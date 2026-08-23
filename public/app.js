@@ -48,14 +48,26 @@ function updatePlatform() {
     card.setAttribute('aria-pressed', String(selected));
   });
   $('#platform-complete').textContent = name + ' selected';
-  $('#connection-title').textContent = `Connect ${name}`;
-  $('#connection-description').textContent = `Official OAuth keeps your account protected and gives you control over publishing access.`;
   $('#connection-icon').textContent = state.platform === 'tiktok' ? '♪' : '◎';
   $('#connection-icon').className = `connection-icon ${state.platform === 'tiktok' ? 'tiktok-connection' : 'instagram-connection'}`;
-  const isConnected = Boolean(state.connected[state.platform]);
-  $('#connect-button').innerHTML = isConnected ? 'Connected <span>✓</span>' : `Connect ${name} <span>↗</span>`;
-  $('#connect-button').classList.toggle('connected-button', isConnected);
+  const connection = state.connected[state.platform];
+  const isConnected = Boolean(connection);
+  const handle = connection && connection.handle ? connection.handle : 'account';
+  if (isConnected) {
+    $('#connection-title').textContent = `${name} connected`;
+    $('#connection-description').textContent = `Session verified on ${new Date(connection.verifiedAt).toLocaleDateString()} — signed in as @${handle}. Cookies live only in this browser.`;
+  } else {
+    $('#connection-title').textContent = `Paste ${name} session cookies`;
+    $('#connection-description').textContent = 'Export the cookies for this platform from your logged-in browser, then paste them below as JSON.';
+  }
   $('#connected-label').classList.toggle('hidden', !isConnected);
+  if ($('#connected-handle')) $('#connected-handle').textContent = isConnected ? `@${handle}` : 'Connected';
+  $('#connect-button').innerHTML = isConnected ? 'Disconnect <span>✕</span>' : 'Validate & connect <span>→</span>';
+  $('#connect-button').classList.toggle('connected-button', isConnected);
+  $('#connect-button').disabled = false;
+  const profile = $('.profile-name');
+  if (profile) profile.textContent = isConnected ? `@${handle}` : 'Sam Carter';
+  if (isConnected && $('#cookie-input')) $('#cookie-input').value = '';
 }
 
 function updateFormat() {
@@ -72,20 +84,127 @@ function saveConnection() {
   localStorage.setItem('storyforge-connected', JSON.stringify(state.connected));
 }
 
-function connectAccount() {
-  const platformName = state.platform === 'tiktok' ? 'TikTok' : 'Instagram';
-  if (state.connected[state.platform]) {
-    state.connected[state.platform] = false;
-    saveConnection();
-    updatePlatform();
-    showToast(`${platformName} demo connection removed`);
+function normalizeCookiesClient(raw) {
+  let list = [];
+  if (Array.isArray(raw)) list = raw;
+  else if (raw && typeof raw === 'object') list = Object.entries(raw).map(([name, value]) => ({ name, value }));
+  return list.filter(cookie => cookie && typeof cookie.name === 'string' && typeof cookie.value === 'string' && cookie.name.trim());
+}
+
+function cookieIsExpiredClient(cookie) {
+  const raw = cookie.expirationDate ?? cookie.expires;
+  if (raw === undefined || raw === null || raw === '') return false;
+  const time = typeof raw === 'number' ? (raw > 1e12 ? raw : raw * 1000) : new Date(raw).getTime();
+  return Number.isFinite(time) && time < Date.now();
+}
+
+function setCookieStatus(kind, message) {
+  const status = $('#cookie-status');
+  if (!status) return;
+  status.classList.remove('hidden', 'ok', 'error', 'warn');
+  if (kind !== 'idle') status.classList.add(kind);
+  status.textContent = message;
+}
+
+async function pasteCookies() {
+  try {
+    const text = await navigator.clipboard.readText();
+    if (!text) throw new Error('empty');
+    $('#cookie-input').value = text;
+    $('#cookie-input').focus();
+    setCookieStatus('idle', 'Cookies pasted — hit Validate & connect to check them.');
+  } catch {
+    showToast('Clipboard access was blocked — paste manually with Ctrl/Cmd + V', 'error');
+  }
+}
+
+function showCookieExample() {
+  $('#cookie-input').value = JSON.stringify([
+    { name: 'sessionid', value: 'replace-with-your-session-id' },
+    { name: 'msToken', value: 'replace-with-your-ms-token' }
+  ], null, 2);
+  $('#cookie-input').focus();
+  setCookieStatus('idle', 'Example filled in — replace the values with your real cookies.');
+}
+
+async function validateSession() {
+  const input = $('#cookie-input').value.trim();
+  if (!input) {
+    showToast('Paste your session cookies JSON first', 'error');
     return;
   }
-  // This is deliberately a local demo state. No credential or cookie is collected.
-  state.connected[state.platform] = true;
+  let parsed;
+  try {
+    parsed = JSON.parse(input);
+  } catch {
+    setCookieStatus('error', 'That is not valid JSON. Paste the cookies export as-is or use the Show example format.');
+    showToast('Invalid JSON — check the format', 'error');
+    return;
+  }
+  const cookies = normalizeCookiesClient(parsed);
+  if (!cookies.length) {
+    setCookieStatus('error', 'No cookies found. Expected an array of { name, value } objects or a flat { "sessionid": "..." } map.');
+    return;
+  }
+  if (!cookies.some(cookie => cookie.name.toLowerCase() === 'sessionid' && cookie.value.length >= 8)) {
+    setCookieStatus('error', 'Missing a valid sessionid cookie — that cookie is required to log in.');
+    return;
+  }
+  const expired = cookies.filter(cookieIsExpiredClient);
+  if (expired.length) {
+    setCookieStatus('error', `${expired.length} cookie${expired.length > 1 ? 's are' : ' is'} expired. Export fresh cookies while logged in.`);
+    return;
+  }
+  setCookieStatus('idle', 'Checking the session against the platform…');
+  $('#connect-button').disabled = true;
+  $('#connect-button').innerHTML = 'Validating… <span>◌</span>';
+  try {
+    const response = await fetch('/api/validate-session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ platform: state.platform, cookies: parsed })
+    });
+    const result = await response.json();
+    if (!response.ok || !result.ok) throw new Error(result.error || 'Validation failed');
+    if (result.status === 'verified') {
+      state.connected[state.platform] = { handle: result.handle || 'account', verifiedAt: result.checkedAt || new Date().toISOString() };
+      saveConnection();
+      updatePlatform();
+      setCookieStatus('ok', `Session verified — connected as @${result.handle || 'account'}. Cookies stay in this browser only.`);
+      showToast('Session verified — account connected');
+    } else if (result.status === 'rejected') {
+      setCookieStatus('error', 'The platform rejected these cookies — the session is invalid or expired. Export fresh cookies while logged in on the platform.');
+      showToast('Session rejected — cookies are not valid', 'error');
+    } else {
+      state.connected[state.platform] = { handle: 'account', verifiedAt: new Date().toISOString(), unchecked: true };
+      saveConnection();
+      updatePlatform();
+      setCookieStatus('warn', 'Could not reach the platform from this server, so the live check was skipped. Connected on the local structural check — the session may or may not be valid.');
+      showToast('Connected (live check unavailable)');
+    }
+  } catch (error) {
+    setCookieStatus('error', error.message || 'Could not validate the session — try again.');
+    showToast(error.message || 'Could not validate the session', 'error');
+  } finally {
+    $('#connect-button').disabled = false;
+    updatePlatform();
+  }
+}
+
+function disconnectAccount() {
+  delete state.connected[state.platform];
   saveConnection();
   updatePlatform();
-  showToast(`${platformName} demo connection enabled — official OAuth goes here`);
+  setCookieStatus('idle', 'Disconnected. Paste fresh cookies to connect again.');
+  showToast('Account disconnected');
+}
+
+function connectAccount() {
+  if (state.connected[state.platform]) {
+    disconnectAccount();
+    return;
+  }
+  validateSession();
 }
 
 function updateCounter() {
@@ -654,6 +773,8 @@ function init() {
   $$('.platform-card').forEach(card => card.addEventListener('click', () => { state.platform = card.dataset.platform; updatePlatform(); }));
   $$('.format-card').forEach(card => card.addEventListener('click', () => { state.format = card.dataset.format; updateFormat(); }));
   $('#connect-button').addEventListener('click', connectAccount);
+  $('#paste-cookies').addEventListener('click', pasteCookies);
+  $('#format-help').addEventListener('click', showCookieExample);
   $('#brief-input').addEventListener('input', updateCounter);
   $('#clear-brief').addEventListener('click', () => { $('#brief-input').value = ''; updateCounter(); $('#brief-input').focus(); });
   $('#start-button').addEventListener('click', startGeneration);
@@ -665,7 +786,7 @@ function init() {
   $('#download-video-button').addEventListener('click', downloadVideo);
   $('#open-library').addEventListener('click', () => $('#library').scrollIntoView({ behavior: 'smooth' }));
   $('#all-drafts').addEventListener('click', () => showToast('Library view is coming next — three latest drafts are shown here'));
-  $('#learn-more').addEventListener('click', () => showToast('OAuth is the safe path; cookies are never collected'));
+  $('#learn-more').addEventListener('click', () => showToast('Cookies are validated live, kept only in this browser, and never sent anywhere else'));
   document.addEventListener('keydown', event => { if (event.key === 'Escape' && !$('#modal-backdrop').classList.contains('hidden')) closeModal(); });
   if ('speechSynthesis' in window) window.speechSynthesis.onvoiceschanged = () => {};
   fetch('/api/health').then(response => response.json()).then(data => { if (data.groqConfigured) $('#engine-status').textContent = 'Groq engine ready'; }).catch(() => {});

@@ -63,7 +63,7 @@
 
         <div class="notice-banner" id="safety">
           <span class="notice-icon">✓</span>
-          <div><strong>Built for safe publishing</strong><span>Connect TikTok or Instagram through official OAuth. StoryForge never asks for or stores session cookies.</span></div>
+          <div><strong>Log in with your session cookies</strong><span>Paste the session cookies JSON from your logged-in TikTok or Instagram, validate it live, and connect. Cookies stay in this browser and are never stored on the server.</span></div>
           <button type="button" class="notice-link" id="learn-more">How it works <span>↗</span></button>
         </div>
 
@@ -80,13 +80,23 @@
         </section>
 
         <section class="section-block" aria-labelledby="connect-title" id="connections">
-          <div class="section-heading"><div><span class="step-number">02</span><div><h2 id="connect-title">Connect your account</h2><p>Use a secure, official connection — never paste credentials or cookies.</p></div></div><span class="connected-label hidden" id="connected-label"><span class="status-dot"></span> Connected</span></div>
-          <div class="connection-panel">
-            <div class="connection-icon" id="connection-icon">♪</div>
-            <div class="connection-copy"><strong id="connection-title">Connect TikTok</strong><span id="connection-description">Official OAuth keeps your account protected and gives you control over publishing access.</span><small><span class="lock">⌑</span> OAuth connection · Access can be revoked anytime</small></div>
-            <button class="outline-button" type="button" id="connect-button">Connect TikTok <span>↗</span></button>
+          <div class="section-heading"><div><span class="step-number">02</span><div><h2 id="connect-title">Log in with session cookies</h2><p>Paste the session cookies JSON from your logged-in account, validate it, and connect.</p></div></div><span class="connected-label hidden" id="connected-label"><span class="status-dot"></span> <span id="connected-handle">Connected</span></span></div>
+          <div class="connection-panel cookie-panel">
+            <div class="cookie-head">
+              <div class="connection-icon" id="connection-icon">♪</div>
+              <div class="connection-copy"><strong id="connection-title">Paste session cookies</strong><span id="connection-description">Export the cookies for this platform from your logged-in browser, then paste them below as JSON.</span></div>
+            </div>
+            <textarea class="cookie-input" id="cookie-input" rows="4" spellcheck="false" placeholder='[{"name":"sessionid","value":"replace-with-your-session-id"}]'></textarea>
+            <div class="cookie-actions">
+              <span class="cookie-hint">Accepts an array of cookie objects or a flat <code>{"sessionid":"…"}</code> map. <button type="button" class="hint-link" id="format-help">Show example</button></span>
+              <div class="cookie-buttons">
+                <button class="ghost-button" type="button" id="paste-cookies"><span>⌘</span> Paste from clipboard</button>
+                <button class="outline-button" type="button" id="connect-button">Validate &amp; connect <span>→</span></button>
+              </div>
+            </div>
           </div>
-          <div class="security-note"><span>i</span> <span>Cookie import is intentionally disabled. It can expose an account and bypass platform security. Use the official OAuth flow when you add production publishing.</span></div>
+          <div class="cookie-status hidden" id="cookie-status"></div>
+          <div class="security-note"><span>i</span> <span>Cookies are sent to this app's validation endpoint once to confirm the session, then kept only in your browser (localStorage). They are never written to the server, never shared, and never included in storyboard exports.</span></div>
         </section>
 
         <section class="section-block" aria-labelledby="format-title">

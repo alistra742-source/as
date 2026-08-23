@@ -160,6 +160,71 @@ function safeFilePath(urlPath) {
   return absolute.startsWith(PUBLIC_DIR) ? absolute : null;
 }
 
+// --- Session-cookie validation -------------------------------------------------
+// Cookies are read once for validation and never persisted anywhere on the server.
+
+function normalizeCookies(raw) {
+  let list = [];
+  if (Array.isArray(raw)) {
+    list = raw;
+  } else if (raw && typeof raw === 'object') {
+    list = Object.entries(raw).map(([name, value]) => ({ name, value }));
+  }
+  return list
+    .filter(cookie => cookie && typeof cookie.name === 'string' && typeof cookie.value === 'string' && cookie.name.trim())
+    .map(cookie => ({ name: cookie.name.trim(), value: cookie.value.trim(), expirationDate: cookie.expirationDate, expires: cookie.expires }));
+}
+
+function cookieHeader(cookies) {
+  return cookies.map(cookie => `${cookie.name}=${cookie.value}`).join('; ');
+}
+
+function cookieIsExpired(cookie) {
+  const raw = cookie.expirationDate ?? cookie.expires;
+  if (raw === undefined || raw === null || raw === '') return false;
+  const time = typeof raw === 'number' ? (raw > 1e12 ? raw : raw * 1000) : new Date(raw).getTime();
+  return Number.isFinite(time) && time < Date.now();
+}
+
+async function probeTikTok(cookies) {
+  const response = await fetch('https://www.tiktok.com/passport/web/account/info/', {
+    method: 'GET',
+    headers: {
+      Cookie: cookieHeader(cookies),
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+      Accept: 'application/json, text/plain, */*'
+    },
+    redirect: 'manual'
+  });
+  const payload = await response.json().catch(() => null);
+  const data = payload?.data;
+  const info = data?.user_info;
+  if (data && info && typeof info === 'object' && (info.unique_id || info.username || info.nickname)) {
+    return { verified: true, handle: info.unique_id || info.username || info.nickname || null };
+  }
+  // TikTok reports dead sessions as HTTP 200 with message "error" / an error_code.
+  if (payload?.message === 'error' || data?.error_code || response.status === 401 || response.status === 403) return { verified: false };
+  return { verified: false, unavailable: true };
+}
+
+async function probeInstagram(cookies) {
+  const response = await fetch('https://i.instagram.com/api/v1/accounts/current_user/?edit=true', {
+    method: 'GET',
+    headers: {
+      Cookie: cookieHeader(cookies),
+      'User-Agent': 'Instagram 219.0.0.12.117 Android (30/11; 420dpi; 1080x2340; samsung; SM-G991B; beyond1; exynos2100; en_US; 314665256)',
+      'X-IG-App-ID': '567067343352427',
+      Accept: '*/*'
+    }
+  });
+  const payload = await response.json().catch(() => null);
+  if (response.ok && payload?.user) {
+    return { verified: true, handle: payload.user.username || null };
+  }
+  if (response.status === 401 || response.status === 403) return { verified: false };
+  return { verified: false, unavailable: true };
+}
+
 async function handle(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
 
@@ -189,6 +254,35 @@ async function handle(req, res) {
         generatedAt: new Date().toISOString(),
         story
       });
+    } catch (error) {
+      return json(res, 400, { ok: false, error: error.message });
+    }
+  }
+
+  if (url.pathname === '/api/validate-session' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const platform = ['tiktok', 'instagram'].includes(body.platform) ? body.platform : null;
+      if (!platform) return json(res, 400, { ok: false, error: 'Unknown platform' });
+      const cookies = normalizeCookies(body.cookies);
+      if (!cookies.length) return json(res, 400, { ok: false, error: 'No cookies found. Expected an array of { name, value } objects or a flat { "sessionid": "..." } map.' });
+      const hasSessionId = cookies.some(cookie => cookie.name.toLowerCase() === 'sessionid' && cookie.value.length >= 8);
+      if (!hasSessionId) return json(res, 400, { ok: false, error: 'Missing a valid sessionid cookie — that is required to log in.' });
+      const expired = cookies.filter(cookieIsExpired);
+      if (expired.length) return json(res, 400, { ok: false, error: `${expired.length} cookie${expired.length > 1 ? 's are' : ' is'} expired. Export fresh cookies while logged in.` });
+      let probe;
+      try {
+        probe = platform === 'tiktok' ? await probeTikTok(cookies) : await probeInstagram(cookies);
+      } catch (error) {
+        probe = { verified: false, unavailable: true };
+      }
+      if (probe.verified) {
+        return json(res, 200, { ok: true, status: 'verified', handle: probe.handle, checkedAt: new Date().toISOString() });
+      }
+      if (probe.unavailable) {
+        return json(res, 200, { ok: true, status: 'unavailable', checkedAt: new Date().toISOString() });
+      }
+      return json(res, 200, { ok: true, status: 'rejected', checkedAt: new Date().toISOString() });
     } catch (error) {
       return json(res, 400, { ok: false, error: error.message });
     }

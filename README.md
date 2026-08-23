@@ -2,11 +2,18 @@
 
 A polished, local-first short-form story creator studio prototype for Railway. StoryForge lets you choose TikTok or Instagram, select a visual format, generate a fresh storyboard, preview motion/captions, listen to local browser narration, and export a storyboard file.
 
-## Safety boundary
+## Logging in with session cookies
 
-This project intentionally does **not** accept, validate, store, or use session cookies. Session-cookie import can expose an account and bypass platform security. The connection control is a local demo state; production publishing should be implemented with each platform's approved OAuth and creator APIs, with least-privilege scopes and revocation support.
+Step 02 lets you log in with session cookies instead of OAuth. Paste the cookies from your logged-in TikTok or Instagram session as JSON (an array of `{ name, value }` objects, or a flat `{ "sessionid": "..." }` map), then validate:
 
-The “Queue test post” action is also a safe no-op: it confirms the draft flow without sending anything to TikTok or Instagram.
+1. **Local checks** — valid JSON, a `sessionid` cookie present, and no expired cookies.
+2. **Live check** — a server-side probe calls the platform's account endpoint with your cookies and reports `verified`, `rejected`, or `unavailable` (if the platform blocks the server's request).
+
+On success the panel shows the connected handle and the topbar updates to the account name.
+
+**Privacy boundary:** cookies are sent to `POST /api/validate-session` exactly once to confirm the session, then kept only in the browser's `localStorage`. They are never written to disk or a database, never logged, never shared, and never included in storyboard exports. Disconnect to remove them.
+
+The “Queue test post” action is a safe no-op: it confirms the draft flow without sending anything to TikTok or Instagram.
 
 ## Features
 
