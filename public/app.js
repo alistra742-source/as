@@ -528,9 +528,14 @@ function drawChatCanvasFrame(ctx, elapsed, scenes, width, height) {
   ctx.fillStyle = '#9aa39e'; ctx.font = '500 9px DM Mono, monospace'; ctx.fillText('active now', 59, 88);
   const messages = scenes.map(scene => ({ name: String(scene.label || 'MAYA').toUpperCase(), text: scene.cue }));
   const durations = scenes.map(scene => Math.max(3, Number(scene.duration) || 5));
-  let messageEnd = 0;
+  // Messages appear when their scene starts (plus a tiny beat) and stay on screen,
+  // like a real chat — no long wait before the first bubble.
+  let sceneStart = 0;
   const visible = [];
-  messages.forEach((message, index) => { messageEnd += durations[index]; if (elapsed >= messageEnd - durations[index] * .72) visible.push({ ...message, index }); });
+  messages.forEach((message, index) => {
+    if (elapsed >= sceneStart + .35) visible.push({ ...message, index });
+    sceneStart += durations[index];
+  });
   const shown = visible.slice(-5);
   let y = 150;
   shown.forEach((message, index) => {
@@ -581,7 +586,15 @@ function startDemoRender() {
     showToast('Live canvas render is available, but this browser cannot export WebM video', 'error');
     $('#video-frame').classList.add('canvas-mode');
     $('#frame-state').textContent = 'LIVE PREVIEW';
-    renderCanvasFrame(0);
+    // Still play the animation — only the WebM export is unavailable.
+    state.renderStartedAt = performance.now();
+    const playTick = now => {
+      const elapsed = (now - state.renderStartedAt) / 1000;
+      const frame = renderCanvasFrame(elapsed);
+      if (elapsed < frame.total) state.renderFrame = requestAnimationFrame(playTick);
+      else state.renderFrame = null;
+    };
+    state.renderFrame = requestAnimationFrame(playTick);
     speakStory();
     return;
   }
@@ -685,8 +698,8 @@ function speakStory() {
   if (state.format !== 'chat') {
     const utterance = new SpeechSynthesisUtterance(script);
     utterance.voice = pickVoice('narrator');
-    utterance.rate = .9;
-    utterance.pitch = .72;
+    utterance.rate = .95;
+    utterance.pitch = 1;
     utterance.volume = 1;
     utterance.onend = () => { state.speaking = false; $('#voice-button').classList.remove('playing'); $('#voice-button').textContent = '▶'; $('#audio-status').textContent = 'Preview finished'; };
     utterance.onerror = utterance.onend;
@@ -705,8 +718,8 @@ function speakStory() {
     const words = split > -1 ? segment.slice(split + 1) : segment;
     const utterance = new SpeechSynthesisUtterance(words.trim());
     utterance.voice = pickVoice(name.toLowerCase() === 'maya' ? 'girl' : 'narrator');
-    utterance.rate = name.toLowerCase() === 'maya' ? 1.02 : .9;
-    utterance.pitch = name.toLowerCase() === 'maya' ? 1.18 : .78;
+    utterance.rate = name.toLowerCase() === 'maya' ? 1 : .92;
+    utterance.pitch = 1;
     utterance.onend = next;
     utterance.onerror = next;
     window.speechSynthesis.speak(utterance);
