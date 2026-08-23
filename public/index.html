@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f6f7fb">
+  <meta name="description" content="StoryForge short-form video creator studio">
+  <title>StoryForge — Creator Studio</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="Primary navigation">
+      <a class="brand" href="#top" aria-label="StoryForge home">
+        <span class="brand-mark"><span></span><span></span><span></span></span>
+        <span>story<span>forge</span></span>
+      </a>
+
+      <div class="workspace-switcher">
+        <span class="workspace-avatar">S</span>
+        <span class="workspace-copy"><small>WORKSPACE</small><strong>Solo creator</strong></span>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 9 5 5 5-5"/></svg>
+      </div>
+
+      <nav class="nav-list">
+        <p class="nav-label">Workspace</p>
+        <a class="nav-item active" href="#create"><span class="nav-icon">✦</span><span>Create</span><span class="nav-badge">2</span></a>
+        <a class="nav-item" href="#library"><span class="nav-icon">▤</span><span>Library</span></a>
+        <a class="nav-item" href="#analytics"><span class="nav-icon">⌁</span><span>Analytics</span><span class="soon">Soon</span></a>
+      </nav>
+
+      <nav class="nav-list lower-nav">
+        <p class="nav-label">Workspace settings</p>
+        <a class="nav-item" href="#connections"><span class="nav-icon">◎</span><span>Connections</span></a>
+        <a class="nav-item" href="#settings"><span class="nav-icon">⚙</span><span>Settings</span></a>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="free-plan"><span class="status-dot"></span><span><strong>Private workspace</strong><small>Local-first demo mode</small></span></div>
+        <div class="help-row"><span>Need a hand?</span><a href="#safety">Read the guide ↗</a></div>
+      </div>
+    </aside>
+
+    <main class="main-content" id="top">
+      <header class="topbar">
+        <div class="breadcrumb"><span>Workspace</span><b>/</b><strong>Create</strong></div>
+        <div class="topbar-actions">
+          <div class="status-pill"><span class="status-dot"></span><span id="engine-status">Local engine ready</span></div>
+          <button class="icon-button" type="button" aria-label="Notifications"><span class="notification-dot"></span>♢</button>
+          <button class="profile-button" type="button" aria-label="Open profile"><span class="profile-avatar">SC</span><span class="profile-name">Sam Carter</span><span class="chevron">⌄</span></button>
+        </div>
+      </header>
+
+      <div class="page-wrap" id="create">
+        <section class="page-intro">
+          <div>
+            <p class="eyebrow">CREATOR WORKSPACE <span class="eyebrow-line"></span> <span id="today-label">AUG 23, 2026</span></p>
+            <h1>Make stories people <em>can’t scroll past.</em></h1>
+            <p class="intro-copy">Turn a sharp idea into a finished vertical draft with narration, motion, captions, and a little mystery.</p>
+          </div>
+          <button class="secondary-button" type="button" id="open-library"><span>▤</span> View library <b>3</b></button>
+        </section>
+
+        <div class="notice-banner" id="safety">
+          <span class="notice-icon">✓</span>
+          <div><strong>Built for safe publishing</strong><span>Connect TikTok or Instagram through official OAuth. StoryForge never asks for or stores session cookies.</span></div>
+          <button type="button" class="notice-link" id="learn-more">How it works <span>↗</span></button>
+        </div>
+
+        <section class="section-block" aria-labelledby="platform-title">
+          <div class="section-heading"><div><span class="step-number">01</span><div><h2 id="platform-title">Choose a platform</h2><p>Where should this story live?</p></div></div><span class="complete-label" id="platform-complete">Choose one</span></div>
+          <div class="platform-grid">
+            <button class="platform-card selected" type="button" data-platform="tiktok" aria-pressed="true">
+              <span class="platform-logo tiktok-logo">♪</span><span class="platform-text"><strong>TikTok</strong><small>Vertical · 9:16</small></span><span class="platform-check">✓</span>
+            </button>
+            <button class="platform-card" type="button" data-platform="instagram" aria-pressed="false">
+              <span class="platform-logo instagram-logo">◎</span><span class="platform-text"><strong>Instagram</strong><small>Reels · 9:16</small></span><span class="platform-check">✓</span>
+            </button>
+          </div>
+        </section>
+
+        <section class="section-block" aria-labelledby="connect-title" id="connections">
+          <div class="section-heading"><div><span class="step-number">02</span><div><h2 id="connect-title">Connect your account</h2><p>Use a secure, official connection — never paste credentials or cookies.</p></div></div><span class="connected-label hidden" id="connected-label"><span class="status-dot"></span> Connected</span></div>
+          <div class="connection-panel">
+            <div class="connection-icon" id="connection-icon">♪</div>
+            <div class="connection-copy"><strong id="connection-title">Connect TikTok</strong><span id="connection-description">Official OAuth keeps your account protected and gives you control over publishing access.</span><small><span class="lock">⌑</span> OAuth connection · Access can be revoked anytime</small></div>
+            <button class="outline-button" type="button" id="connect-button">Connect TikTok <span>↗</span></button>
+          </div>
+          <div class="security-note"><span>i</span> <span>Cookie import is intentionally disabled. It can expose an account and bypass platform security. Use the official OAuth flow when you add production publishing.</span></div>
+        </section>
+
+        <section class="section-block" aria-labelledby="format-title">
+          <div class="section-heading"><div><span class="step-number">03</span><div><h2 id="format-title">Pick a story format</h2><p>Choose a visual language for your next draft.</p></div></div><span class="complete-label" id="format-complete">Choose one</span></div>
+          <div class="format-grid">
+            <button class="format-card selected" type="button" data-format="stickman" aria-pressed="true">
+              <span class="format-art stickman-art"><span class="art-spark s1">✦</span><span class="art-spark s2">·</span><span class="mini-stickman"><i class="head"></i><i class="body"></i><i class="arm arm-left"></i><i class="arm arm-right"></i><i class="leg leg-left"></i><i class="leg leg-right"></i></span><span class="art-caption">CASE FILE<br><b>01</b></span></span>
+              <span class="format-info"><span><strong>Stickman crimes</strong><small>Non-graphic true-crime style explainers with a lightly animated stickman cast.</small></span><span class="duration-tag">40–60 sec</span></span><span class="format-selected">✓</span>
+            </button>
+            <button class="format-card" type="button" data-format="chat" aria-pressed="false">
+              <span class="format-art chat-art"><span class="chat-bubble bubble-one">where are you?</span><span class="chat-bubble bubble-two">don’t open it.</span><span class="chat-phone"><i></i><b></b><em></em></span></span>
+              <span class="format-info"><span><strong>Faceless chat stories</strong><small>Messenger-style suspense with two distinct voices and timed messages.</small></span><span class="duration-tag">30–45 sec</span></span><span class="format-selected">✓</span>
+            </button>
+            <button class="format-card test-card" type="button" data-format="test" aria-pressed="false">
+              <span class="format-art test-art"><span class="play-triangle">▶</span><span class="test-lines"><i></i><i></i><i></i></span><span class="test-grid"></span></span>
+              <span class="format-info"><span><strong>Render test</strong><small>A quick sample draft to verify the preview, captions, and audio pipeline.</small></span><span class="duration-tag">10 sec</span></span><span class="format-selected">✓</span>
+            </button>
+          </div>
+        </section>
+
+        <section class="section-block brief-block" aria-labelledby="brief-title">
+          <div class="section-heading"><div><span class="step-number">04</span><div><h2 id="brief-title">Add a creative brief <span class="optional">Optional</span></h2><p>Give the story engine a direction, or let it surprise you.</p></div></div><span class="counter" id="brief-counter">0 / 120</span></div>
+          <div class="brief-field"><textarea id="brief-input" maxlength="120" placeholder="Try: an overlooked clue at a hotel, a missing key, an unreliable timestamp…"></textarea><span class="field-spark">✦</span></div>
+          <div class="brief-footer"><span><span class="ai-dot">✦</span> Original drafts avoid repeating recent story patterns</span><button type="button" class="clear-button" id="clear-brief">Clear</button></div>
+        </section>
+
+        <section class="start-panel">
+          <div class="start-copy"><span class="start-orb">✦</span><div><h2>Ready to make something?</h2><p id="start-description">A unique stickman crime draft with captions, motion, and a deep narrator voice.</p></div></div>
+          <button class="primary-button" type="button" id="start-button"><span class="button-icon">✦</span> Generate my draft <span class="button-arrow">→</span></button>
+        </section>
+
+        <section class="recent-section" id="library">
+          <div class="recent-heading"><div><p class="eyebrow">YOUR WORKSPACE</p><h2>Recent drafts</h2></div><button type="button" class="text-button" id="all-drafts">See all <span>→</span></button></div>
+          <div class="drafts-grid" id="drafts-grid">
+            <article class="draft-card"><div class="draft-thumb thumb-station"><span>CASE 001</span><i></i><b>11:47</b></div><div class="draft-meta"><strong>The Vanishing at Platform 6</strong><span><span class="draft-status ready"></span> Ready to review <time>· 2m ago</time></span></div><button class="more-button" type="button" aria-label="More options">•••</button></article>
+            <article class="draft-card"><div class="draft-thumb thumb-chat"><span>NEW MESSAGE</span><i>are you still there?</i><b>2:13 AM</b></div><div class="draft-meta"><strong>Read at 2:13 AM</strong><span><span class="draft-status ready"></span> Ready to review <time>· 1h ago</time></span></div><button class="more-button" type="button" aria-label="More options">•••</button></article>
+            <article class="draft-card"><div class="draft-thumb thumb-test"><span>RENDER CHECK</span><i>✓</i><b>10 SEC</b></div><div class="draft-meta"><strong>StoryForge Render Check</strong><span><span class="draft-status published"></span> Exported <time>· Yesterday</time></span></div><button class="more-button" type="button" aria-label="More options">•••</button></article>
+          </div>
+        </section>
+
+        <footer class="page-footer"><span>StoryForge Studio <b>·</b> Private creator workspace</span><span><a href="#safety">Safety &amp; privacy</a><a href="#settings">Settings</a></span></footer>
+      </div>
+    </main>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"><span class="toast-icon">✓</span><span id="toast-message">Done</span></div>
+
+  <div class="modal-backdrop hidden" id="modal-backdrop" aria-hidden="true">
+    <section class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <button class="modal-close" type="button" id="modal-close" aria-label="Close">×</button>
+      <div class="modal-kicker">STORYFORGE PREVIEW</div>
+      <h2 id="modal-title">Your draft is ready</h2>
+      <p class="modal-subtitle" id="modal-subtitle">A fresh story, shaped for vertical video.</p>
+      <div class="preview-layout">
+        <div class="video-frame" id="video-frame">
+          <div class="frame-top"><span class="live-chip"><i></i> PREVIEW</span><span id="frame-duration">00:00</span></div>
+          <div class="stickman-scene" id="stickman-scene">
+            <span class="scene-label" id="scene-label">THE HOOK</span><div class="scene-glow"></div><div class="scene-stickman"><i class="head"></i><i class="body"></i><i class="arm arm-left"></i><i class="arm arm-right"></i><i class="leg leg-left"></i><i class="leg leg-right"></i></div><div class="scene-prop" id="scene-prop">▣</div><div class="scene-caption" id="scene-caption">A quiet station.<br><b>11:47 PM</b></div>
+          </div>
+          <div class="chat-scene hidden" id="chat-scene"><span class="scene-label">PRIVATE CHAT</span><div class="chat-header"><span class="chat-avatar maya">M</span><span><b>m / leo</b><small>active now</small></span><i>•••</i></div><div class="messages" id="messages"></div><div class="typing"><i></i><i></i><i></i></div></div>
+          <div class="frame-bottom"><span id="frame-format">STICKMAN CRIMES</span><span>9:16</span></div>
+        </div>
+        <div class="preview-details">
+          <div class="ready-pill"><span class="status-dot"></span><span id="engine-label">Draft generated locally</span></div>
+          <h3 id="story-title">The Vanishing at Platform 6</h3>
+          <p class="story-hook" id="story-hook">At 11:47 p.m., one camera went dark for exactly ninety seconds.</p>
+          <div class="detail-divider"></div>
+          <div class="audio-row"><div class="audio-icon">◖</div><div><strong id="voice-label">Deep narrator</strong><small id="audio-status">Local browser voice preview</small></div><button type="button" class="play-button" id="voice-button" aria-label="Play voice preview">▶</button></div>
+          <div class="modal-actions"><button type="button" class="secondary-button" id="export-button"><span>↓</span> Export storyboard</button><button type="button" class="primary-button" id="queue-button">Queue test post <span class="button-arrow">→</span></button></div>
+          <p class="publish-note"><span>i</span> This prototype does not post or use session cookies. Production publishing should use approved platform APIs and OAuth.</p>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

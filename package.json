@@ -1,0 +1,14 @@
+{
+  "name": "storyforge-studio",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A safe, local-first short-form story video studio prototype.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
