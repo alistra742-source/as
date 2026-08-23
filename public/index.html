@@ -47,7 +47,7 @@
         <div class="topbar-actions">
           <div class="status-pill"><span class="status-dot"></span><span id="engine-status">Local engine ready</span></div>
           <button class="icon-button" type="button" aria-label="Notifications"><span class="notification-dot"></span>♢</button>
-          <button class="profile-button" type="button" aria-label="Open profile"><span class="profile-avatar">SC</span><span class="profile-name">Sam Carter</span><span class="chevron">⌄</span></button>
+          <button class="profile-button" type="button" aria-label="Open profile"><span class="profile-avatar">SC</span><span class="profile-name" id="profile-name">Sam Carter</span><span class="chevron">⌄</span></button>
         </div>
       </header>
 
@@ -63,7 +63,7 @@
 
         <div class="notice-banner" id="safety">
           <span class="notice-icon">✓</span>
-          <div><strong>Built for safe publishing</strong><span>Connect TikTok or Instagram through official OAuth. StoryForge never asks for or stores session cookies.</span></div>
+          <div><strong>Your session, your connection</strong><span>Log in by pasting the session cookies JSON from your own browser. No OAuth, no redirects — the session is checked against the platform, then kept only on your device.</span></div>
           <button type="button" class="notice-link" id="learn-more">How it works <span>↗</span></button>
         </div>
 
@@ -80,13 +80,24 @@
         </section>
 
         <section class="section-block" aria-labelledby="connect-title" id="connections">
-          <div class="section-heading"><div><span class="step-number">02</span><div><h2 id="connect-title">Connect your account</h2><p>Use a secure, official connection — never paste credentials or cookies.</p></div></div><span class="connected-label hidden" id="connected-label"><span class="status-dot"></span> Connected</span></div>
-          <div class="connection-panel">
-            <div class="connection-icon" id="connection-icon">♪</div>
-            <div class="connection-copy"><strong id="connection-title">Connect TikTok</strong><span id="connection-description">Official OAuth keeps your account protected and gives you control over publishing access.</span><small><span class="lock">⌑</span> OAuth connection · Access can be revoked anytime</small></div>
-            <button class="outline-button" type="button" id="connect-button">Connect TikTok <span>↗</span></button>
+          <div class="section-heading"><div><span class="step-number">02</span><div><h2 id="connect-title">Log in with session cookies</h2><p>Paste the session cookies JSON from your own browser to connect the account.</p></div></div><span class="connected-label hidden" id="connected-label"><span class="status-dot"></span> Connected</span></div>
+          <div class="connection-panel cookie-panel">
+            <div class="cookie-head">
+              <div class="connection-icon" id="connection-icon">♪</div>
+              <div class="connection-copy"><strong id="connection-title">Paste TikTok session cookies</strong><span id="connection-description">Export your logged-in cookies as JSON (a cookie-editor extension can do this), then paste them below.</span></div>
+            </div>
+            <textarea id="cookie-input" spellcheck="false" placeholder='[{ "name": "sessionid", "value": "…", "domain": ".tiktok.com", "path": "/", "expires": 1750000000 }]'></textarea>
+            <div class="cookie-actions">
+              <button class="outline-button" type="button" id="paste-cookies">⇧ Paste from clipboard</button>
+              <button class="primary-button" type="button" id="connect-button">Validate &amp; connect <span class="button-arrow">→</span></button>
+              <button class="clear-button hidden" type="button" id="disconnect-button">Disconnect</button>
+            </div>
+            <details class="cookie-format-hint"><summary>Need the exact format?</summary><p>Paste JSON like this — an array of cookie objects, or a simple name → value map:</p><pre>[
+  { "name": "sessionid", "value": "abc123…", "domain": ".tiktok.com", "path": "/", "expires": 1750000000 }
+]</pre><p>Or: <code>{ "sessionid": "abc123…", "sid_tt": "xyz…" }</code></p></details>
+            <div class="cookie-status hidden" id="cookie-status" role="status"></div>
+            <div class="security-note"><span>i</span> <span>Cookies are sent to this app only to verify the session, are never written to the server, and stay stored in your browser. Re-export a fresh set whenever a session expires.</span></div>
           </div>
-          <div class="security-note"><span>i</span> <span>Cookie import is intentionally disabled. It can expose an account and bypass platform security. Use the official OAuth flow when you add production publishing.</span></div>
         </section>
 
         <section class="section-block" aria-labelledby="format-title">
@@ -156,7 +167,7 @@
           <div class="detail-divider"></div>
           <div class="audio-row"><div class="audio-icon">◖</div><div><strong id="voice-label">Deep narrator</strong><small id="audio-status">Local browser voice preview</small></div><button type="button" class="play-button" id="voice-button" aria-label="Play voice preview">▶</button></div>
           <div class="modal-actions"><button type="button" class="secondary-button" id="export-button"><span>↓</span> Export storyboard</button><button type="button" class="primary-button" id="queue-button">Queue test post <span class="button-arrow">→</span></button></div>
-          <p class="publish-note"><span>i</span> This prototype does not post or use session cookies. Production publishing should use approved platform APIs and OAuth.</p>
+          <p class="publish-note"><span>i</span> Your session cookies are used only to verify the connection here — they are never included in exports or sent anywhere else.</p>
         </div>
       </div>
     </section>

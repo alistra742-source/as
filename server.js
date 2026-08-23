@@ -153,6 +153,153 @@ async function generateWithGroq(format, prompt) {
   };
 }
 
+const PROBE_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+function normalizeCookies(raw) {
+  let parsed = raw;
+  if (parsed && !Array.isArray(parsed) && typeof parsed === 'object' && Array.isArray(parsed.cookies)) parsed = parsed.cookies;
+  let cookies;
+  if (Array.isArray(parsed)) {
+    cookies = parsed
+      .filter(c => c && typeof c === 'object')
+      .map(c => ({
+        name: String(c.name || '').trim(),
+        value: String(c.value == null ? '' : c.value).trim(),
+        domain: c.domain ? String(c.domain) : '',
+        path: c.path ? String(c.path) : '',
+        expires: normalizeExpiry(c.expires),
+        httpOnly: Boolean(c.httpOnly),
+        secure: Boolean(c.secure)
+      }))
+      .filter(c => c.name && c.value);
+  } else if (parsed && typeof parsed === 'object') {
+    cookies = Object.entries(parsed)
+      .filter(([, value]) => value != null && String(value).trim())
+      .map(([name, value]) => ({ name: String(name).trim(), value: String(value).trim(), domain: '', path: '/', expires: null }));
+  } else {
+    cookies = [];
+  }
+  return cookies;
+}
+
+function normalizeExpiry(value) {
+  if (value == null || value === '') return null;
+  const number = Number(value);
+  if (Number.isFinite(number) && number > 0) {
+    // Epoch seconds (~1e9-1e10) or epoch milliseconds (~1e12-1e13)
+    return number > 1e11 ? number / 1000 : number;
+  }
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed / 1000 : null;
+}
+
+function isUsableCookie(cookie) {
+  if (!cookie.name || !cookie.value) return false;
+  if (cookie.expires && cookie.expires < Date.now() / 1000) return false;
+  return true;
+}
+
+function matchesPlatformDomain(cookie, platform) {
+  if (!cookie.domain) return true;
+  const domain = String(cookie.domain).replace(/^\./, '').toLowerCase();
+  const base = platform === 'tiktok' ? 'tiktok.com' : 'instagram.com';
+  return domain === base || domain.endsWith('.' + base);
+}
+
+function cookieHeader(cookies) {
+  return cookies
+    .filter(c => isUsableCookie(c))
+    .map(c => `${c.name.replace(/[^\w-]/g, '')}=${c.value.replace(/[;\r\n]/g, '')}`)
+    .join('; ');
+}
+
+async function probeInstagram(cookieValue) {
+  const attempts = [
+    {
+      url: 'https://i.instagram.com/api/v1/accounts/current_user/?edit=true',
+      headers: { 'User-Agent': 'Instagram 275.0.0.27.98 Android (SDK 33; Pixel 7)', 'X-Requested-With': 'XMLHttpRequest' }
+    },
+    {
+      url: 'https://www.instagram.com/api/v1/accounts/current_user/?edit=true',
+      headers: { 'User-Agent': PROBE_USER_AGENT, 'X-Requested-With': 'XMLHttpRequest' }
+    }
+  ];
+  let sawNetworkError = false;
+  for (const attempt of attempts) {
+    try {
+      const response = await fetch(attempt.url, {
+        method: 'GET',
+        headers: { ...attempt.headers, Cookie: cookieValue },
+        redirect: 'manual',
+        signal: AbortSignal.timeout(8000)
+      });
+      if (response.status === 200) {
+        const text = await response.text();
+        let data;
+        try { data = JSON.parse(text); } catch { continue; }
+        if (data && data.user && (data.user.username || data.user.pk)) {
+          return {
+            live: 'verified',
+            account: { platform: 'instagram', username: data.user.username || '', displayName: data.user.full_name || data.user.username || '' }
+          };
+        }
+      } else if (response.status === 302 || response.status === 401 || response.status === 403) {
+        return { live: 'rejected', account: null };
+      }
+    } catch (error) {
+      sawNetworkError = true;
+    }
+  }
+  return sawNetworkError ? { live: 'unavailable', account: null } : { live: 'rejected', account: null };
+}
+
+async function probeTikTok(cookieValue) {
+  let sawNetworkError = false;
+  try {
+    const response = await fetch('https://www.tiktok.com/passport/web/account/info/', {
+      method: 'GET',
+      headers: { 'User-Agent': PROBE_USER_AGENT, Cookie: cookieValue, Referer: 'https://www.tiktok.com/' },
+      redirect: 'manual',
+      signal: AbortSignal.timeout(8000)
+    });
+    if (response.status === 200) {
+      const text = await response.text();
+      try {
+        const data = JSON.parse(text);
+        const info = data && data.data && data.data.user_info;
+        if (info) {
+          return {
+            live: 'verified',
+            account: {
+              platform: 'tiktok',
+              username: info.unique_id || info.username || '',
+              displayName: info.nickname || info.unique_id || ''
+            }
+          };
+        }
+      } catch { /* not JSON or unexpected shape */ }
+    } else if (response.status === 302 || response.status === 401 || response.status === 403) {
+      const location = response.headers.get('location') || '';
+      if (/login/i.test(location)) return { live: 'rejected', account: null };
+    }
+  } catch (error) {
+    sawNetworkError = true;
+  }
+  return sawNetworkError ? { live: 'unavailable', account: null } : { live: 'rejected', account: null };
+}
+
+function validateSession(platform, rawCookies) {
+  const cookies = normalizeCookies(rawCookies);
+  if (!cookies.length) return Promise.resolve({ ok: false, error: 'No usable cookies provided', live: 'rejected', account: null });
+  const names = new Set(cookies.map(c => c.name.toLowerCase()));
+  if (!names.has('sessionid')) {
+    return Promise.resolve({ ok: false, error: 'Missing required cookie: sessionid', live: 'rejected', account: null });
+  }
+  const header = cookieHeader(cookies.filter(c => matchesPlatformDomain(c, platform)));
+  const probe = platform === 'instagram' ? probeInstagram(header) : probeTikTok(header);
+  return probe.then(result => ({ ok: true, ...result }));
+}
+
 function safeFilePath(urlPath) {
   const pathname = decodeURIComponent(urlPath.split('?')[0]);
   const requested = pathname === '/' ? '/index.html' : pathname;
@@ -165,6 +312,17 @@ async function handle(req, res) {
 
   if (url.pathname === '/api/health' && req.method === 'GET') {
     return json(res, 200, { ok: true, groqConfigured: Boolean(process.env.GROQ_API_KEY) });
+  }
+
+  if (url.pathname === '/api/validate-session' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const platform = body.platform === 'instagram' ? 'instagram' : 'tiktok';
+      const result = await validateSession(platform, body.cookies);
+      return json(res, result.ok ? 200 : 422, result);
+    } catch (error) {
+      return json(res, 400, { ok: false, error: error.message, live: 'unavailable', account: null });
+    }
   }
 
   if (url.pathname === '/api/generate-story' && req.method === 'POST') {
@@ -216,7 +374,11 @@ const server = http.createServer((req, res) => {
   });
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`StoryForge Studio listening on 0.0.0.0:${PORT}`);
-  console.log(`Groq story engine: ${process.env.GROQ_API_KEY ? 'configured' : 'local demo fallback'}`);
-});
+if (require.main === module) {
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`StoryForge Studio listening on 0.0.0.0:${PORT}`);
+    console.log(`Groq story engine: ${process.env.GROQ_API_KEY ? 'configured' : 'local demo fallback'}`);
+  });
+}
+
+module.exports = { normalizeCookies, validateSession, probeTikTok, probeInstagram };
