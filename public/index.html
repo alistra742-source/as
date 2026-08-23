@@ -142,7 +142,8 @@
       <p class="modal-subtitle" id="modal-subtitle">A fresh story, shaped for vertical video.</p>
       <div class="preview-layout">
         <div class="video-frame" id="video-frame">
-          <div class="frame-top"><span class="live-chip"><i></i> PREVIEW</span><span id="frame-duration">00:00</span></div>
+          <canvas id="video-canvas" width="360" height="640" aria-label="Live rendered video canvas"></canvas>
+          <div class="frame-top"><span class="live-chip"><i></i> <span id="frame-state">PREVIEW</span></span><span id="frame-duration">00:00</span></div>
           <div class="stickman-scene" id="stickman-scene">
             <span class="scene-label" id="scene-label">THE HOOK</span><div class="scene-glow"></div><div class="scene-stickman"><i class="head"></i><i class="body"></i><i class="arm arm-left"></i><i class="arm arm-right"></i><i class="leg leg-left"></i><i class="leg leg-right"></i></div><div class="scene-prop" id="scene-prop">▣</div><div class="scene-caption" id="scene-caption">A quiet station.<br><b>11:47 PM</b></div>
           </div>
@@ -151,12 +152,13 @@
         </div>
         <div class="preview-details">
           <div class="ready-pill"><span class="status-dot"></span><span id="engine-label">Draft generated locally</span></div>
+          <div class="render-status" id="render-status"><span class="render-dot"></span><strong id="render-status-text">Preview ready</strong><span id="render-progress">0%</span></div>
           <h3 id="story-title">The Vanishing at Platform 6</h3>
           <p class="story-hook" id="story-hook">At 11:47 p.m., one camera went dark for exactly ninety seconds.</p>
           <div class="detail-divider"></div>
-          <div class="audio-row"><div class="audio-icon">◖</div><div><strong id="voice-label">Deep narrator</strong><small id="audio-status">Local browser voice preview</small></div><button type="button" class="play-button" id="voice-button" aria-label="Play voice preview">▶</button></div>
-          <div class="modal-actions"><button type="button" class="secondary-button" id="export-button"><span>↓</span> Export storyboard</button><button type="button" class="primary-button" id="queue-button">Queue test post <span class="button-arrow">→</span></button></div>
-          <p class="publish-note"><span>i</span> This prototype does not post or use session cookies. Production publishing should use approved platform APIs and OAuth.</p>
+          <div class="audio-row"><div class="audio-icon">◖</div><div><strong id="voice-label">Deep narrator</strong><small id="audio-status">Live browser voiceover</small></div><button type="button" class="play-button" id="voice-button" aria-label="Play voice preview">▶</button></div>
+          <div class="modal-actions"><button type="button" class="secondary-button" id="export-button"><span>↓</span> Export storyboard</button><button type="button" class="primary-button" id="render-button"><span class="button-icon">●</span> Render demo video <span class="button-arrow">→</span></button><button type="button" class="secondary-button hidden" id="download-video-button"><span>↓</span> Download video</button></div>
+          <p class="publish-note"><span>i</span> The live render includes timed captions and motion. Voiceover plays privately through your browser while rendering; production audio export needs a server-side TTS provider. No post or session cookie is used.</p>
         </div>
       </div>
     </section>

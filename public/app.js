@@ -6,6 +6,12 @@ const state = {
   currentScene: 0,
   sceneTimer: null,
   voiceTimer: null,
+  renderFrame: null,
+  renderStartedAt: 0,
+  renderDuration: 0,
+  recorder: null,
+  videoChunks: [],
+  videoBlob: null,
   speaking: false,
   usedIds: JSON.parse(localStorage.getItem('storyforge-used-ids') || '[]')
 };
@@ -128,17 +134,35 @@ async function requestStory() {
 function stopPreview() {
   clearTimeout(state.sceneTimer);
   state.sceneTimer = null;
+  if (state.renderFrame) cancelAnimationFrame(state.renderFrame);
+  state.renderFrame = null;
+  if (state.recorder && state.recorder.state !== 'inactive') state.recorder.stop();
+  state.recorder = null;
   if ('speechSynthesis' in window) window.speechSynthesis.cancel();
   clearTimeout(state.voiceTimer);
   state.speaking = false;
   $('#voice-button').classList.remove('playing');
   $('#voice-button').textContent = '▶';
-  $('#audio-status').textContent = 'Local browser voice preview';
+  $('#audio-status').textContent = 'Live browser voiceover';
+  if ($('#render-status')) {
+    $('#render-status').classList.remove('live');
+    $('#render-status-text').textContent = 'Preview ready';
+    $('#render-progress').textContent = '0%';
+  }
+  if ($('#render-button')) {
+    $('#render-button').disabled = false;
+    $('#render-button').innerHTML = '<span class="button-icon">●</span> Render demo video <span class="button-arrow">→</span>';
+  }
 }
 
 function openModal(result) {
+  stopPreview();
   state.story = result;
   state.currentScene = 0;
+  state.videoBlob = null;
+  $('#download-video-button').classList.add('hidden');
+  $('#video-frame').classList.remove('canvas-mode');
+  $('#frame-state').textContent = 'PREVIEW';
   $('#story-title').textContent = result.story.title;
   $('#story-hook').textContent = result.story.hook;
   $('#engine-label').textContent = result.engine === 'Local demo library' ? 'Draft generated locally' : result.engine;
@@ -152,6 +176,10 @@ function openModal(result) {
   document.body.style.overflow = 'hidden';
   if (state.format === 'chat') renderChatPreview();
   else renderScene(0);
+  // Starting a draft also starts the same vertical render pass used for the demo video.
+  setTimeout(() => {
+    if (!$('#modal-backdrop').classList.contains('hidden') && state.story === result) startDemoRender();
+  }, 450);
 }
 
 function closeModal() {
@@ -213,6 +241,293 @@ function renderChatPreview() {
     messages.appendChild(node);
   });
   $('#frame-duration').textContent = '00:32';
+}
+
+function getChatMessages() {
+  const script = state.story?.story?.script || '';
+  const matches = script.match(/(?:Maya|Leo|UNKNOWN)\s*:\s*[^:]+?(?=\s+(?:Maya|Leo|UNKNOWN)\s*:|$)/gi) || [];
+  const parsed = matches.slice(0, 8).map(item => {
+    const split = item.indexOf(':');
+    return { name: (split > -1 ? item.slice(0, split) : 'Maya').trim().toUpperCase(), text: (split > -1 ? item.slice(split + 1) : item).trim() };
+  }).filter(item => item.text);
+  return parsed.length ? parsed : [
+    { name: 'MAYA', text: 'Are you still there?' },
+    { name: 'LEO', text: 'I never left.' },
+    { name: 'MAYA', text: 'Then who just used your key?' },
+    { name: 'UNKNOWN', text: 'Stop pretending you cannot see me.' }
+  ];
+}
+
+function wrapCanvasText(ctx, text, maxWidth) {
+  const words = String(text || '').split(/\s+/);
+  const lines = [];
+  let line = '';
+  words.forEach(word => {
+    const next = line ? `${line} ${word}` : word;
+    if (ctx.measureText(next).width > maxWidth && line) {
+      lines.push(line);
+      line = word;
+    } else line = next;
+  });
+  if (line) lines.push(line);
+  return lines;
+}
+
+function roundedRectPath(ctx, x, y, width, height, radius) {
+  if (typeof ctx.roundRect === 'function') {
+    ctx.roundRect(x, y, width, height, radius);
+    return;
+  }
+  const r = Math.min(radius, width / 2, height / 2);
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + width, y, x + width, y + height, r);
+  ctx.arcTo(x + width, y + height, x, y + height, r);
+  ctx.arcTo(x, y + height, x, y, r);
+  ctx.arcTo(x, y, x + width, y, r);
+  ctx.closePath();
+}
+
+function drawCanvasCaption(ctx, cue, width, height) {
+  const boxX = 22;
+  const boxWidth = width - 44;
+  ctx.font = '600 16px DM Sans, Arial, sans-serif';
+  const lines = wrapCanvasText(ctx, cue, boxWidth - 28).slice(0, 3);
+  const boxHeight = 30 + lines.length * 23;
+  const boxY = height - 116 - boxHeight;
+  ctx.fillStyle = 'rgba(18, 20, 32, .78)';
+  ctx.beginPath();
+  roundedRectPath(ctx, boxX, boxY, boxWidth, boxHeight, 12);
+  ctx.fill();
+  ctx.fillStyle = '#e6dc9a';
+  ctx.fillRect(boxX, boxY, 4, boxHeight);
+  ctx.fillStyle = '#fffdf3';
+  lines.forEach((line, index) => ctx.fillText(line, boxX + 16, boxY + 27 + index * 23));
+  return boxY;
+}
+
+function drawStickman(ctx, x, y, scale, elapsed) {
+  const bounce = Math.sin(elapsed * 4.2) * 2.5 * scale;
+  const talk = Math.sin(elapsed * 10) > .25;
+  const s = scale;
+  ctx.save();
+  ctx.translate(x, y + bounce);
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.strokeStyle = '#191b24';
+  ctx.fillStyle = '#fffef9';
+  ctx.lineWidth = 5 * s;
+  // Head, with the clean outlined look from the reference image.
+  ctx.beginPath();
+  ctx.arc(0, -126 * s, 44 * s, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  // Three loose hair strokes.
+  ctx.lineWidth = 4 * s;
+  [-25, 0, 25].forEach((offset, index) => {
+    ctx.beginPath();
+    ctx.moveTo(offset * s, -168 * s);
+    ctx.quadraticCurveTo((offset - 3) * s, (-183 - index * 4) * s, (offset + 7) * s, (-192 - index * 2) * s);
+    ctx.stroke();
+  });
+  // Eyes.
+  ctx.fillStyle = '#191b24';
+  ctx.beginPath(); ctx.ellipse(-14 * s, -135 * s, 7 * s, 12 * s, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(14 * s, -135 * s, 7 * s, 12 * s, 0, 0, Math.PI * 2); ctx.fill();
+  // Friendly talking smile.
+  ctx.strokeStyle = '#191b24';
+  ctx.lineWidth = 3.5 * s;
+  ctx.beginPath();
+  ctx.arc(0, -129 * s, 24 * s, .18, Math.PI - .18);
+  ctx.stroke();
+  if (talk) {
+    ctx.fillStyle = '#f29b92';
+    ctx.beginPath(); ctx.ellipse(0, -113 * s, 7 * s, 3 * s, 0, 0, Math.PI * 2); ctx.fill();
+  }
+  // Body and open explaining pose.
+  ctx.strokeStyle = '#191b24';
+  ctx.lineWidth = 5 * s;
+  ctx.beginPath(); ctx.moveTo(0, -82 * s); ctx.lineTo(0, 10 * s); ctx.stroke();
+  const armLift = Math.sin(elapsed * 3) * 4 * s;
+  ctx.beginPath(); ctx.moveTo(0, -65 * s); ctx.lineTo(-68 * s, (-103 + armLift) * s); ctx.lineTo(-102 * s, (-93 + armLift) * s); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0, -65 * s); ctx.lineTo(68 * s, (-103 - armLift) * s); ctx.lineTo(102 * s, (-93 - armLift) * s); ctx.stroke();
+  // Open hands with three small fingers.
+  const drawHand = (handX, handY, side) => {
+    ctx.beginPath(); ctx.arc(handX, handY, 8 * s, 0, Math.PI * 2); ctx.stroke();
+    for (let finger = -1; finger <= 1; finger++) {
+      ctx.beginPath();
+      ctx.moveTo(handX + side * 3 * s, handY + finger * 4 * s);
+      ctx.lineTo(handX + side * (13 + Math.abs(finger) * 2) * s, handY + (finger - .2) * 7 * s);
+      ctx.stroke();
+    }
+  };
+  drawHand(-106 * s, (-94 + armLift) * s, -1);
+  drawHand(106 * s, (-94 - armLift) * s, 1);
+  // Long legs with soft oval shoes.
+  ctx.beginPath(); ctx.moveTo(0, 10 * s); ctx.lineTo(-54 * s, 128 * s); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0, 10 * s); ctx.lineTo(57 * s, 128 * s); ctx.stroke();
+  ctx.fillStyle = '#31323b';
+  ctx.beginPath(); ctx.ellipse(-67 * s, 131 * s, 25 * s, 7 * s, -.08, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(70 * s, 131 * s, 25 * s, 7 * s, .08, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  ctx.restore();
+}
+
+function drawStickmanCanvasFrame(ctx, elapsed, scene, sceneIndex, totalScenes, width, height) {
+  const background = ctx.createLinearGradient(0, 0, width, height);
+  background.addColorStop(0, ['#f8f4e9', '#e8f0fa', '#f6e8f0', '#e9f5ef'][sceneIndex % 4]);
+  background.addColorStop(1, ['#b9cce5', '#c7d8dc', '#d8c2d2', '#bed7cb'][sceneIndex % 4]);
+  ctx.fillStyle = background;
+  ctx.fillRect(0, 0, width, height);
+  // Soft spotlight and subtle storyboard grid.
+  ctx.fillStyle = 'rgba(255,255,255,.42)';
+  ctx.beginPath(); ctx.arc(width * .72, height * .32, 142, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = 'rgba(73, 84, 105, .12)'; ctx.lineWidth = 1;
+  for (let y = 0; y < height; y += 32) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(width, y); ctx.stroke(); }
+  ctx.fillStyle = '#52596a'; ctx.font = '500 10px DM Mono, monospace'; ctx.letterSpacing = '1px'; ctx.fillText('LIVE STICKMAN EXPLAINER', 22, 30);
+  ctx.fillStyle = 'rgba(42, 45, 56, .68)'; ctx.font = '500 10px DM Mono, monospace'; ctx.fillText(`${String(scene.label || 'SCENE').toUpperCase()}  /  ${String(sceneIndex + 1).padStart(2, '0')}`, 22, 55);
+  drawStickman(ctx, width * .5, height * .58, .88, elapsed);
+  ctx.fillStyle = '#677089';
+  ctx.font = '600 15px DM Sans, Arial, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('explaining the clue', width * .5, height * .77);
+  ctx.textAlign = 'left';
+  drawCanvasCaption(ctx, scene.cue, width, height);
+  ctx.fillStyle = 'rgba(54, 60, 72, .62)';
+  ctx.font = '500 10px DM Mono, monospace';
+  ctx.fillText('STORYFORGE  ·  9:16', 22, height - 22);
+  // A little live speech indicator makes the relationship to the voiceover clear.
+  ctx.fillStyle = '#7b6cf2';
+  ctx.beginPath(); ctx.arc(width - 31, 29, 4 + Math.abs(Math.sin(elapsed * 6)) * 2, 0, Math.PI * 2); ctx.fill();
+}
+
+function drawChatCanvasFrame(ctx, elapsed, scenes, width, height) {
+  ctx.fillStyle = '#f5f3fc'; ctx.fillRect(0, 0, width, height);
+  ctx.fillStyle = '#9894b4'; ctx.font = '500 10px DM Mono, monospace'; ctx.fillText('PRIVATE CHAT  /  LIVE PREVIEW', 18, 29);
+  ctx.fillStyle = '#fff'; ctx.fillRect(14, 50, width - 28, 53);
+  ctx.fillStyle = '#d49bb4'; ctx.beginPath(); ctx.arc(36, 76, 15, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#fff'; ctx.font = '700 12px DM Sans, Arial'; ctx.textAlign = 'center'; ctx.fillText('M', 36, 80); ctx.textAlign = 'left';
+  ctx.fillStyle = '#2b2c38'; ctx.font = '700 12px DM Sans, Arial'; ctx.fillText('m / leo', 59, 74);
+  ctx.fillStyle = '#9aa39e'; ctx.font = '500 9px DM Mono, monospace'; ctx.fillText('active now', 59, 88);
+  const messages = scenes.map(scene => ({ name: String(scene.label || 'MAYA').toUpperCase(), text: scene.cue }));
+  const durations = scenes.map(scene => Math.max(3, Number(scene.duration) || 5));
+  let messageEnd = 0;
+  const visible = [];
+  messages.forEach((message, index) => { messageEnd += durations[index]; if (elapsed >= messageEnd - durations[index] * .72) visible.push({ ...message, index }); });
+  const shown = visible.slice(-5);
+  let y = 150;
+  shown.forEach((message, index) => {
+    const right = message.name !== 'MAYA' && message.name !== 'UNKNOWN';
+    const unknown = message.name === 'UNKNOWN';
+    ctx.font = '500 12px DM Sans, Arial';
+    const lines = wrapCanvasText(ctx, message.text, 210).slice(0, 3);
+    const boxH = 25 + lines.length * 17;
+    const boxW = Math.min(270, Math.max(120, Math.max(...lines.map(line => ctx.measureText(line).width)) + 22));
+    const x = right ? width - 18 - boxW : 18;
+    ctx.fillStyle = unknown ? '#675eb0' : right ? '#d8f1e5' : '#fff';
+    ctx.beginPath(); roundedRectPath(ctx, x, y, boxW, boxH, 11); ctx.fill();
+    ctx.fillStyle = unknown ? '#e6e2ff' : right ? '#6a9987' : '#9b83ae'; ctx.font = '500 8px DM Mono, monospace'; ctx.fillText(message.name, x + 11, y + 13);
+    ctx.fillStyle = unknown ? '#fff' : right ? '#3f7561' : '#555265'; ctx.font = '500 12px DM Sans, Arial'; lines.forEach((line, lineIndex) => ctx.fillText(line, x + 11, y + 30 + lineIndex * 17));
+    y += boxH + 12;
+  });
+  ctx.fillStyle = '#fff'; ctx.beginPath(); roundedRectPath(ctx, 18, height - 64, width - 36, 34, 17); ctx.fill();
+  ctx.fillStyle = '#aaa4bd'; ctx.font = '500 11px DM Sans, Arial'; ctx.fillText('typing…', 33, height - 43);
+  ctx.fillStyle = '#6e65c9'; ctx.font = '500 9px DM Mono, monospace'; ctx.fillText('VOICEOVER  ·  MAYA + LEO', 18, height - 15);
+}
+
+function renderCanvasFrame(elapsed) {
+  const canvas = $('#video-canvas');
+  if (!canvas) return { elapsed: 0, total: 1, sceneIndex: 0 };
+  const ctx = canvas.getContext('2d');
+  const scenes = state.story?.story?.scenes || [];
+  const total = Math.max(1, scenes.reduce((sum, scene) => sum + Math.max(3, Number(scene.duration) || 5), 0));
+  let remaining = Math.min(elapsed, total);
+  let sceneIndex = 0;
+  while (sceneIndex < scenes.length - 1 && remaining >= Math.max(3, Number(scenes[sceneIndex].duration) || 5)) {
+    remaining -= Math.max(3, Number(scenes[sceneIndex].duration) || 5);
+    sceneIndex += 1;
+  }
+  if (state.format === 'chat') drawChatCanvasFrame(ctx, elapsed, scenes, canvas.width, canvas.height);
+  else drawStickmanCanvasFrame(ctx, elapsed, scenes[sceneIndex] || { label: 'SCENE', cue: '' }, sceneIndex, scenes.length, canvas.width, canvas.height);
+  return { elapsed, total, sceneIndex };
+}
+
+function supportedVideoMime() {
+  if (!window.MediaRecorder) return '';
+  return ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'].find(type => MediaRecorder.isTypeSupported(type)) || '';
+}
+
+function startDemoRender() {
+  if (!state.story) return;
+  const canvas = $('#video-canvas');
+  if (!canvas || !canvas.captureStream || !window.MediaRecorder) {
+    showToast('Live canvas render is available, but this browser cannot export WebM video', 'error');
+    $('#video-frame').classList.add('canvas-mode');
+    $('#frame-state').textContent = 'LIVE PREVIEW';
+    renderCanvasFrame(0);
+    speakStory();
+    return;
+  }
+  stopPreview();
+  $('#video-frame').classList.add('canvas-mode');
+  $('#frame-state').textContent = 'LIVE RENDER';
+  $('#render-status').classList.add('live');
+  $('#render-status').classList.remove('done');
+  $('#render-status-text').textContent = 'Rendering video + captions';
+  $('#render-progress').textContent = '0%';
+  $('#render-button').disabled = true;
+  $('#render-button').innerHTML = '<span class="button-icon">◌</span> Rendering live…';
+  $('#download-video-button').classList.add('hidden');
+  state.videoBlob = null;
+  state.renderStartedAt = performance.now();
+  const mimeType = supportedVideoMime();
+  const stream = canvas.captureStream(30);
+  state.videoChunks = [];
+  state.recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+  state.recorder.ondataavailable = event => { if (event.data && event.data.size) state.videoChunks.push(event.data); };
+  state.recorder.onstop = () => {
+    if (state.videoChunks.length) {
+      state.videoBlob = new Blob(state.videoChunks, { type: mimeType || 'video/webm' });
+      $('#download-video-button').classList.remove('hidden');
+      $('#render-status').classList.remove('live');
+      $('#render-status').classList.add('done');
+      $('#render-status-text').textContent = 'Video ready to download';
+      $('#render-progress').textContent = '100%';
+      $('#render-button').disabled = false;
+      $('#render-button').innerHTML = '<span class="button-icon">↻</span> Render again <span class="button-arrow">→</span>';
+      showToast('Demo video ready — captions and motion are synced');
+    }
+    state.recorder = null;
+  };
+  state.recorder.start(250);
+  // This is intentionally a local browser voiceover: free, private, and heard while the demo renders.
+  speakStory();
+  const tick = now => {
+    const elapsed = (now - state.renderStartedAt) / 1000;
+    const frame = renderCanvasFrame(elapsed);
+    const progress = Math.min(100, Math.round((frame.elapsed / frame.total) * 100));
+    $('#render-progress').textContent = `${progress}%`;
+    $('#frame-duration').textContent = `00:${String(Math.floor(Math.min(frame.elapsed, frame.total))).padStart(2, '0')}`;
+    if (elapsed < frame.total) {
+      state.renderFrame = requestAnimationFrame(tick);
+    } else {
+      state.renderFrame = null;
+      renderCanvasFrame(frame.total);
+      if (state.recorder && state.recorder.state !== 'inactive') state.recorder.stop();
+    }
+  };
+  state.renderFrame = requestAnimationFrame(tick);
+}
+
+function downloadVideo() {
+  if (!state.videoBlob) {
+    showToast('Render the demo video first', 'error');
+    return;
+  }
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(state.videoBlob);
+  link.download = `${slugify(state.story.story.title)}-demo.webm`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  showToast('Demo video downloaded as WebM');
 }
 
 function escapeHtml(value) {
@@ -346,7 +661,8 @@ function init() {
   $('#modal-backdrop').addEventListener('click', event => { if (event.target === $('#modal-backdrop')) closeModal(); });
   $('#voice-button').addEventListener('click', speakStory);
   $('#export-button').addEventListener('click', downloadStoryboard);
-  $('#queue-button').addEventListener('click', () => { showToast(`${state.platform === 'tiktok' ? 'TikTok' : 'Instagram'} queue saved as a test — no post was sent`); });
+  $('#render-button').addEventListener('click', startDemoRender);
+  $('#download-video-button').addEventListener('click', downloadVideo);
   $('#open-library').addEventListener('click', () => $('#library').scrollIntoView({ behavior: 'smooth' }));
   $('#all-drafts').addEventListener('click', () => showToast('Library view is coming next — three latest drafts are shown here'));
   $('#learn-more').addEventListener('click', () => showToast('OAuth is the safe path; cookies are never collected'));
