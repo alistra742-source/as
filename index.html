@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Captcha Trainer — Practice &amp; Data</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%231a73e8'/%3E%3Cpath d='M6 12.5l4 4L18 7.5' stroke='white' stroke-width='2.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header class="site-header">
+  <div class="header-inner">
+    <div class="brand">
+      <span class="brand-badge" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="22" height="22"><rect width="24" height="24" rx="6" fill="#1a73e8"/><path d="M6 12.5l4 4L18 7.5" stroke="#fff" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </span>
+      <div class="brand-text">
+        <h1>Captcha Trainer</h1>
+        <p>Human-verification practice lab</p>
+      </div>
+    </div>
+
+    <nav class="tabs" role="tablist" aria-label="Sections">
+      <button id="tab-trainer" class="tab is-active" role="tab" type="button"
+              aria-selected="true" aria-controls="panel-trainer" data-tab="trainer">Trainer</button>
+      <button id="tab-data" class="tab" role="tab" type="button"
+              aria-selected="false" aria-controls="panel-data" data-tab="data">Data</button>
+    </nav>
+
+    <a class="discord-btn" href="https://discord.com/register" target="_blank" rel="noopener noreferrer"
+       aria-label="Join Discord — opens the Discord registration page">
+      <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" fill="currentColor"><path d="M20.317 4.3698a19.7913 19.7913 0 00-4.8851-1.5152.0741.0741 0 00-.0785.0371c-.211.3753-.4447.8648-.6083 1.2495-1.8447-.2762-3.68-.2762-5.4868 0-.1636-.3933-.4058-.8742-.6177-1.2495a.077.077 0 00-.0785-.037 19.7363 19.7363 0 00-4.8852 1.515.0699.0699 0 00-.0321.0277C.5334 9.0458-.319 13.5799.0992 18.0578a.0824.0824 0 00.0312.0561c2.0528 1.5076 4.0413 2.4228 5.9929 3.0294a.0777.0777 0 00.0842-.0276c.4616-.6304.8731-1.2952 1.226-1.9942a.076.076 0 00-.0416-.1057c-.6528-.2476-1.2743-.5495-1.8722-.8923a.077.077 0 01-.0076-.1277c.1258-.0943.2517-.1923.3718-.2914a.0743.0743 0 01.0776-.0105c3.9278 1.7933 8.18 1.7933 12.0614 0a.0739.0739 0 01.0785.0095c.1202.099.246.1981.3728.2924a.077.077 0 01-.0066.1276 12.2986 12.2986 0 01-1.873.8914.0766.0766 0 00-.0407.1067c.3604.698.7719 1.3628 1.225 1.9932a.076.076 0 00.0842.0286c1.961-.6067 3.9495-1.5219 6.0023-3.0294a.077.077 0 00.0313-.0552c.5004-5.177-.8382-9.6739-3.5485-13.6604a.061.061 0 00-.0312-.0286zM8.02 15.3312c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9555-2.4189 2.157-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.9555 2.4189-2.1569 2.4189zm7.9748 0c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9554-2.4189 2.1569-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.946 2.4189-2.1568 2.4189Z"/></svg>
+      <span>Join Discord</span>
+    </a>
+  </div>
+</header>
+
+<main>
+  <!-- ================= TRAINER ================= -->
+  <section id="panel-trainer" class="panel is-active" role="tabpanel" aria-labelledby="tab-trainer">
+    <div class="trainer-wrap">
+
+      <div class="captcha-widget" id="captcha-widget" data-state="idle">
+        <button class="checkbox" id="human-checkbox" type="button" role="checkbox"
+                aria-checked="false" aria-label="I am not a robot">
+          <span class="box" aria-hidden="true">
+            <svg class="check" viewBox="0 0 24 24"><path d="M4.5 12.5l5 5L19.5 7"/></svg>
+            <span class="spinner"></span>
+          </span>
+        </button>
+        <span class="widget-label" id="widget-label">I'm not a robot</span>
+        <div class="widget-brand" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="26" height="26"><circle cx="12" cy="12" r="11" fill="#1a73e8"/><path d="M6.5 12.5l3.5 3.5 7.5-8" stroke="#fff" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span class="wb-name">CaptchaTrainer</span>
+          <span class="wb-sub">Privacy · Terms</span>
+        </div>
+      </div>
+
+      <p class="verify-hint" id="verify-hint" aria-live="polite">Click the checkbox to unlock the image challenges.</p>
+
+      <div class="challenge-card hidden" id="challenge-card">
+        <div class="challenge-prompt">
+          <p class="prompt-lead">Select all squares with</p>
+          <h2 id="challenge-target">traffic lights</h2>
+          <p class="prompt-sub">Click a square to select it — click again to undo.</p>
+        </div>
+
+        <div class="challenge-grid" id="challenge-grid" role="group" aria-label="Image challenge: 3 by 3 grid"></div>
+
+        <p class="challenge-status" id="challenge-status" role="status" aria-live="polite"></p>
+
+        <div class="challenge-actions">
+          <button class="icon-btn" id="btn-shuffle" type="button" title="Load a different challenge" aria-label="Load a different challenge">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+          </button>
+          <div class="progress-dots" id="progress-dots" aria-label="Challenge progress"></div>
+          <button class="verify-btn" id="btn-verify" type="button">VERIFY</button>
+          <button class="verify-btn next hidden" id="btn-next" type="button">NEXT</button>
+        </div>
+      </div>
+
+      <p class="trainer-progress" id="trainer-progress">Solved 0 of 6</p>
+      <button class="reset-btn" id="btn-reset" type="button">Reset progress</button>
+    </div>
+  </section>
+
+  <!-- ================= DATA ================= -->
+  <section id="panel-data" class="panel show-answers" role="tabpanel" aria-labelledby="tab-data" hidden>
+    <div class="data-head">
+      <h2>Challenge data</h2>
+      <p class="data-sub">Every image challenge in the trainer dataset — all of them, with their answer keys.</p>
+      <div class="data-stats" id="data-stats"></div>
+      <label class="answers-toggle" for="toggle-answers">
+        <input type="checkbox" id="toggle-answers" checked>
+        <span class="switch" aria-hidden="true"></span>
+        <span class="toggle-text">Show answers</span>
+      </label>
+      <p class="legend">
+        <span class="legend-item"><span class="legend-swatch target"></span>target square</span>
+        <span class="legend-item"><span class="legend-swatch borderline"></span>optional (only a tiny glimpse)</span>
+      </p>
+    </div>
+    <div class="data-grid" id="data-grid"></div>
+  </section>
+</main>
+
+<footer class="site-footer">
+  <a class="discord-btn big" href="https://discord.com/register" target="_blank" rel="noopener noreferrer"
+     aria-label="Create your Discord account — opens the Discord registration page">
+    <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" fill="currentColor"><path d="M20.317 4.3698a19.7913 19.7913 0 00-4.8851-1.5152.0741.0741 0 00-.0785.0371c-.211.3753-.4447.8648-.6083 1.2495-1.8447-.2762-3.68-.2762-5.4868 0-.1636-.3933-.4058-.8742-.6177-1.2495a.077.077 0 00-.0785-.037 19.7363 19.7363 0 00-4.8852 1.515.0699.0699 0 00-.0321.0277C.5334 9.0458-.319 13.5799.0992 18.0578a.0824.0824 0 00.0312.0561c2.0528 1.5076 4.0413 2.4228 5.9929 3.0294a.0777.0777 0 00.0842-.0276c.4616-.6304.8731-1.2952 1.226-1.9942a.076.076 0 00-.0416-.1057c-.6528-.2476-1.2743-.5495-1.8722-.8923a.077.077 0 01-.0076-.1277c.1258-.0943.2517-.1923.3718-.2914a.0743.0743 0 01.0776-.0105c3.9278 1.7933 8.18 1.7933 12.0614 0a.0739.0739 0 01.0785.0095c.1202.099.246.1981.3728.2924a.077.077 0 01-.0066.1276 12.2986 12.2986 0 01-1.873.8914.0766.0766 0 00-.0407.1067c.3604.698.7719 1.3628 1.225 1.9932a.076.076 0 00.0842.0286c1.961-.6067 3.9495-1.5219 6.0023-3.0294a.077.077 0 00.0313-.0552c.5004-5.177-.8382-9.6739-3.5485-13.6604a.061.061 0 00-.0312-.0286zM8.02 15.3312c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9555-2.4189 2.157-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.9555 2.4189-2.1569 2.4189zm7.9748 0c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9554-2.4189 2.1569-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.946 2.4189-2.1568 2.4189Z"/></svg>
+    <span>Create your Discord account</span>
+  </a>
+  <p>Captcha Trainer · practice dataset · not affiliated with Discord or Google reCAPTCHA</p>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
