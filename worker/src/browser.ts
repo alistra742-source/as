@@ -1,0 +1,377 @@
+import fs from "node:fs";
+import path from "node:path";
+import { chromium, type BrowserContext, type Page } from "playwright";
+import { env, START_URLS, type PlatformKey } from "./config.js";
+import type { RemoteCmd, ServerMsg } from "./protocol.js";
+import { Store } from "./store.js";
+
+const LAUNCH_ARGS = [
+  "--no-sandbox",
+  "--disable-dev-shm-usage",
+  "--disable-blink-features=AutomationControlled",
+  "--disable-features=IsolateOrigins,site-per-process",
+];
+
+const UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+export interface RigClient {
+  send: (msg: ServerMsg) => void;
+}
+
+export class Rig {
+  platform: PlatformKey;
+  store: Store;
+  clients = new Set<RigClient>();
+  context: BrowserContext | null = null;
+  control: Page | null = null;
+  private frameTimer: NodeJS.Timeout | null = null;
+  private loginTimer: NodeJS.Timeout | null = null;
+  private detectBusy = false;
+
+  constructor(platform: PlatformKey, store: Store) {
+    this.platform = platform;
+    this.store = store;
+  }
+
+  profileDir(): string {
+    const dir = path.join(env.dataDir, `profile-${this.platform}`);
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
+  broadcast(msg: ServerMsg) {
+    for (const c of this.clients) {
+      try {
+        c.send(msg);
+      } catch {
+        /* drop dead sockets */
+      }
+    }
+  }
+
+  async ensureContext(): Promise<BrowserContext> {
+    if (this.context) return this.context;
+    if (env.browserbaseApiKey && env.browserbaseProjectId) {
+      const browser = await chromium.connectOverCDP(
+        `wss://connect.browserbase.com/v1/project/${env.browserbaseProjectId}?apiKey=${env.browserbaseApiKey}`
+      );
+      this.context = browser.contexts()[0] ?? (await browser.newContext({ viewport: { width: 1280, height: 900 } }));
+    } else {
+      this.context = await chromium.launchPersistentContext(this.profileDir(), {
+        headless: true,
+        viewport: { width: 1280, height: 900 },
+        userAgent: UA,
+        locale: "en-US",
+        timezoneId: "America/New_York",
+        args: LAUNCH_ARGS,
+      });
+    }
+    this.control = null;
+    return this.context;
+  }
+
+  async openControlSession(): Promise<Page> {
+    const ctx = await this.ensureContext();
+    if (this.control && !this.control.isClosed()) return this.control;
+    const page = await ctx.newPage();
+    this.control = page;
+    page.on("framenavigated", (frame) => {
+      if (frame !== page.mainFrame()) return;
+      const url = frame.url();
+      if (!url || url === "about:blank") return;
+      this.broadcast({ type: "nav", url, title: url });
+      void this.detectLogin();
+    });
+    this.broadcast({ type: "ready", sessionId: `rig-${this.platform}`, url: START_URLS[this.platform] });
+    this.startLoops();
+    try {
+      await page.goto(START_URLS[this.platform], { waitUntil: "domcontentloaded", timeout: 45_000 });
+    } catch {
+      /* page may be mid-challenge; frames still stream */
+    }
+    return page;
+  }
+
+  async newEnginePage(): Promise<Page> {
+    const ctx = await this.ensureContext();
+    return ctx.newPage();
+  }
+
+  private startLoops() {
+    if (!this.frameTimer) {
+      this.frameTimer = setInterval(() => void this.pushFrame(), Math.max(400, env.frameIntervalMs));
+    }
+    if (!this.loginTimer) {
+      this.loginTimer = setInterval(() => void this.detectLogin(), 5000);
+    }
+  }
+
+  stopLoops() {
+    if (this.frameTimer) {
+      clearInterval(this.frameTimer);
+      this.frameTimer = null;
+    }
+    if (this.loginTimer) {
+      clearInterval(this.loginTimer);
+      this.loginTimer = null;
+    }
+  }
+
+  private async pushFrame() {
+    const page = this.control;
+    if (this.clients.size === 0 || !page || page.isClosed()) return;
+    try {
+      const shot = await page.screenshot({ type: "jpeg", quality: 52 });
+      this.broadcast({ type: "frame", data: shot.toString("base64"), at: Date.now() });
+    } catch {
+      /* page navigating — skip this frame */
+    }
+  }
+
+  /** Best-effort "am I signed in" detection. Engines pause until this is true. */
+  async detectLogin(): Promise<boolean> {
+    const page = this.control;
+    if (!page || page.isClosed() || this.detectBusy) return this.store.rig(this.platform).loggedIn;
+    this.detectBusy = true;
+    try {
+      let logged = false;
+      if (this.platform === "tiktok") {
+        logged = await page.evaluate(() => {
+          const u = location.href;
+          if (u.includes("login") || u.includes("passport")) return false;
+          return !!(
+            document.querySelector(
+              '[data-e2e="profile-icon"], [data-e2e="user-avatar"], a[data-e2e="user-avatar"], [data-e2e="upload-icon"]'
+            ) ||
+            (u.includes("/foryou") && !document.querySelector('[data-e2e="top-login-button"]'))
+          );
+        });
+      } else if (this.platform === "instagram") {
+        logged = await page.evaluate(() => {
+          const u = location.href;
+          if (u.includes("/accounts/login")) return false;
+          return (
+            !!document.querySelector(
+              'a[href*="/direct/inbox/"], svg[aria-label="Home"], svg[aria-label="New post"], svg[aria-label="Search"]'
+            ) || (!!document.querySelector("main") && !document.body.innerText.includes("Log in"))
+          );
+        });
+      } else {
+        logged = true;
+      }
+      const prev = this.store.rig(this.platform).loggedIn;
+      if (logged !== prev) {
+        this.store.setLoggedIn(this.platform, logged);
+        this.broadcast({ type: "login", loggedIn: logged });
+        this.broadcast({
+          type: "log",
+          level: logged ? "ok" : "warn",
+          text: logged ? `✅ Signed in detected on ${this.platform} — the engine may act.` : `Signed-out state on ${this.platform} — log in to arm the engine.`,
+          at: Date.now(),
+        });
+      }
+      return logged;
+    } catch {
+      return this.store.rig(this.platform).loggedIn;
+    } finally {
+      this.detectBusy = false;
+    }
+  }
+
+  async exec(cmd: RemoteCmd): Promise<void> {
+    const page = this.control;
+    if (!page || page.isClosed()) throw new Error("Control page not open");
+    switch (cmd.t) {
+      case "ping":
+        return;
+      case "back":
+        await page.goBack({ waitUntil: "domcontentloaded" }).catch(() => undefined);
+        return;
+      case "forward":
+        await page.goForward({ waitUntil: "domcontentloaded" }).catch(() => undefined);
+        return;
+      case "reload":
+        await page.reload({ waitUntil: "domcontentloaded" }).catch(() => undefined);
+        return;
+      case "home":
+        await page.goto(START_URLS[this.platform], { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
+        return;
+      case "navigate":
+        await page.goto(cmd.url, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
+        return;
+      case "tap": {
+        const vp = page.viewportSize() ?? { width: 1280, height: 900 };
+        await page.mouse.click(cmd.x * vp.width, cmd.y * vp.height);
+        return;
+      }
+      case "scroll":
+        await page.mouse.wheel(0, cmd.dy);
+        return;
+      case "type":
+        await page.keyboard.type(cmd.text, { delay: 18 });
+        return;
+      case "key":
+        await page.keyboard.press(cmd.key);
+        return;
+    }
+  }
+
+  async close() {
+    this.stopLoops();
+    this.clients.clear();
+    try {
+      await this.context?.close();
+    } catch {
+      /* already closed */
+    }
+    this.context = null;
+    this.control = null;
+  }
+}
+
+/* ------------------------------ scraper helpers ---------------------------- */
+
+export function parseCount(s: string | null | undefined): number | null {
+  if (!s) return null;
+  const m = String(s).replace(/,/g, "").match(/([\d.]+)\s*([KMB])?/i);
+  if (!m) return null;
+  const n = parseFloat(m[1]);
+  const mult = m[2]?.toUpperCase() === "K" ? 1e3 : m[2]?.toUpperCase() === "M" ? 1e6 : m[2]?.toUpperCase() === "B" ? 1e9 : 1;
+  return Math.round(n * mult);
+}
+
+export interface Candidate {
+  url: string;
+  title: string;
+  likes: number;
+  views: number;
+  comments: number;
+  commentSample: string;
+}
+
+/** Scan the For You feed (or platform home) for candidate videos. */
+export async function scrapeCandidates(page: Page, likesFloor: number): Promise<Candidate[]> {
+  const url =
+    page.url().includes("tiktok.com")
+      ? "https://www.tiktok.com/foryou"
+      : page.url().includes("instagram.com")
+        ? "https://www.instagram.com/reels/"
+        : page.url();
+  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
+  await page.waitForTimeout(4000);
+
+  const items = await page.evaluate(() => {
+    const out: { url: string; label: string }[] = [];
+    const hrefs = new Set<string>();
+    const els = document.querySelectorAll("a[href*='/video/'], a[href*='/reel/']");
+    for (const a of els) {
+      const href = (a as HTMLAnchorElement).href.split("?")[0];
+      if (hrefs.has(href)) continue;
+      hrefs.add(href);
+      out.push({ url: href, label: a.getAttribute("aria-label") || a.textContent || "" });
+      if (out.length >= 40) break;
+    }
+    return out;
+  });
+
+  const candidates: Candidate[] = [];
+  for (const it of items) {
+    const likes = parseCount(it.label.match(/([\d.,]+[KMB]?)\s*likes?/i)?.[1]);
+    const views = parseCount(it.label.match(/([\d.,]+[KMB]?)\s*views?/i)?.[1]);
+    const comments = parseCount(it.label.match(/([\d.,]+[KMB]?)\s*comments?/i)?.[1]);
+    if (likes && likes >= likesFloor) {
+      candidates.push({
+        url: it.url,
+        title: it.label.slice(0, 160) || "Untitled clip",
+        likes,
+        views: views ?? 0,
+        comments: comments ?? 0,
+        commentSample: "",
+      });
+    }
+  }
+  return candidates.slice(0, 12);
+}
+
+/** Read a few comments off a video page (best effort). */
+export async function scrapeCommentSample(page: Page, url: string): Promise<string> {
+  try {
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => undefined);
+    await page.waitForTimeout(2000);
+    return await page.evaluate(() => {
+      const sels = [
+        '[data-e2e="comment-item"] [data-e2e="comment-text"]',
+        '[data-e2e="comment-item"]',
+        'div[role="article"] span',
+      ];
+      for (const sel of sels) {
+        const nodes = Array.from(document.querySelectorAll(sel)).slice(0, 5);
+        const text = nodes.map((n) => (n.textContent || "").trim()).filter(Boolean).join(" | ");
+        if (text) return text.slice(0, 700);
+      }
+      return "";
+    });
+  } catch {
+    return "";
+  }
+}
+
+export interface VideoStats {
+  views: number | null;
+  likes: number | null;
+  comments: number | null;
+}
+
+/** Parse view/like/comment stats from a published video page. */
+export async function readVideoStats(page: Page, url: string): Promise<VideoStats> {
+  try {
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => undefined);
+    await page.waitForTimeout(1500);
+  } catch {
+    return { views: null, likes: null, comments: null };
+  }
+  try {
+    return await page.evaluate(() => {
+      const cnt = (s: string | null | undefined): number | null => {
+        if (!s) return null;
+        const m = String(s).replace(/,/g, "").match(/([\d.]+)\s*([KMB])?/i);
+        if (!m) return null;
+        const n = parseFloat(m[1]);
+        const mult = m[2]?.toUpperCase() === "K" ? 1e3 : m[2]?.toUpperCase() === "M" ? 1e6 : m[2]?.toUpperCase() === "B" ? 1e9 : 1;
+        return Math.round(n * mult);
+      };
+      const pick = { views: null as number | null, likes: null as number | null, comments: null as number | null };
+      for (const s of Array.from(document.querySelectorAll('script[type="application/ld+json"]'))) {
+        try {
+          const data = JSON.parse(s.textContent || "{}") as { interactionStatistic?: unknown };
+          const st = data.interactionStatistic;
+          if (Array.isArray(st)) {
+            for (const i of st as { userInteractionCount?: unknown; interactionType?: unknown }[]) {
+              const n = Number(i.userInteractionCount);
+              if (!Number.isFinite(n)) continue;
+              const t = String(
+                (i.interactionType as { type?: string } | undefined)?.type || i.interactionType || ""
+              ).toLowerCase();
+              if (t.includes("watch") || t.includes("view")) pick.views = n;
+              else if (t.includes("like")) pick.likes = n;
+              else if (t.includes("comment")) pick.comments = n;
+            }
+          }
+        } catch {
+          /* continue */
+        }
+      }
+      const body = document.body?.innerText?.slice(0, 3000) ?? "";
+      const likes = body.match(/([\d.,]+[KMB]?)\s*likes?/i);
+      const views = body.match(/([\d.,]+[KMB]?)\s*views?/i);
+      const comments = body.match(/([\d.,]+[KMB]?)\s*comments?/i);
+      if (pick.views == null && views) pick.views = cnt(views[1]);
+      if (pick.likes == null && likes) pick.likes = cnt(likes[1]);
+      if (pick.comments == null && comments) pick.comments = cnt(comments[1]);
+      return pick;
+    });
+  } catch {
+    return { views: null, likes: null, comments: null };
+  }
+}

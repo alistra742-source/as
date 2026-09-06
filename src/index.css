@@ -1,0 +1,109 @@
+@import "tailwindcss";
+
+@theme {
+  --color-ink-950: #07090d;
+  --color-ink-900: #0a0c11;
+  --color-ink-850: #0d1017;
+  --color-ink-800: #12161f;
+  --color-ink-700: #1a202c;
+  --color-ink-600: #242c3b;
+  --color-line: #1f2733;
+  --color-line-soft: #171d27;
+
+  --color-amber-300: #ffce79;
+  --color-amber-400: #ffb547;
+  --color-amber-500: #f59e0b;
+  --color-amber-600: #d97706;
+
+  --color-signal-300: #7ee2b8;
+  --color-signal-400: #34d399;
+  --color-signal-500: #10b981;
+
+  --color-danger-400: #fb7185;
+  --color-danger-500: #f43f5e;
+
+  --color-muted: #8b93a7;
+  --color-faint: #5b6474;
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas,
+    monospace;
+
+  --animate-blink: blink 1.1s steps(2, start) infinite;
+  --animate-pulse-dot: pulseDot 1.6s ease-in-out infinite;
+  --animate-rise: rise 0.35s cubic-bezier(0.22, 1, 0.36, 1) both;
+  --animate-scan: scan 2.4s ease-in-out infinite;
+
+  @keyframes blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.25; }
+  }
+  @keyframes pulseDot {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.45; transform: scale(0.82); }
+  }
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes scan {
+    0%, 100% { transform: translateY(-120%); }
+    50% { transform: translateY(120%); }
+  }
+}
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-ink-900);
+  color: #e7eaf1;
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Ambient background grid used by the app shell */
+.deck-bg {
+  background-image:
+    radial-gradient(1200px 500px at 85% -10%, rgba(245, 158, 11, 0.07), transparent 60%),
+    radial-gradient(900px 420px at -10% 10%, rgba(52, 211, 153, 0.05), transparent 60%),
+    linear-gradient(rgba(255, 255, 255, 0.022) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.022) 1px, transparent 1px);
+  background-size: auto, auto, 44px 44px, 44px 44px;
+}
+
+.panel {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.02), rgba(255, 255, 255, 0)) ,
+    var(--color-ink-850);
+}
+
+.glow-ring {
+  box-shadow: 0 0 0 1px rgba(255, 181, 71, 0.35),
+    0 0 26px -6px rgba(245, 158, 11, 0.35);
+}
+
+.scrollbar-slim::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.scrollbar-slim::-webkit-scrollbar-thumb {
+  background: #232c3b;
+  border-radius: 999px;
+}
+.scrollbar-slim::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::selection {
+  background: rgba(245, 158, 11, 0.35);
+}
