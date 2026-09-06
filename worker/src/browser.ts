@@ -158,7 +158,20 @@ export class Rig {
           );
         });
       } else {
-        logged = true;
+        // YouTube: signed in only when an avatar chip is present and no
+        // top-bar “Sign in” entry remains.
+        logged = await page.evaluate(() => {
+          const u = location.href;
+          if (/accounts\.google\.com|ServiceLogin|signin/i.test(u)) return false;
+          const signedOut =
+            !!document.querySelector(
+              'a[aria-label="Sign in"], ytd-button-renderer a[href*="/signin"], a[href*="accounts.google.com"]'
+            );
+          if (signedOut) return false;
+          return !!document.querySelector(
+            "button#avatar-btn, a#avatar-btn, a[href^='/channel/'], img[src*='yt3.googleusercontent.com']"
+          );
+        });
       }
       const prev = this.store.rig(this.platform).loggedIn;
       if (logged !== prev) {
@@ -250,8 +263,20 @@ export interface Candidate {
   commentSample: string;
 }
 
+const YT_SEARCH_QUERIES: Record<string, string[]> = {
+  stories: ["faceless+storytime+shorts", "faceless+stories+shorts"],
+  scary: ["scary+creepy+stories+shorts", "scary+stories+shorts"],
+  facts: ["mind+blowing+facts+shorts", "amazing+facts+shorts"],
+};
+
 /** Scan the For You feed (or platform home) for candidate videos. */
-export async function scrapeCandidates(page: Page, likesFloor: number): Promise<Candidate[]> {
+export async function scrapeCandidates(
+  page: Page,
+  likesFloor: number,
+  platform: "tiktok" | "instagram" | "youtube" = "tiktok",
+  niche: string = "stories"
+): Promise<Candidate[]> {
+  if (platform === "youtube") return scrapeYouTubeCandidates(page, likesFloor, niche);
   const url =
     page.url().includes("tiktok.com")
       ? "https://www.tiktok.com/foryou"
@@ -294,9 +319,89 @@ export async function scrapeCandidates(page: Page, likesFloor: number): Promise<
   return candidates.slice(0, 12);
 }
 
+/**
+ * YouTube discovery: search Shorts in the active niche, then open each
+ * candidate and read its like count (the 50K floor). Bounded to keep the
+ * hourly cycle cheap; YouTube Shorts hide comments behind clicks so the
+ * comment sample stays empty and Groq judges on stats + title.
+ */
+async function scrapeYouTubeCandidates(
+  page: Page,
+  likesFloor: number,
+  niche: string
+): Promise<Candidate[]> {
+  const queries = YT_SEARCH_QUERIES[niche] ?? YT_SEARCH_QUERIES.stories;
+  let hrefs: string[] = [];
+  for (const q of queries) {
+    await page
+      .goto(`https://www.youtube.com/results?search_query=${q}`, { waitUntil: "domcontentloaded", timeout: 45_000 })
+      .catch(() => undefined);
+    await page.waitForTimeout(3500);
+    await page.evaluate(() => window.scrollBy(0, 2200)).catch(() => undefined);
+    await page.waitForTimeout(1800);
+    hrefs = await page.evaluate(() => {
+      const out: string[] = [];
+      const seen = new Set<string>();
+      for (const a of Array.from(document.querySelectorAll('a[href^="/shorts/"]'))) {
+        const href = (a as HTMLAnchorElement).href.split("?")[0];
+        if (seen.has(href)) continue;
+        seen.add(href);
+        out.push(href);
+        if (out.length >= 14) break;
+      }
+      return out;
+    });
+    if (hrefs.length > 0) break;
+  }
+
+  const candidates: Candidate[] = [];
+  for (const href of hrefs.slice(0, 8)) {
+    if (candidates.length >= 8) break;
+    try {
+      await page.goto(href, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => undefined);
+      await page.waitForTimeout(2400);
+      const s = await page.evaluate(() => {
+        const cnt = (raw: string | null | undefined): number | null => {
+          if (!raw) return null;
+          const m = String(raw).replace(/,/g, "").match(/([\d.]+)\s*([KMB])?/i);
+          if (!m) return null;
+          const n = parseFloat(m[1]);
+          const mult = m[2]?.toUpperCase() === "K" ? 1e3 : m[2]?.toUpperCase() === "M" ? 1e6 : m[2]?.toUpperCase() === "B" ? 1e9 : 1;
+          return Math.round(n * mult);
+        };
+        let likes: number | null = null;
+        for (const btn of Array.from(document.querySelectorAll("button[aria-label]"))) {
+          const label = btn.getAttribute("aria-label") || "";
+          const m = label.match(/along with\s*([\d.,]+\s*[KMB]?)/i);
+          if (/like this video/i.test(label) && m) {
+            likes = cnt(m[1]);
+            break;
+          }
+        }
+        const title = (document.title || "YouTube Short").replace(/\s*-\s*YouTube\s*$/, "").replace(/\s*#?shorts?\s*$/i, "").trim();
+        return { likes, title: title || "YouTube Short" };
+      });
+      if (s.likes && s.likes >= likesFloor) {
+        candidates.push({
+          url: href,
+          title: s.title.slice(0, 160),
+          likes: s.likes,
+          views: 0,
+          comments: 0,
+          commentSample: "",
+        });
+      }
+    } catch {
+      /* skip unreadable short */
+    }
+  }
+  return candidates;
+}
+
 /** Read a few comments off a video page (best effort). */
 export async function scrapeCommentSample(page: Page, url: string): Promise<string> {
   try {
+    if (url.includes("youtube.com")) return ""; // Shorts comments need interaction; judged on stats.
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => undefined);
     await page.waitForTimeout(2000);
     return await page.evaluate(() => {
@@ -341,6 +446,46 @@ export async function readVideoStats(page: Page, url: string): Promise<VideoStat
         const mult = m[2]?.toUpperCase() === "K" ? 1e3 : m[2]?.toUpperCase() === "M" ? 1e6 : m[2]?.toUpperCase() === "B" ? 1e9 : 1;
         return Math.round(n * mult);
       };
+      if (location.hostname.endsWith("youtube.com")) {
+        const yt = { views: null as number | null, likes: null as number | null, comments: null as number | null };
+        for (const s of Array.from(document.querySelectorAll('script[type="application/ld+json"]'))) {
+          try {
+            const data = JSON.parse(s.textContent || "{}") as {
+              interactionStatistic?: { userInteractionCount?: unknown; interactionType?: { type?: string } }[];
+              commentCount?: unknown;
+            };
+            for (const i of data.interactionStatistic ?? []) {
+              const n = Number(i.userInteractionCount);
+              if (!Number.isFinite(n)) continue;
+              const t = String(i.interactionType?.type ?? "").toLowerCase();
+              if (t.includes("watch") || t.includes("view")) yt.views = n;
+            }
+            const cc = Number(data.commentCount);
+            if (Number.isFinite(cc) && cc > 0) yt.comments = cc;
+          } catch {
+            /* continue */
+          }
+        }
+        for (const btn of Array.from(document.querySelectorAll("button[aria-label]"))) {
+          const label = btn.getAttribute("aria-label") || "";
+          const m = label.match(/like this video along with\s*([\d.,]+\s*[KMB]?)/i);
+          if (m) {
+            yt.likes = cnt(m[1]);
+            break;
+          }
+        }
+        if (yt.views == null) {
+          const el = document.querySelector(
+            ".view-count, ytd-watch-metadata #count yt-formatted-string, ytd-video-primary-info-renderer #count"
+          );
+          if (el) yt.views = cnt((el.textContent || "").match(/([\d.,]+\s*[KMB]?)/)?.[1]);
+        }
+        if (yt.comments == null) {
+          const hdr = document.querySelector("ytd-comments-header-renderer #count, #comments-header #count");
+          if (hdr) yt.comments = cnt((hdr.textContent || "").replace(/[^\d.,KMB]/g, ""));
+        }
+        return yt;
+      }
       const pick = { views: null as number | null, likes: null as number | null, comments: null as number | null };
       for (const s of Array.from(document.querySelectorAll('script[type="application/ld+json"]'))) {
         try {
@@ -375,3 +520,4 @@ export async function readVideoStats(page: Page, url: string): Promise<VideoStat
     return { views: null, likes: null, comments: null };
   }
 }
+

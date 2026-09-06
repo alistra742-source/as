@@ -13,6 +13,13 @@ const GRADS = [
   "linear-gradient(140deg,#143526,#07120c 70%)",
 ];
 
+const YT_THUMBS = [
+  "linear-gradient(150deg,#5b2333,#12060a 75%)",
+  "linear-gradient(150deg,#14324d,#050c16 75%)",
+  "linear-gradient(150deg,#3d2a12,#140b03 75%)",
+  "linear-gradient(150deg,#0f4d3a,#03130e 75%)",
+];
+
 export function DemoBrowser({ platform }: { platform: Platform }) {
   const sessionState = useDeck((s) => s.rooms[platform].session?.state);
   const loggedIn = sessionState === "logged-in";
@@ -26,13 +33,7 @@ export function DemoBrowser({ platform }: { platform: Platform }) {
     if (igRoute === "ig-login") return <LoginPage kind="instagram" />;
     return <GooglePage onOpenInstagram={() => setIgRoute("ig-login")} />;
   }
-  return (
-    <div className="flex h-full flex-col items-center justify-center gap-3 p-6 text-center">
-      <div className="text-3xl">🚧</div>
-      <p className="text-sm text-slate-300">YouTube room</p>
-      <p className="text-xs text-muted">Coming in the next build — same deck, YouTube shorts.</p>
-    </div>
-  );
+  return loggedIn ? <YouTubeHome /> : <LoginPage kind="youtube" />;
 }
 
 /* --------------------------------- Google --------------------------------- */
@@ -93,12 +94,16 @@ function GooglePage({ onOpenInstagram }: { onOpenInstagram: () => void }) {
 
 /* ---------------------------------- Login ---------------------------------- */
 
-function LoginPage({ kind }: { kind: "tiktok" | "instagram" }) {
+type LoginKind = "tiktok" | "instagram" | "youtube";
+
+function LoginPage({ kind }: { kind: LoginKind }) {
   const setUrl = useDeck((s) => s.setSession);
   const markLoggedIn = useDeck((s) => s.markDemoLoggedIn);
   const platform: Platform = kind;
   const [user, setUser] = useState("");
   const [pass, setPass] = useState("");
+
+  const homeUrl = kind === "tiktok" ? "https://www.tiktok.com/foryou" : kind === "instagram" ? "https://www.instagram.com/" : "https://www.youtube.com/shorts";
 
   const submit = (fill: boolean) => {
     if (fill) {
@@ -107,9 +112,11 @@ function LoginPage({ kind }: { kind: "tiktok" | "instagram" }) {
     }
     window.setTimeout(() => {
       markLoggedIn(platform);
-      setUrl(platform, { url: kind === "tiktok" ? "https://www.tiktok.com/foryou" : "https://www.instagram.com/" });
+      setUrl(platform, { url: homeUrl });
     }, 350);
   };
+
+  const dark = kind !== "instagram";
 
   return (
     <div
@@ -118,58 +125,70 @@ function LoginPage({ kind }: { kind: "tiktok" | "instagram" }) {
         background:
           kind === "tiktok"
             ? "linear-gradient(180deg,#05070b 0%,#0a0d13 60%,#15070b 100%)"
-            : "linear-gradient(160deg,#fafafa,#f3f0fa)",
+            : kind === "youtube"
+              ? "linear-gradient(180deg,#0a0a0a 0%,#12070a 70%,#1c0505 100%)"
+              : "linear-gradient(160deg,#fafafa,#f3f0fa)",
       }}
     >
       <div className="flex size-16 items-center justify-center rounded-3xl text-4xl">
-        {kind === "tiktok" ? "🎵" : "📸"}
+        {kind === "tiktok" ? "🎵" : kind === "youtube" ? "▶️" : "📸"}
       </div>
-      <h1 className={`text-2xl font-extrabold tracking-tight ${kind === "tiktok" ? "text-white" : "text-neutral-900"}`}>
-        {kind === "tiktok" ? "TikTok" : "Instagram"}
+      <h1 className={`text-2xl font-extrabold tracking-tight ${dark ? "text-white" : "text-neutral-900"}`}>
+        {kind === "tiktok" ? "TikTok" : kind === "youtube" ? "YouTube" : "Instagram"}
         <span className="ml-2 align-middle font-mono text-[10px] font-medium text-amber-400">simulated</span>
       </h1>
-      <p className={`text-center text-xs ${kind === "tiktok" ? "text-neutral-400" : "text-neutral-500"}`}>
-        This page only exists for the preview demo.
-        <br />
-        Type anything — “Log in” marks the session as signed in.
+      <p className={`text-center text-xs ${dark ? "text-neutral-400" : "text-neutral-500"}`}>
+        {kind === "youtube" ? (
+          <>
+            Sign in with any Google account.
+            <br />
+            Type anything — “Log in” marks the session as signed in.
+          </>
+        ) : (
+          <>
+            This page only exists for the preview demo.
+            <br />
+            Type anything — “Log in” marks the session as signed in.
+          </>
+        )}
       </p>
 
       <div className="mt-2 w-full max-w-[280px] space-y-2">
         <label
           className={`flex items-center gap-2 rounded-xl border px-3 py-2.5 ${
-            kind === "tiktok" ? "border-neutral-800 bg-white/5" : "border-neutral-300 bg-white"
+            dark ? "border-neutral-800 bg-white/5" : "border-neutral-300 bg-white"
           }`}
         >
-          <AtSign className={`size-4 ${kind === "tiktok" ? "text-neutral-500" : "text-neutral-400"}`} />
+          <AtSign className={`size-4 ${dark ? "text-neutral-500" : "text-neutral-400"}`} />
           <input
             value={user}
             onChange={(e) => setUser(e.target.value)}
-            placeholder="Username / email"
+            placeholder={kind === "youtube" ? "Google email" : "Username / email"}
             autoCapitalize="none"
             className={`min-w-0 flex-1 bg-transparent text-sm outline-none ${
-              kind === "tiktok" ? "text-white placeholder:text-neutral-600" : "text-neutral-900"
+              dark ? "text-white placeholder:text-neutral-600" : "text-neutral-900"
             }`}
           />
         </label>
         <label
           className={`flex items-center gap-2 rounded-xl border px-3 py-2.5 ${
-            kind === "tiktok" ? "border-neutral-800 bg-white/5" : "border-neutral-300 bg-white"
+            dark ? "border-neutral-800 bg-white/5" : "border-neutral-300 bg-white"
           }`}
         >
-          <Lock className={`size-4 ${kind === "tiktok" ? "text-neutral-500" : "text-neutral-400"}`} />
+          <Lock className={`size-4 ${dark ? "text-neutral-500" : "text-neutral-400"}`} />
           <input
             type="password"
             value={pass}
             onChange={(e) => setPass(e.target.value)}
             placeholder="Password"
             className={`min-w-0 flex-1 bg-transparent text-sm outline-none ${
-              kind === "tiktok" ? "text-white placeholder:text-neutral-600" : "text-neutral-900"
+              dark ? "text-white placeholder:text-neutral-600" : "text-neutral-900"
             }`}
           />
         </label>
         <Button
           size="lg"
-          variant={kind === "tiktok" ? "primary" : "dark"}
+          variant={dark ? "primary" : "dark"}
           className="w-full"
           onClick={() => submit(false)}
         >
@@ -257,6 +276,61 @@ function InstaHome() {
       </div>
       <div className="flex items-center justify-around border-t border-neutral-900 py-1.5 text-[10px] text-neutral-400">
         <span>Home</span><span>Search</span><span>Reels</span><span>Profile</span>
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------ YouTube home ------------------------------- */
+
+function YouTubeHome() {
+  return (
+    <div className="flex h-full flex-col overflow-hidden bg-[#0f0f0f] text-white">
+      <div className="flex items-center gap-2 px-3 py-2">
+        <span className="text-xl font-black tracking-tight">
+          <span className="text-red-600">▶</span> YouTube
+          <span className="align-middle font-mono text-[9px] font-normal text-amber-400"> sim</span>
+        </span>
+        <span className="ml-auto flex items-center gap-1 text-[10px] text-neutral-400">
+          <span className="size-1.5 rounded-full bg-emerald-400" /> signed in · {DEMO_USER.youtube}
+        </span>
+      </div>
+      <div className="flex items-center gap-1 overflow-x-auto border-b border-neutral-900 px-2 py-1.5 scrollbar-slim">
+        {["All", "Shorts", "Stories", "Scary", "Facts"].map((chip, i) => (
+          <span
+            key={chip}
+            className={`whitespace-nowrap rounded-full border px-2.5 py-0.5 text-[10px] font-medium ${
+              i === 0 ? "border-white/20 bg-white/15 text-white" : "border-neutral-800 bg-neutral-900 text-neutral-300"
+            }`}
+          >
+            {chip}
+          </span>
+        ))}
+      </div>
+      <div className="grid flex-1 grid-cols-2 content-start gap-2 overflow-y-auto p-2 scrollbar-slim">
+        {DEMO_CANDIDATES.slice(0, 8).map((c, i) => (
+          <button key={c.id} className="group overflow-hidden rounded-xl bg-neutral-900 text-left hover:bg-neutral-800/80">
+            <div
+              className="relative aspect-video w-full overflow-hidden"
+              style={{ background: YT_THUMBS[i % YT_THUMBS.length] }}
+            >
+              <div className="absolute inset-0 flex items-center justify-center">
+                <span className="flex size-8 items-center justify-center rounded-full bg-black/50 text-white opacity-0 transition-opacity group-hover:opacity-100">
+                  <Play className="size-4 fill-white" />
+                </span>
+              </div>
+              {i % 3 === 0 && (
+                <span className="absolute left-1 top-1 rounded bg-red-600 px-1 py-px text-[8px] font-black uppercase">#shorts</span>
+              )}
+            </div>
+            <div className="p-2">
+              <p className="line-clamp-2 text-[11px] font-medium leading-snug">{c.title}</p>
+              <p className="mt-1 text-[10px] text-neutral-500">
+                {["faceless stories", "faceless scary", "fun facts"][c.niche === "stories" ? 0 : c.niche === "scary" ? 1 : 2]} · {compactNumber(Math.round(c.views * 0.9))} views
+              </p>
+            </div>
+          </button>
+        ))}
       </div>
     </div>
   );

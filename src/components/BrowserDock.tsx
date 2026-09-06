@@ -105,7 +105,7 @@ function DockToolbar({ platform }: { platform: Platform }) {
             ? [START_URL.tiktok, "https://www.tiktok.com/foryou"]
             : platform === "instagram"
               ? [START_URL.instagram, "https://www.instagram.com/"]
-              : [START_URL.youtube]
+              : [START_URL.youtube, "https://www.youtube.com/shorts", "https://studio.youtube.com/"]
         ).map((u) => (
           <button
             key={u}
@@ -123,6 +123,9 @@ function DockToolbar({ platform }: { platform: Platform }) {
         ))}
         {platform === "instagram" && (
           <span className="whitespace-nowrap text-[10px] text-faint">starts on Google — same flow as TikTok</span>
+        )}
+        {platform === "youtube" && room.session?.mode === "live" && (
+          <span className="whitespace-nowrap text-[10px] text-faint">log in on youtube.com · uploads run via Studio</span>
         )}
       </div>
     </div>
@@ -410,7 +413,7 @@ function NoSession({ platform }: { platform: Platform }) {
   return (
     <div className="flex flex-col items-center justify-center gap-3 px-6 py-12 text-center">
       <div className="flex size-14 items-center justify-center rounded-2xl border border-dashed border-line bg-ink-800 text-amber-300">
-        {platform === "tiktok" ? "🎵" : "📸"}
+        {platform === "tiktok" ? "🎵" : platform === "youtube" ? "▶️" : "📸"}
       </div>
       <div>
         <p className="text-sm font-semibold text-slate-200">No browser session yet</p>

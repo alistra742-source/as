@@ -1,5 +1,6 @@
 import { ChevronRight, PlayCircle, Radar, ShieldCheck, TimerReset, TrendingUp } from "lucide-react";
 import type { Platform } from "../lib/types";
+import { PLATFORMS } from "../lib/types";
 import { useDeck } from "../state/deck";
 import { Button, Chip, Panel, StatusDot, cn } from "./ui";
 import { compactNumber } from "../lib/format";
@@ -40,9 +41,8 @@ const CARDS: HubCard[] = [
     accent: "from-red-500/20",
     border: "hover:border-red-500/30",
     name: "YouTube",
-    headline: "Shorts room",
-    bullets: ["Upload Shorts from a link", "Per-channel analytics feed the engine", "You said you'd fix this one soon 🙂"],
-    soon: true,
+    headline: "Shorts, same engine",
+    bullets: ["Live browser — sign in with your Google account", "Link + caption → posts Public (Everyone)", "Same 1/hr engine, 3K+ trigger & 50K quality gate"],
   },
 ];
 
@@ -64,17 +64,10 @@ export function MainHub({ onOpen }: { onOpen: (p: Platform) => void }) {
 
 function Hero({ onOpen }: { onOpen: (p: Platform) => void }) {
   const rooms = useDeck((s) => s.rooms);
-  const running = (["tiktok", "instagram"] as Platform[]).filter(
-    (p) => rooms[p].engine.running
-  ).length;
-  const totalPosts = (["tiktok", "instagram"] as Platform[]).reduce(
-    (acc, p) => acc + rooms[p].posts.length,
-    0
-  );
-  const totalViews = (["tiktok", "instagram"] as Platform[]).reduce(
-    (acc, p) =>
-      acc +
-      rooms[p].posts.reduce((a, post) => a + (post.checks.at(-1)?.views ?? 0), 0),
+  const running = PLATFORMS.filter((p) => rooms[p].engine.running).length;
+  const totalPosts = PLATFORMS.reduce((acc, p) => acc + rooms[p].posts.length, 0);
+  const totalViews = PLATFORMS.reduce(
+    (acc, p) => acc + rooms[p].posts.reduce((a, post) => a + (post.checks.at(-1)?.views ?? 0), 0),
     0
   );
 
@@ -99,16 +92,19 @@ function Hero({ onOpen }: { onOpen: (p: Platform) => void }) {
             </span>
           </h1>
           <p className="mt-3 max-w-xl text-sm leading-relaxed text-muted">
-            Log into TikTok or Instagram once in the live browser. Then the engine posts faceless
-            stories, scary stories and fun facts — one per hour, always visible to Everyone —
-            and Groq reads every post's first hour to decide what to make next.
+            Log into TikTok, Instagram or YouTube once in the live browser. Then the engine posts
+            faceless stories, scary stories and fun facts — one per hour, always visible to
+            Everyone — and Groq reads every post's first hour to decide what to make next.
           </p>
           <div className="mt-5 flex flex-wrap items-center gap-2">
             <Button size="lg" onClick={() => onOpen("tiktok")}>
-              🎵 Open TikTok room
+              🎵 TikTok room
             </Button>
             <Button size="lg" variant="dark" onClick={() => onOpen("instagram")}>
-              📸 Open Instagram room
+              📸 Instagram room
+            </Button>
+            <Button size="lg" variant="dark" onClick={() => onOpen("youtube")}>
+              ▶️ YouTube room
             </Button>
           </div>
         </div>

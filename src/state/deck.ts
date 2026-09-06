@@ -55,13 +55,15 @@ function freshLog(platform: Platform): LogEntry[] {
       ? [
           "Deck online — TikTok room ready.",
           "Open a browser session, log in, then press Start to launch the growth engine.",
-        ]
-      : platform === "instagram"
-        ? [
-            "Deck online — Instagram room ready.",
-            "Open a browser session (starts on Google), log in, then press Start.",
-          ]
-        : ["YouTube room — wiring coming soon."];
+        ]        : platform === "instagram"
+          ? [
+              "Deck online — Instagram room ready.",
+              "Open a browser session (starts on Google), log in, then press Start.",
+            ]
+          : [
+              "Deck online — YouTube room ready.",
+              "Open a browser session, sign in with your Google account, then press Start.",
+            ];
   return lines.map((text) => logEntry("info", text));
 }
 
@@ -158,15 +160,17 @@ export const useDeck = create<DeckState>()(
             [p]: {
               ...s.rooms[p],
               session,
-              log: [
-                ...s.rooms[p].log,
-                logEntry(
-                  "info",
-                  p === "instagram"
-                    ? "Demo browser online → opened google.com. Log in via Google or the app, then Start."
+              log:            [
+              ...s.rooms[p].log,
+              logEntry(
+                "info",
+                p === "instagram"
+                  ? "Demo browser online → opened google.com. Log in via Google or the app, then Start."
+                  : p === "youtube"
+                    ? "Demo browser online → opened youtube.com. Sign in with your Google account, then Start."
                     : "Demo browser online → opened tiktok.com. Log in with your account, then Start."
-                ),
-              ].slice(-MAX_LOG),
+              ),
+            ].slice(-MAX_LOG),
             },
           },
         }));
@@ -246,7 +250,14 @@ export const useDeck = create<DeckState>()(
                 : s.rooms[p].session,
               log: [
                 ...room.log,
-                logEntry("ok", p === "tiktok" ? "Logged in to TikTok (demo session)." : "Logged in to Instagram (demo session)."),
+                logEntry(
+                  "ok",
+                  p === "tiktok"
+                    ? "Logged in to TikTok (demo session)."
+                    : p === "youtube"
+                      ? "Signed in to YouTube (demo session)."
+                      : "Logged in to Instagram (demo session)."
+                ),
               ].slice(-MAX_LOG),
             },
           },
@@ -319,7 +330,7 @@ export const useDeck = create<DeckState>()(
 
         const url = c.url.trim();
         if (!url && !c.caption.trim()) {
-          get().setComposer(p, { error: "Paste a TikTok link, or leave both empty and the AI will find + post a video for you." });
+          get().setComposer(p, { error: "Paste a video link, or leave both empty and the AI will find + post a video for you." });
           return;
         }
         get().setComposer(p, { busy: true, error: null });

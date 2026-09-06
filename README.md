@@ -1,9 +1,10 @@
-# ViralDeck — AI growth deck for faceless TikTok & Instagram content
+# ViralDeck — AI growth deck for faceless TikTok, Instagram & YouTube
 
-Log into TikTok or Instagram **once** in a browser you control from the app, then let the
-engine keep the account growing on your rules:
+Log into TikTok, Instagram or YouTube **once** in a browser you control from the app, then let
+the engine keep the account growing on your rules:
 
-- **1 post per hour** (manual link+caption, or an AI-discovered clip), always on **Everyone**.
+- **1 post per hour** (manual link+caption, or an AI-discovered clip), always on **Everyone**
+  (YouTube publishes as **Public** — its “Everyone”).
 - After each post, the engine reads views/likes/comments every hour. Crossing **3,000 views in
   the first hour** flips it into *double-down* mode and it posts **similar** content.
 - No link? Groq reviews **faceless videos with 50K+ likes** (captions + comment sentiment) and
@@ -17,14 +18,14 @@ engine keep the account growing on your rules:
 │  ViralDeck frontend      │  frames + commands       │  automation worker  (worker/) │
 │  (this repo, Vite/React) │ ───────────────────────► │  Node + Playwright Chromium   │
 │                          │ ◄─────────────────────── │  · persistent login profiles  │
-│  · Main / TikTok / IG    │   live browser stream    │  · remote click/scroll/type   │
-│  · demo browser (no net) │                          │  · uploads (audience Everyone)│
+│  · Main / TikTok / IG / YT│  live browser stream    │  · remote click/scroll/type   │
+│  · demo browser (no net) │                          │  · uploads (Everyone / Public)│
 │  · composer, engine UI   │                          │  · Groq captions + reviews    │
 └──────────────────────────┘                          │  · hourly engine + metrics    │
         ▲                                             └───────────────┬───────────────┘
         │ localStorage deck state                                     │ Railway volume
         └─────────────────────────────────────────────────────────────▼───────────────
-                             TikTok / Instagram / Google (profiles + state.json)
+                    TikTok / Instagram / YouTube + Google (profiles + state.json)
 ```
 
 - **Frontend** is a plain Vite + React + Tailwind app (no account system — it's your private
@@ -36,7 +37,7 @@ engine keep the account growing on your rules:
 ## Try it now (demo mode — no server needed)
 
 1. `bun install && bun run dev`
-2. Open **Main → TikTok** (or Instagram), press **＋ Open browser (demo)**.
+2. Open **Main → TikTok** (Instagram or YouTube), press **＋ Open browser (demo)**.
 3. The simulated browser opens. Type anything into the login fields (your phone keyboard pops
    up naturally because they're real inputs) and tap **Log in**.
 4. Paste a link + caption under the browser and hit **Post** — watch the engine read the post,
@@ -63,7 +64,7 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 
 | Rule | Value | Where |
 | --- | --- | --- |
-| Audience | Everyone | `worker/src/uploads.ts` + enforced in UI |
+| Audience | Everyone (YouTube: visibility **Public**) | `worker/src/uploads.ts` + enforced in UI |
 | Cadence | 1 post / 1 hour | `worker/src/engine.ts` (also demo engine) |
 | Hit trigger | 3,000+ views in first hour | engine metric pass, editable per room |
 | Discovery floor | 50K+ likes | `scrapeCandidates` filter + Groq judge |
@@ -74,11 +75,12 @@ nothing silently breaks.
 
 ## Honest notes (read before running)
 
-- Automating logins/posting can violate TikTok/Instagram terms and may get accounts flagged.
-  This tool keeps **your** login in **your** browser profile — no passwords are stored in code —
-  but platform anti-bot heuristics (datacenter IPs, headless fingerprints) may still challenge
-  sessions. If TikTok/IG challenge your session, do the verification manually in the dock; the
-  worker waits for the signed-in state.
+- Automating logins/posting can violate TikTok/Instagram/YouTube terms and may get accounts
+  flagged. This tool keeps **your** login in **your** browser profile — no passwords are stored
+  in code — but platform anti-bot heuristics (datacenter IPs, headless fingerprints) may still
+  challenge sessions. If TikTok/IG/YouTube challenge your session, do the verification manually
+  in the dock; the worker waits for the signed-in state. YouTube uploads run through **Studio**,
+  so the logged-in session must be a Google account with an associated channel.
 - Page selectors used by the uploaders (`worker/src/uploads.ts`) are best-effort and change
   over time. Failures are logged to the deck activity feed and never silently swallowed — you
   can always finish an upload by hand in the live browser.
@@ -87,7 +89,21 @@ nothing silently breaks.
 - Metric reads rely on what the public video page exposes; blocked reads are logged and retried
   next hour rather than guessed.
 
-## YouTube
+## YouTube (live)
 
-The room is scaffolded (tab → "coming next"). The worker already accepts `youtube` as a
-platform for the browser rig; Shorts upload + analytics wiring is the next build.
+The YouTube room is fully wired to the same deck flow:
+
+- **Live browser** starts on youtube.com — sign in with your Google account (the dock also has
+  one-tap links to `/shorts` and `studio.youtube.com` for verification).
+- **Post a link + caption**: the worker downloads the clip and publishes it through YouTube
+  Studio with the caption as the **title** and visibility **Public** (Everyone). A vertical
+  clip under ~3 minutes is published as a **Short** automatically; anything else uploads as a
+  regular video, so paste Shorts links for Shorts output.
+- **AI auto-post**: discovery searches YouTube for the active niche (`faceless storytime
+  shorts`, `scary stories shorts`, `mind blowing facts shorts`), opens each candidate to read
+  its like count, and only the clips above the 50K floor go to the Groq review. Same 1/hour
+  cadence and 3K+/hour double-down trigger as the other rooms; stats are read from each video's
+  page.
+- Studio selectors are best-effort like the TikTok/IG uploaders (they change over time) —
+  failures land in the deck activity feed and you can always finish a publish by hand in the
+  live browser.

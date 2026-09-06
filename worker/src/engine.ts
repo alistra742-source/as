@@ -74,6 +74,10 @@ export class GrowthEngine {
 
   /* -------------------------------- lifecycle ------------------------------ */
 
+  private audienceLabel(): string {
+    return this.platform === "youtube" ? "visibility Public (Everyone)" : "audience Everyone";
+  }
+
   start() {
     const e = this.store.engine(this.platform);
     if (e.running) return;
@@ -83,7 +87,7 @@ export class GrowthEngine {
     e.message = "Engine armed. Analyzing account + algorithm, scanning faceless content.";
     e.errorCount = 0;
     this.store.save();
-    this.log("ok", `🛰 Engine armed for ${this.platform} — 1 post/hour, audience Everyone, ${e.thresholdViews.toLocaleString()}+/hr trigger, ${e.likesFloor.toLocaleString()}+ likes discovery floor.`);
+    this.log("ok", `🛰 Engine armed for ${this.platform} — 1 post/hour, ${this.audienceLabel()}, ${e.thresholdViews.toLocaleString()}+/hr trigger, ${e.likesFloor.toLocaleString()}+ likes discovery floor.`);
     this.pushEngine();
     this.ensureLoop();
     void this.runCycle("start");
@@ -235,9 +239,10 @@ export class GrowthEngine {
     this.store.save();
     this.pushEngine();
 
+    const niche = this.hitNiche && NICHE_CYCLE.includes(this.hitNiche) ? this.hitNiche : e.niche;
     const page = await this.rig.newEnginePage();
     try {
-      const candidates = await scrapeCandidates(page, e.likesFloor);
+      const candidates = await scrapeCandidates(page, e.likesFloor, this.platform, niche);
       if (candidates.length === 0) {
         e.phase = "waiting";
         e.nextRunAt = now() + HOUR_MS;
@@ -252,7 +257,6 @@ export class GrowthEngine {
       this.store.save();
       this.pushEngine();
 
-      const niche = this.hitNiche && NICHE_CYCLE.includes(this.hitNiche) ? this.hitNiche : e.niche;
       let best: Awaited<ReturnType<typeof judgeCandidate>> | null = null;
       let bestUrl = "";
       for (const c of candidates.slice(0, 3)) {
@@ -276,19 +280,13 @@ export class GrowthEngine {
       }
 
       e.phase = "posting";
-      e.message = `Publishing chosen clip — audience Everyone…`;
+      e.message = `Publishing chosen clip — ${this.audienceLabel()}…`;
       this.store.save();
       this.pushEngine();
 
       const caption = best.caption || (await writeCaption({ niche, hook: best.angle }));
       const video = await downloadVideo(page, this.rig.context!, bestUrl, (t) => this.log("info", t));
-      const result = await uploadToPlatform(
-        (this.platform === "youtube" ? "tiktok" : this.platform) as "tiktok" | "instagram",
-        page,
-        video,
-        caption,
-        (t) => this.log("info", t)
-      );
+      const result = await uploadToPlatform(this.platform, page, video, caption, (t) => this.log("info", t));
       const post: WorkerPost = {
         id: uid(),
         url: bestUrl,
@@ -309,7 +307,7 @@ export class GrowthEngine {
       this.hitNiche = null;
       this.store.save();
       this.rig.broadcast({ type: "post-ok", postId: post.id, postedAt: post.postedAt, url: post.url });
-      this.log(result.ok ? "ok" : "warn", result.ok ? `📤 Auto-posted (audience Everyone). Verdict stored — first read in ~1h.` : `Auto-post result: ${result.message}`);
+      this.log(result.ok ? "ok" : "warn", result.ok ? `📤 Auto-posted (${this.audienceLabel()}). Verdict stored — first read in ~1h.` : `Auto-post result: ${result.message}`);
       this.pushEngine();
     } finally {
       await page.close().catch(() => undefined);
@@ -332,14 +330,14 @@ export class GrowthEngine {
     this.manualBusy = true;
     const prevPhase = e.phase;
     e.phase = "posting";
-    e.message = "Publishing your link + caption to Everyone…";
+    e.message = `Publishing your link + caption (${this.audienceLabel()})…`;
     this.store.save();
     this.pushEngine();
     const page = await this.rig.newEnginePage();
     try {
       const video = await downloadVideo(page, this.rig.context!, url, (t) => this.log("info", t));
       const result = await uploadToPlatform(
-        (this.platform === "youtube" ? "tiktok" : this.platform) as "tiktok" | "instagram",
+        this.platform,
         page,
         video,
         caption || "Posted via ViralDeck",
@@ -358,7 +356,7 @@ export class GrowthEngine {
       };
       this.store.addPost(this.platform, post);
       this.rig.broadcast({ type: "post-ok", postId: post.id, postedAt: post.postedAt, url: post.url });
-      this.log("ok", `✅ Manual publish done — audience Everyone, caption “${(caption || "Posted via ViralDeck").slice(0, 60)}”.`);
+      this.log("ok", `✅ Manual publish done — ${this.audienceLabel()}, caption “${(caption || "Posted via ViralDeck").slice(0, 60)}”.`);
       e.lastRunAt = now();
       if (e.running) {
         e.nextRunAt = now() + e.cadenceHours * HOUR_MS;

@@ -83,4 +83,5 @@ export const DEMO_HOOKS: Record<Niche, string[]> = {
 export const DEMO_USER = {
   tiktok: "@deck.demo",
   instagram: "deck.demo",
+  youtube: "Deck Channel",
 };

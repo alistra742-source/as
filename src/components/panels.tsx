@@ -236,12 +236,22 @@ export function ComposerPanel({ room }: { room: Room }) {
       <div className="space-y-3 p-4">
         <label className="block">
           <span className="mb-1 block text-[11px] font-semibold text-muted uppercase tracking-wider">
-            {room.platform === "tiktok" ? "TikTok video link" : "Reel / IG video link"}
+            {room.platform === "tiktok"
+              ? "TikTok video link"
+              : room.platform === "youtube"
+                ? "YouTube video / Shorts link"
+                : "Reel / IG video link"}
           </span>
           <input
             value={c.url}
             onChange={(e) => setComposer(room.platform, { url: e.target.value })}
-            placeholder={room.platform === "tiktok" ? "https://www.tiktok.com/@user/video/…" : "https://www.instagram.com/reel/…"}
+            placeholder={
+              room.platform === "tiktok"
+                ? "https://www.tiktok.com/@user/video/…"
+                : room.platform === "youtube"
+                  ? "https://www.youtube.com/watch?v=… or /shorts/…"
+                  : "https://www.instagram.com/reel/…"
+            }
             spellCheck={false}
             className="h-10 w-full rounded-xl border border-line bg-ink-900 px-3 font-mono text-xs text-slate-200 outline-none transition-colors placeholder:text-faint focus:border-amber-400/60"
           />

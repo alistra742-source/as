@@ -1,10 +1,4 @@
-import {
-  ArrowLeft,
-  Clapperboard,
-  Gauge,
-  Radio,
-  Sparkles,
-} from "lucide-react";
+import { Gauge, Radio } from "lucide-react";
 import type { Platform, Room } from "../lib/types";
 import { NICHE_LABEL } from "../lib/types";
 import { useDeck } from "../state/deck";
@@ -16,7 +10,7 @@ import {
   PostsPanel,
   WorkerCard,
 } from "./panels";
-import { Chip, Panel, StatusDot, cn } from "./ui";
+import { Chip, StatusDot, cn } from "./ui";
 import { compactNumber } from "../lib/format";
 
 const META: Record<Platform, { title: string; tag: string; blurb: string }> = {
@@ -32,21 +26,23 @@ const META: Record<Platform, { title: string; tag: string; blurb: string }> = {
   },
   youtube: {
     title: "YouTube",
-    tag: "coming next",
-    blurb: "Same deck, Shorts uploads and channel analytics — on the next build.",
+    tag: "Shorts growth room",
+    blurb: "Sign in with Google once in the browser, then videos + Shorts post 1/hr — visibility Public (Everyone) — with the same AI engine.",
   },
+};
+
+const THEME: Record<Platform, { emoji: string; cls: string }> = {
+  tiktok: { emoji: "🎵", cls: "border-rose-500/30 bg-rose-500/10" },
+  instagram: { emoji: "📸", cls: "border-violet-500/30 bg-violet-500/10" },
+  youtube: { emoji: "▶️", cls: "border-red-500/30 bg-red-500/10" },
 };
 
 export function PlatformRoom({
   platform,
-  onBackToMain,
 }: {
   platform: Platform;
-  onBackToMain?: () => void;
 }) {
   const room = useDeck((s) => s.rooms[platform]);
-
-  if (platform === "youtube") return <YouTubeSoon onBack={onBackToMain} />;
 
   const meta = META[platform];
   return (
@@ -79,19 +75,16 @@ function RoomHeader({
   const hits = room.posts.filter((p) =>
     p.checks.some((m) => m.views >= room.engine.thresholdViews)
   ).length;
-  return (
-    <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
-      <div className="flex items-center gap-3">
-        <div
-          className={cn(
-            "flex size-11 items-center justify-center rounded-2xl border text-xl",
-            room.platform === "tiktok"
-              ? "border-rose-500/30 bg-rose-500/10"
-              : "border-violet-500/30 bg-violet-500/10"
-          )}
-        >
-          {room.platform === "tiktok" ? "🎵" : "📸"}
-        </div>
+  return (      <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+        <div className="flex items-center gap-3">
+          <div
+            className={cn(
+              "flex size-11 items-center justify-center rounded-2xl border text-xl",
+              THEME[room.platform].cls
+            )}
+          >
+            {THEME[room.platform].emoji}
+          </div>
         <div>
           <h1 className="text-xl font-extrabold tracking-tight text-white">
             {meta.title}{" "}
@@ -122,56 +115,8 @@ function RoomHeader({
   );
 }
 
-function YouTubeSoon({ onBack }: { onBack?: () => void }) {
-  return (
-    <div className="animate-rise space-y-4">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
-        <div className="flex size-11 items-center justify-center rounded-2xl border border-red-500/30 bg-red-500/10 text-xl">
-          ▶️
-        </div>
-        <div>
-          <h1 className="text-xl font-extrabold tracking-tight text-white">
-            YouTube <span className="text-muted">· coming next</span>
-          </h1>
-          <p className="text-xs text-muted">You said you'd fix YouTube soon — this room is wired to accept it.</p>
-        </div>
-      </div>
-      <Panel className="p-6">
-        <div className="mx-auto max-w-md space-y-4 text-center">
-          <Clapperboard className="mx-auto size-10 text-red-400" />
-          <h2 className="text-lg font-bold text-white">Same deck, Shorts next</h2>
-          <ul className="space-y-2 text-left text-sm text-muted">
-            {[
-              ["Live browser room", "Log in to YouTube Studio the same way as TikTok/IG."],
-              ["Upload Shorts", "Link + caption → posts Short as “Everyone”, 1 per hour."],
-              ["Groq performance loop", "3K+ views/hour flips the engine into similar-content mode."],
-              ["Analytics", "Channel-level reads so the deck plans uploads around winners."],
-            ].map(([t, d]) => (
-              <li key={t} className="flex gap-2.5">
-                <Sparkles className="mt-0.5 size-4 shrink-0 text-amber-300" />
-                <span>
-                  <strong className="text-slate-200">{t}</strong> — {d}
-                </span>
-              </li>
-            ))}
-          </ul>
-          {onBack && (
-            <button
-              onClick={onBack}
-              className="inline-flex items-center gap-1.5 text-sm font-semibold text-amber-300 hover:text-amber-200"
-            >
-              <ArrowLeft className="size-4" /> Back to Main
-            </button>
-          )}
-        </div>
-      </Panel>
-    </div>
-  );
-}
-
 export function MiniStatus({ platform }: { platform: Platform }) {
   const room = useDeck((s) => s.rooms[platform]);
-  if (room.platform === "youtube") return null;
   return (
     <span className="flex items-center gap-1 text-[11px] text-muted">
       <Gauge className="size-3.5" />

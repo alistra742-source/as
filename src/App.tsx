@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Activity, LayoutGrid, Youtube } from "lucide-react";
 import type { Platform } from "./lib/types";
+import { PLATFORMS } from "./lib/types";
 import { useDeck } from "./state/deck";
 import { MainHub } from "./components/MainHub";
 import { PlatformRoom } from "./components/PlatformRoom";
@@ -31,7 +32,7 @@ export default function App() {
         {tab === "main" ? (
           <MainHub onOpen={(p) => setTab(p)} />
         ) : (
-          <PlatformRoom platform={tab} onBackToMain={() => setTab("main")} />
+          <PlatformRoom platform={tab} />
         )}
       </main>
       <footer className="border-t border-line-soft py-3 text-center text-[11px] text-faint">
@@ -44,9 +45,7 @@ export default function App() {
 
 function Header({ tab, onTab }: { tab: Tab; onTab: (t: Tab) => void }) {
   const rooms = useDeck((s) => s.rooms);
-  const liveRunning = (["tiktok", "instagram"] as Platform[]).filter(
-    (p) => rooms[p].engine.running
-  ).length;
+  const liveRunning = PLATFORMS.filter((p) => rooms[p].engine.running).length;
 
   return (
     <header className="sticky top-0 z-30 border-b border-line-soft bg-ink-950/85 backdrop-blur">
@@ -76,9 +75,7 @@ function Header({ tab, onTab }: { tab: Tab; onTab: (t: Tab) => void }) {
               {t.icon === "grid" && <LayoutGrid className="size-4" />}
               {t.icon === "yt" && <Youtube className="size-4 text-red-500" />}
               {t.label}
-              {t.id !== "main" &&
-                t.id !== "youtube" &&
-                rooms[t.id as Platform].session && (
+              {t.id !== "main" && rooms[t.id as Platform].session && (
                   <span
                     className={cn(
                       "size-1.5 rounded-full",

@@ -8,6 +8,8 @@ export interface VideoFile {
 
 type StepLog = (text: string) => void;
 
+export type UploadPlatform = "tiktok" | "instagram" | "youtube";
+
 /** Resolve a public video page to an actual playable mp4 and download it. */
 export async function downloadVideo(
   page: Page,
@@ -41,7 +43,7 @@ export async function downloadVideo(
   const buffer = Buffer.from(await resp.body());
   if (buffer.length < 10_000) throw new Error("Downloaded file looks too small — likely a bot wall.");
   const mime = (resp.headers()["content-type"] || "video/mp4").split(";")[0];
-  log(`Got video (${(buffer.length / 1_048_576).toFixed(1)} MB) — uploading to ${page.url().includes("instagram") ? "Instagram" : "TikTok"}…`);
+  log(`Got video (${(buffer.length / 1_048_576).toFixed(1)} MB) — ready to publish.`);
   return { name: `clip-${Date.now()}.mp4`, mime: mime.includes("video") ? mime : "video/mp4", buffer };
 }
 
@@ -158,12 +160,103 @@ export async function uploadInstagram(page: Page, video: VideoFile, caption: str
 }
 
 export async function uploadToPlatform(
-  platform: "tiktok" | "instagram",
+  platform: UploadPlatform,
   page: Page,
   video: VideoFile,
   caption: string,
   log: StepLog
 ) {
   if (platform === "tiktok") return uploadTikTok(page, video, caption, log);
+  if (platform === "youtube") return uploadYouTube(page, video, caption, log);
   return uploadInstagram(page, video, caption, log);
+}
+
+/* --------------------------------- YouTube -------------------------------- */
+
+/**
+ * Publish through YouTube Studio (youtube.com/upload). The user's spec maps
+ * to: title = caption, visibility = Public (= TikTok's “Everyone”). Selectors
+ * are best-effort like the TikTok/IG uploaders and change over time; failures
+ * log loudly and can always be finished by hand in the live browser.
+ */
+export async function uploadYouTube(page: Page, video: VideoFile, caption: string, log: StepLog) {
+  log("Opening YouTube Studio upload flow…");
+  await page.goto("https://www.youtube.com/upload", { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
+  await page.waitForTimeout(2500);
+
+  const signedOut = await page.evaluate(() => {
+    const u = location.href;
+    if (/accounts\.google\.com|ServiceLogin/i.test(u)) return true;
+    return /youtube\.com/i.test(u) && !document.querySelector("button#avatar-btn, a#avatar-btn, a[aria-label*='avatar' i]");
+  });
+  if (signedOut) {
+    throw new Error("YouTube Studio needs a signed-in Google session — log in in the live browser (browser → studio.youtube.com), then post again.");
+  }
+
+  const fileInput = page.locator("ytcp-upload-file input[type='file'], input[type='file']").first();
+  try {
+    await fileInput.waitFor({ state: "attached", timeout: 40_000 });
+    await fileInput.setInputFiles({ name: video.name, mimeType: video.mime, buffer: video.buffer });
+  } catch {
+    throw new Error("YouTube upload dialog didn't expose a file input (are you signed in to Studio?).");
+  }
+
+  // Processing → draft editor (title field #textbox). Shorts stay Shorts when
+  // the file is 9:16 and under 3 minutes; longer files publish as a normal video.
+  log("Video processing in Studio — waiting for the draft editor…");
+  const titleBox = page.locator("ytcp-uploads-dialog #textbox, #textbox[contenteditable='true']").first();
+  try {
+    await titleBox.waitFor({ state: "visible", timeout: 240_000 });
+  } catch {
+    throw new Error("Draft editor never appeared after processing (video may be too long or Studio is stuck).");
+  }
+  try {
+    await titleBox.click({ timeout: 8000 });
+    await page.keyboard.type(caption.slice(0, 90), { delay: 10 });
+    log(`Title set: “${caption.slice(0, 60)}…”`);
+  } catch {
+    log("Could not type the title automatically — paste it in the studio draft if needed.");
+  }
+
+  // “Made for kids” — YouTube requires an explicit answer; choose “No”.
+  const notKids = page
+    .locator("ytcp-uploads-dialog div[role='radio']:has-text(\"No, it's not made for kids\"), ytcp-uploads-dialog:has-text(\"Made for kids\") div[role='radio']")
+    .first();
+  if ((await notKids.count()) > 0) {
+    await notKids.click({ timeout: 4000 }).catch(() => undefined);
+    await page.waitForTimeout(300);
+  }
+
+  // Visibility = Public (the “Everyone” audience). Best-effort: pick the
+  // Public radio inside the upload dialog.
+  const visPublic = page
+    .locator("ytcp-uploads-dialog div[role='radio']:has-text(\"Public\"), ytcp-video-visibility-select div[role='radio']:has-text(\"Public\"), paper-radio-button[name='PUBLIC_VISIBILITY']")
+    .first();
+  if ((await visPublic.count()) > 0) {
+    await visPublic.click({ timeout: 5000 }).catch(() => undefined);
+    await page.waitForTimeout(400);
+    log("Visibility set to Public (Everyone).");
+  }
+
+  log("Publishing…");
+  const publish = page.locator("ytcp-button[aria-label*='Publish' i], ytcp-button:has-text(\"Publish\"), button:has-text(\"Publish\")").last();
+  await publish.click({ timeout: 15_000 }).catch(() => undefined);
+  // Success = the studio upload dialog closes (optionally after a “published” toast).
+  const dialogGone = await page
+    .waitForFunction(() => {
+      const dialog = document.querySelector("ytcp-uploads-dialog") as HTMLElement | null;
+      return !dialog || dialog.getAttribute("hidden") !== null || dialog.style.display === "none";
+    }, { timeout: 45_000 })
+    .then(() => true)
+    .catch(() => false);
+  if (dialogGone) {
+    log("✅ YouTube publish confirmed — visibility Public (Everyone).");
+    return { ok: true as const, message: "Published on YouTube (Public)" };
+  }
+  const body = await page.evaluate(() => document.body?.innerText?.slice(0, 600) ?? "");
+  if (/publish\s*ed/i.test(body) || /video\s+publish/i.test(body)) {
+    log("✅ YouTube publish confirmed — visibility Public (Everyone).");
+    return { ok: true as const, message: "Published on YouTube (Public)" };
+  }
+  return { ok: false as const, message: "Publish clicked but Studio kept the dialog open — check for an error in the live browser." };
 }
