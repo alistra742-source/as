@@ -18,7 +18,7 @@ import { START_URL } from "../lib/types";
 import type { RemoteCmd } from "../lib/protocol";
 import { connectLive, defaultWorkerUrl, sendBusCmd } from "../lib/liveBus";
 import { useDeck } from "../state/deck";
-import { Chip, Kbd, StatusDot, cn } from "./ui";
+import { Chip, StatusDot, cn } from "./ui";
 import { DemoBrowser } from "./DemoBrowser";
 
 export function BrowserDock({ platform }: { platform: Platform }) {
@@ -192,6 +192,7 @@ function LiveViewport({ platform }: { platform: Platform }) {
       onReady: (url) => {
         setSession(platform, { url, state: "open" });
       },
+      onInputFocus: () => setKbOpen(true),
       onError: (message) => setLive(platform, { lastError: message }),
       onStateChange: (ok) => {
         setConnected(ok);
@@ -286,7 +287,7 @@ function LiveViewport({ platform }: { platform: Platform }) {
               <div className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center pb-2">
                 <div className="flex items-center gap-1.5 rounded-full border border-line bg-ink-950/85 px-3 py-1 text-[10px] text-slate-300">
                   <MousePointer2 className="size-3 text-amber-300" />
-                  tap to click · drag to scroll · tap “Keyboard” to type with your phone keyboard
+                  tap to click · drag to scroll · tap a field and your phone keyboard opens
                 </div>
               </div>
             </div>
@@ -313,43 +314,47 @@ function IconBtn({ children, onClick, title }: { children: React.ReactNode; onCl
 
 /* ------------------------------ type capture ------------------------------ */
 
-const ROWS = [
-  ["q", "w", "e", "r", "t", "y", "u", "i", "o", "p"],
-  ["a", "s", "d", "f", "g", "h", "j", "k", "l"],
-  ["⇧", "z", "x", "c", "v", "b", "n", "m", "⌫"],
-];
-
+/**
+ * Real, visible capture bar: focusing it summons the user's OWN device
+ * keyboard (a zero-size hidden input does not work on iOS). Every keystroke is
+ * forwarded to the focused field in the live browser; the bar itself never
+ * accumulates text. No in-app keypad — the device keyboard does all the work.
+ */
 function TypeCapture({ onKey, onClose }: { onKey: (cmd: RemoteCmd) => void; onClose: () => void }) {
   const inputRef = useRef<HTMLInputElement | null>(null);
-  const [caps, setCaps] = useState(false);
 
   useEffect(() => {
+    // Keep focus so keystrokes keep flowing to the live browser.
     inputRef.current?.focus({ preventScroll: true });
   }, []);
-
-  const inject = (char: string) => {
-    if (char === "⇧") return setCaps((c) => !c);
-    if (char === "⌫") return onKey({ t: "key", key: "Backspace" });
-    onKey({ t: "type", text: caps ? char.toUpperCase() : char });
-  };
 
   return (
     <div className="border-t border-line-soft bg-ink-900 p-3">
       <div className="mb-2 flex items-center gap-2">
-        <Keyboard className="size-4 text-amber-300" />
+        <Keyboard className="size-4 shrink-0 text-amber-300" />
         <p className="flex-1 text-xs text-muted">
-          Typing target armed — your phone keyboard is open. Keystrokes go to the focused field in the live browser.
+          Your device keyboard is live — what you type goes into the focused field in the browser.
         </p>
-        <button onClick={onClose} className="flex size-6 items-center justify-center rounded-md text-faint hover:text-slate-200">
+        <button
+          onClick={onClose}
+          title="Done typing"
+          className="flex size-6 items-center justify-center rounded-md text-faint hover:text-slate-200"
+        >
           <X className="size-4" />
         </button>
       </div>
       <input
         ref={inputRef}
         autoFocus
-        autoCapitalize="sentences"
+        autoCapitalize="none"
         autoCorrect="off"
+        spellCheck={false}
         enterKeyHint="go"
+        value=""
+        onBeforeInput={(e) => e.preventDefault()}
+        onChange={() => {
+          /* keystrokes are forwarded from keydown; this bar never stores text */
+        }}
         onKeyDown={(e) => {
           if (e.key === "Backspace") {
             e.preventDefault();
@@ -362,41 +367,9 @@ function TypeCapture({ onKey, onClose }: { onKey: (cmd: RemoteCmd) => void; onCl
             onKey({ t: "type", text: e.key });
           }
         }}
-        className="h-0 w-0 opacity-0"
-        tabIndex={-1}
+        placeholder="Type here — it goes to the live browser field"
+        className="h-11 w-full rounded-xl border border-amber-500/30 bg-ink-950 px-3 text-base text-slate-200 caret-amber-400 outline-none placeholder:text-faint focus:border-amber-400/60"
       />
-      <div className="hidden sm:block">
-        {ROWS.map((row, i) => (
-          <div key={i} className="mb-1 flex justify-center gap-1">
-            {row.map((k) => (
-              <button
-                key={k}
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={() => inject(k)}
-                className={cn(
-                  "h-9 w-9 rounded-lg border border-line bg-ink-800 text-sm font-semibold text-slate-200 hover:bg-ink-700",
-                  k === "⌫" && "w-14",
-                  k === "⇧" && "w-14 text-xs"
-                )}
-              >
-                {k}
-              </button>
-            ))}
-          </div>
-        ))}
-        <div className="mt-1 flex justify-center gap-1">
-          <button
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={() => onKey({ t: "type", text: " " })}
-            className="h-9 w-56 rounded-lg border border-line bg-ink-800 text-slate-200 hover:bg-ink-700"
-          >
-            space
-          </button>
-        </div>
-        <div className="mt-1 flex justify-center">
-          <Kbd>or just use your physical keyboard</Kbd>
-        </div>
-      </div>
     </div>
   );
 }

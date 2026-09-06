@@ -55,6 +55,7 @@ export type ServerMsg =
   | { type: "log"; level: string; text: string; at: number }
   | { type: "engine"; state: EngineSnapshot }
   | { type: "post-ok"; postId: string; postedAt: number; url: string }
+  | { type: "input-focused" } // a tap landed on a text field — open the device keyboard
   | { type: "error"; message: string };
 
 export function now(): number {

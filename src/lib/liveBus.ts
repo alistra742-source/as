@@ -10,6 +10,7 @@ export interface LiveBusHandlers {
   onEngine: (state: import("./protocol").EngineSnapshot) => void;
   onPostOk: (postId: string, postedAt: number, url: string) => void;
   onReady: (url: string) => void;
+  onInputFocus: () => void;
   onError: (message: string) => void;
   onStateChange: (connected: boolean) => void;
 }
@@ -73,6 +74,9 @@ export function connectLive(
           break;
         case "post-ok":
           handlers.onPostOk(msg.postId, msg.postedAt, msg.url);
+          break;
+        case "input-focused":
+          handlers.onInputFocus();
           break;
         case "error":
           handlers.onError(msg.message);

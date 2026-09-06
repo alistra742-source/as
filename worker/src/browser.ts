@@ -216,6 +216,23 @@ export class Rig {
       case "tap": {
         const vp = page.viewportSize() ?? { width: 1280, height: 900 };
         await page.mouse.click(cmd.x * vp.width, cmd.y * vp.height);
+        // If the tap landed in a text field, tell the deck so it can pop the
+        // user's own device keyboard and route keystrokes to that field.
+        const onField = await page
+          .evaluate(() => {
+            const el = document.activeElement as HTMLElement | null;
+            if (!el) return false;
+            const tag = el.tagName;
+            return (
+              tag === "INPUT" ||
+              tag === "TEXTAREA" ||
+              el.isContentEditable ||
+              el.getAttribute("contenteditable") === "true" ||
+              el.getAttribute("role") === "textbox"
+            );
+          })
+          .catch(() => false);
+        if (onField) this.broadcast({ type: "input-focused" });
         return;
       }
       case "scroll":
