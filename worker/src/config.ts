@@ -44,8 +44,9 @@ export const stealth = {
   humanize: process.env.STEALTH_HUMANIZE !== "false",
   /** Red cursor dot over the live stream so you can SEE the humanized motion. */
   showCursor: process.env.STEALTH_SHOW_CURSOR === "true",
-  /** Headless by default — Clearcote's headless passes headless-heuristic
-   * suites. Set "false" and run under xvfb for a headed window. */
+  /** Headless by default on bare machines; the Docker image sets
+   * STEALTH_HEADLESS=false and runs HEADED under Xvfb (headed Chrome avoids
+   * headless-mode tells — the official Clearcote container does the same). */
   headless: process.env.STEALTH_HEADLESS !== "false",
   timezone: process.env.STEALTH_TIMEZONE || "America/New_York",
   acceptLanguage: process.env.STEALTH_LANG || "en-US,en",

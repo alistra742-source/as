@@ -66,7 +66,10 @@ export class Rig {
     );
     this.context = await launchPersistentContext(profile, {
       headless: stealth.headless,
-      viewport: { width: 1280, height: 900 },
+      // NOTE: no explicit viewport — on a headed window the SDK forces
+      // viewport: null (an emulated viewport on a real window is a tell);
+      // when headless, the SDK fits window/screen geometry itself.
+      ...(stealth.headless ? { viewport: { width: 1280, height: 900 } } : {}),
       locale: "en-US",
       timezoneId: stealth.timezone,
       args: LAUNCH_ARGS,
@@ -272,9 +275,15 @@ export class Rig {
         await page.goto(cmd.url, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
         return;
       case "tap": {
-        const vp = page.viewportSize() ?? { width: 1280, height: 900 };
-        const x = cmd.x * vp.width;
-        const y = cmd.y * vp.height;
+        // Real window size in CSS px (the SDK's own convention: with
+        // viewport:null on a headed window, viewportSize() is null for life).
+        const vp = await page
+          .evaluate(() => [window.innerWidth, window.innerHeight])
+          .catch(() => undefined);
+        const width = vp?.[0] || page.viewportSize()?.width || 1280;
+        const height = vp?.[1] || page.viewportSize()?.height || 900;
+        const x = cmd.x * width;
+        const y = cmd.y * height;
         // Humanized: the SDK glides there (min-jerk path, tremor, dwell) and
         // presses with a human hold; we add the pre-tap "eyes on the target"
         // pause and a post-tap beat around it.

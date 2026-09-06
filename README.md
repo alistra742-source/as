@@ -20,7 +20,7 @@ detectable JS patches — the **nodriver** way:
 
 | Layer | What it does |
 | --- | --- |
-| **Clearcote binary** | Engine-level persona: one coherent, seed-stable “machine” per platform (UA + UA-CH + TLS/JA4 + canvas/WebGL/audio/fonts/GPU all agree). `--enable-automation` is stripped, `navigator.webdriver` stays `false`, headless-heuristic tells are masked. The verified binary is SHA-256-checked and pre-downloaded at Docker build time. |
+| **Clearcote binary** | Engine-level persona: one coherent, seed-stable “machine” per platform (UA + UA-CH + TLS/JA4 + canvas/WebGL/audio/fonts/GPU all agree). `--enable-automation` is stripped, `navigator.webdriver` stays `false`. The verified binary is SHA-256-checked and pre-downloaded at Docker build time. In Docker the browser runs **headed under Xvfb** (headed Chrome avoids headless-mode tells — the official Clearcote container does the same). |
 | **nodriver-style driving** | Raw CDP, no chromedriver / WebDriver layer. Playwright-core attaches over CDP like nodriver does — no driver artifacts, and the engine neutralizes CDP `Runtime.enable` leaks. |
 | **Humanized input (trusted events)** | Every click, keystroke and scroll is dispatched as a **native trusted event** (`isTrusted === true`) by the SDK's humanize layer: minimum-jerk cursor paths with tremor + overshoot, Fitts-scaled speeds, key-hold dwells, eased scrolls with reading pauses, ambient cursor drift, and ~2% fat-finger typos that are auto-corrected (engine-typed captions only — keystrokes *you* route from the deck are typed clean). |
 | **Human scheduling** | The 1-post/hour rule always holds, but every slot gets a random upward jitter (default up to +9 min), the first automatic pass waits a random 0–8 min after arm/boot, and stats reads land a few random minutes after they're due. Nothing happens on a metronome beat. |
@@ -71,9 +71,12 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 
 1. **Push this repo to GitHub**, then on Railway create a service from it (repo root — the
    root `Dockerfile` is picked up automatically). That's it: the same service serves the app
-   and the browser backend on one domain. During the Docker build the **verified Clearcote
-   browser** is downloaded and SHA-256-checked into `/app/.clearcote-browser`, so deploys
-   never touch GitHub at runtime.
+   and the browser backend on one domain. The image is Debian bookworm (the same base as the
+   official Clearcote container) with the full Chromium runtime + font set; during the build
+   the **verified Clearcote browser** is downloaded and SHA-256-checked into
+   `/app/.clearcote-browser`, so deploys never touch GitHub at runtime. The browser runs
+   **headed under Xvfb** by default (`STEALTH_HEADLESS=false` in the image — headed avoids
+   headless-mode tells).
 2. Add a **volume** mounted at `/app/data` (keeps your logins + state across restarts).
 3. Set one environment variable: `GROQ_API_KEY` (get one at console.groq.com — free tier is
    plenty). Optional: `GROQ_MODEL`, `WORKER_TOKEN` (if set, paste the same value in the

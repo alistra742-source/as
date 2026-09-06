@@ -8,42 +8,48 @@
 # image and none is ever downloaded at runtime — the verified Clearcote binary
 # is fetched once during the build.
 #
-# Ubuntu 24.04 base: matches the glibc/libs the Clearcote Linux binary expects,
-# with Chrome's runtime dependencies installed for it.
-FROM node:22-noble
+# Base + runtime deps mirror Clearcote's own official container
+# (github.com/clearcotelabs/clearcote-browser, docker/Dockerfile): Debian
+# bookworm, the full Chromium library set, and a complete font base (fontconfig
+# + Liberation + Noto emoji/CJK + unifont) so canvas/text hashes stay coherent
+# on a bare container — the #1 Linux fingerprint tell. The browser runs HEADED
+# under Xvfb by default (headed Chrome avoids headless-mode tells); set
+# STEALTH_HEADLESS=true to opt out.
+FROM node:22-bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    xz-utils \
     ca-certificates \
-    fonts-liberation \
-    fonts-noto-color-emoji \
-    libasound2t64 \
-    libatk-bridge2.0-0t64 \
-    libatk1.0-0t64 \
-    libatspi2.0-0t64 \
-    libcairo2 \
-    libcups2t64 \
-    libdbus-1-3 \
-    libdrm2 \
-    libegl1 \
-    libexpat1 \
-    libgbm1 \
-    libglib2.0-0t64 \
-    libgtk-3-0t64 \
-    libnspr4 \
+    xvfb \
     libnss3 \
-    libpango-1.0-0 \
-    libx11-6 \
-    libx11-xcb1 \
-    libxcb1 \
-    libxcb-dri3-0 \
+    libnspr4 \
+    libgbm1 \
+    libasound2 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libxkbcommon0 \
     libxcomposite1 \
     libxdamage1 \
-    libxext6 \
-    libxfixes3 \
-    libxkbcommon0 \
     libxrandr2 \
-    libxshmfence1 \
-    xdg-utils \
+    libxfixes3 \
+    libxext6 \
+    libxrender1 \
+    libxcb1 \
+    libpango-1.0-0 \
+    libcairo2 \
+    libx11-6 \
+    libexpat1 \
+    libdbus-1-3 \
+    libxi6 \
+    libxtst6 \
+    libgtk-3-0 \
+    fontconfig \
+    fonts-liberation \
+    fonts-noto-color-emoji \
+    fonts-unifont \
+    fonts-wqy-zenhei \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -64,8 +70,16 @@ RUN node -e "import('clearcote').then(async (m) => { const p = await m.download(
 # Drop build-only tooling from the final image.
 RUN npm prune --omit=dev
 
-ENV NODE_ENV=production
+# Headed under Xvfb by default (the official Clearcote container does the
+# same: headed Chrome avoids headless-mode tells). Set STEALTH_HEADLESS=true
+# to run headless and skip Xvfb.
+ENV NODE_ENV=production \
+    STEALTH_HEADLESS=false \
+    XVFB_SCREEN=1280x900x24
+
+COPY worker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
 EXPOSE 8080
 
-CMD ["node", "worker/dist/index.js"]
+CMD ["/entrypoint.sh"]
