@@ -418,7 +418,7 @@ export function WorkerCard({ room }: { room: Room }) {
       <PanelHeader
         icon={<span className="text-base leading-none">🛰</span>}
         title="Browser worker"
-        sub={live.connected ? "Connected — real browser sessions available" : "For live mode (deploy worker/ to Railway)"}
+        sub={live.connected ? "Connected — real browser sessions available" : "Optional — empty = auto-connect to this app's backend"}
         right={
           live.connected ? (
             <Chip tone="green">● online</Chip>
@@ -433,7 +433,7 @@ export function WorkerCard({ room }: { room: Room }) {
           <input
             value={live.wsUrl}
             onChange={(e) => setLive(room.platform, { wsUrl: e.target.value })}
-            placeholder="wss://your-worker.up.railway.app/ws"
+            placeholder="leave empty to auto-connect (same domain)"
             spellCheck={false}
             className="h-9 w-full rounded-lg border border-line bg-ink-900 px-2.5 font-mono text-[11px] text-slate-200 outline-none placeholder:text-faint focus:border-amber-400/60"
           />
@@ -444,7 +444,7 @@ export function WorkerCard({ room }: { room: Room }) {
             <input
               value={live.token}
               onChange={(e) => setLive(room.platform, { token: e.target.value })}
-              placeholder="from WORKER_TOKEN"
+              placeholder="optional (only if the backend sets WORKER_TOKEN)"
               spellCheck={false}
               className="h-9 w-full rounded-lg border border-line bg-ink-900 px-2.5 font-mono text-[11px] text-slate-200 outline-none placeholder:text-faint focus:border-amber-400/60"
             />
@@ -454,8 +454,8 @@ export function WorkerCard({ room }: { room: Room }) {
           </Button>
         </div>
         <p className="text-[11px] leading-snug text-muted">
-          The worker is what makes the browser “live”. Without it the deck runs in the interactive demo mode —
-          everything else (posting rules, Groq engine, hourly loop) is identical.
+          Deployed as one service, the app serves its own browser backend — leave both fields empty and live
+          mode just works. Set a custom URL/token only when pointing at a separate worker.
         </p>
       </div>
     </Panel>

@@ -179,12 +179,8 @@ export const useDeck = create<DeckState>()(
       openLiveSession: (p) => {
         const room = get().rooms[p];
         if (room.session) return false;
-        if (!room.live.wsUrl.trim()) {
-          get().addLog(p, [
-            logEntry("err", "Live session needs a worker URL — paste it in the Worker card first."),
-          ]);
-          return false;
-        }
+        // Empty Worker card is fine: the live bus falls back to the same-origin
+        // /ws endpoint (single-service deploy).
         const session: BrowserSession = {
           id: uid("ses"),
           platform: p,
@@ -201,7 +197,7 @@ export const useDeck = create<DeckState>()(
               session,
               log: [
                 ...s.rooms[p].log,
-                logEntry("info", "Live browser requested — connecting to your worker…"),
+                logEntry("info", "Live browser requested — connecting to the browser backend…"),
               ].slice(-MAX_LOG),
             },
           },

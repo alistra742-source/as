@@ -5,16 +5,20 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b && vite build && tsc -p worker/tsconfig.json",
+    "start": "node worker/dist/index.js",
     "preview": "vite preview --host 0.0.0.0",
-    "typecheck": "tsc -b --noEmit"
+    "typecheck": "tsc -b --noEmit && tsc -p worker/tsconfig.json --noEmit"
   },
   "dependencies": {
     "clsx": "^2.1.1",
+    "groq-sdk": "^0.15.0",
     "lucide-react": "^0.525.0",
+    "playwright": "1.49.1",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "tailwind-merge": "^3.3.0",
+    "ws": "^8.18.0",
     "zustand": "^5.0.6"
   },
   "devDependencies": {
@@ -22,6 +26,7 @@
     "@types/node": "^24.0.0",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
+    "@types/ws": "^8.5.13",
     "@vitejs/plugin-react": "^4.6.0",
     "tailwindcss": "^4.1.11",
     "typescript": "~5.8.3",

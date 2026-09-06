@@ -16,7 +16,7 @@ import {
 import type { Platform } from "../lib/types";
 import { START_URL } from "../lib/types";
 import type { RemoteCmd } from "../lib/protocol";
-import { connectLive, sendBusCmd } from "../lib/liveBus";
+import { connectLive, defaultWorkerUrl, sendBusCmd } from "../lib/liveBus";
 import { useDeck } from "../state/deck";
 import { Chip, Kbd, StatusDot, cn } from "./ui";
 import { DemoBrowser } from "./DemoBrowser";
@@ -168,11 +168,9 @@ function LiveViewport({ platform }: { platform: Platform }) {
   const { wsUrl, token } = room.live;
 
   useEffect(() => {
-    if (!wsUrl) {
-      setLive(platform, { lastError: "No worker URL set — add it under the Worker card." });
-      return;
-    }
-    const disconnect = connectLive(platform, wsUrl, token, {
+    // Empty URL = same-origin auto-connect (single-service deploy).
+    const url = wsUrl.trim() || defaultWorkerUrl();
+    const disconnect = connectLive(platform, url, token, {
       onFrame: (data) => setFrame(data),
       onNav: (url) => {
         setSession(platform, { url });
@@ -409,7 +407,8 @@ function NoSession({ platform }: { platform: Platform }) {
   const room = useDeck((s) => s.rooms[platform]);
   const openDemo = useDeck((s) => s.openDemoSession);
   const openLive = useDeck((s) => s.openLiveSession);
-  const canLive = room.live.wsUrl.trim().length > 0;
+  // Always enabled — with an empty Worker card the deck auto-connects to the
+  // same-domain backend (single-service deploy).
   return (
     <div className="flex flex-col items-center justify-center gap-3 px-6 py-12 text-center">
       <div className="flex size-14 items-center justify-center rounded-2xl border border-dashed border-line bg-ink-800 text-amber-300">
@@ -425,9 +424,8 @@ function NoSession({ platform }: { platform: Platform }) {
       <div className="flex flex-col items-center gap-2">
         <button
           onClick={() => openLive(platform)}
-          disabled={!canLive}
-          title={canLive ? "Open a real browser driven by your Railway worker" : "Add your worker WebSocket URL in the Worker card first"}
-          className="inline-flex items-center gap-2 rounded-xl bg-amber-400 px-5 py-2.5 text-sm font-bold text-ink-950 shadow-[0_0_22px_-6px_rgba(245,158,11,0.6)] hover:bg-amber-300 active:scale-[0.98] disabled:opacity-40 disabled:pointer-events-none"
+          title="Open a real browser driven by the app's backend"
+          className="inline-flex items-center gap-2 rounded-xl bg-amber-400 px-5 py-2.5 text-sm font-bold text-ink-950 shadow-[0_0_22px_-6px_rgba(245,158,11,0.6)] hover:bg-amber-300 active:scale-[0.98]"
         >
           <span className="text-base leading-none">＋</span> Live browser
         </button>
@@ -438,11 +436,9 @@ function NoSession({ platform }: { platform: Platform }) {
           Try the interactive demo instead
         </button>
       </div>
-      {!canLive && (
-        <p className="max-w-xs text-[11px] text-faint">
-          Live needs your worker URL (Worker card) — or just start with the demo.
-        </p>
-      )}
+      <p className="max-w-xs text-[11px] text-faint">
+        Live connects to this app's backend automatically (Worker card is optional) — or just start with the demo.
+      </p>
     </div>
   );
 }
@@ -452,8 +448,9 @@ export function LiveDisconnectedHint() {
     <div className="flex items-start gap-2 rounded-xl border border-line bg-ink-800/60 p-3 text-xs text-muted">
       <WifiOff className="mt-0.5 size-4 shrink-0 text-faint" />
       <p>
-        Live mode needs your Railway worker. Deploy <code className="font-mono text-amber-300">worker/</code>, then
-        paste its WebSocket URL + token in the <span className="text-slate-300">Worker card</span>.
+        Live mode needs the Node backend — deploy this repo as one service (it serves the app
+        <span className="text-slate-300"> and</span> the browser socket). The deck auto-connects on the same domain;
+        the <span className="text-slate-300">Worker card</span> fields are only for pointing at a separate worker.
       </p>
     </div>
   );

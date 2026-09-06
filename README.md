@@ -14,25 +14,26 @@ the engine keep the account growing on your rules:
 ## Architecture
 
 ```
-┌──────────────────────────┐        WebSocket         ┌───────────────────────────────┐
-│  ViralDeck frontend      │  frames + commands       │  automation worker  (worker/) │
-│  (this repo, Vite/React) │ ───────────────────────► │  Node + Playwright Chromium   │
-│                          │ ◄─────────────────────── │  · persistent login profiles  │
-│  · Main / TikTok / IG / YT│  live browser stream    │  · remote click/scroll/type   │
-│  · demo browser (no net) │                          │  · uploads (Everyone / Public)│
-│  · composer, engine UI   │                          │  · Groq captions + reviews    │
-└──────────────────────────┘                          │  · hourly engine + metrics    │
-        ▲                                             └───────────────┬───────────────┘
-        │ localStorage deck state                                     │ Railway volume
-        └─────────────────────────────────────────────────────────────▼───────────────
-                    TikTok / Instagram / YouTube + Google (profiles + state.json)
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  One service (this repo, one Railway deploy)                               │
+│                                                                            │
+│  · Vite/React frontend (Main / TikTok / IG / YT, demo browser, engine UI)  │
+│  · Node + Playwright Chromium backend — serves the app AND the /ws socket  │
+│      on the same domain: live browser stream, click/scroll/type, uploads,  │
+│      Groq captions + reviews, hourly engine + metrics, login profiles      │
+└──────────────────────────────────────────────────────────────┬─────────────┘
+                                                               │ Railway volume
+                                                               ▼
+                                        TikTok / Instagram / YouTube + Google
+                                        (profiles + state.json)
 ```
 
 - **Frontend** is a plain Vite + React + Tailwind app (no account system — it's your private
   control deck; state persists in the browser).
-- **`worker/`** is the piece you host. It can run anywhere with Docker — the repo ships a
-  Railway-friendly `Dockerfile` (Playwright Chromium preinstalled). Everything sensitive
-  (your logins, Groq key, browser sessions) lives here, never in the browser UI.
+- **Backend** (`worker/src/`) ships in the same deploy — the root `Dockerfile` builds both and
+  one process serves the app and the browser socket on the same domain, so live mode
+  auto-connects with **zero configuration**. Everything sensitive (your logins, Groq key,
+  browser sessions) lives on the server, never in the browser UI.
 
 ## Try it now (demo mode — no server needed)
 
@@ -46,18 +47,18 @@ the engine keep the account growing on your rules:
 
 Demo mode never touches the network. The banner above the browser says SIMULATED.
 
-## Real mode — connect your Railway worker
+## Deploy (one service, zero config)
 
-1. **Push this repo to GitHub**, then on Railway create a new service from it with
-   **Root Directory = `worker`** (Dockerfile is picked up automatically).
+1. **Push this repo to GitHub**, then on Railway create a service from it (repo root — the
+   root `Dockerfile` is picked up automatically). That's it: the same service serves the app
+   and the browser backend on one domain.
 2. Add a **volume** mounted at `/app/data` (keeps your logins + state across restarts).
-3. Set environment variables: `WORKER_TOKEN` (long random string) and `GROQ_API_KEY`
-   (get one at console.groq.com — free tier is plenty). Optional:
-   `GROQ_MODEL`, `BROWSERBASE_API_KEY` + `BROWSERBASE_PROJECT_ID` (cloud browsers with
+3. Set one environment variable: `GROQ_API_KEY` (get one at console.groq.com — free tier is
+   plenty). Optional: `GROQ_MODEL`, `WORKER_TOKEN` (if set, paste the same value in the
+   Worker card), `BROWSERBASE_API_KEY` + `BROWSERBASE_PROJECT_ID` (cloud browsers with
    residential-grade IPs — use these if TikTok blocks datacenter logins).
-4. In the app, open **TikTok room → Worker card** and paste
-   `wss://<your-service>.up.railway.app/ws` plus the token, then open a browser session —
-   it now streams the *real* TikTok in your dock. Click, drag to scroll, tap **Keyboard** to
+4. Open the app, hit **＋ Live browser** in any room — it auto-connects to the same domain
+   and streams the *real* platform in your dock. Click, drag to scroll, tap **Keyboard** to
    type with your phone's keyboard, log in, then hit **Start**.
 
 ## Rules the engine enforces

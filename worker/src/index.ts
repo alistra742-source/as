@@ -1,10 +1,78 @@
 import http from "node:http";
+import { promises as fsp } from "node:fs";
+import path from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 import { env, PLATFORMS, START_URLS, type PlatformKey } from "./config.js";
 import type { ClientMsg, ServerMsg } from "./protocol.js";
 import { Store } from "./store.js";
 import { Rig } from "./browser.js";
 import { GrowthEngine } from "./engine.js";
+
+/** Built frontend lives in dist/ at the repo root (single-service deploy). */
+const DIST = path.resolve("dist");
+
+const MIME: Record<string, string> = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".ico": "image/x-icon",
+  ".txt": "text/plain; charset=utf-8",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+  ".map": "application/json",
+};
+
+/** Serve the Vite build with an SPA fallback to index.html. */
+async function serveFrontend(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    res.writeHead(404);
+    res.end("not found");
+    return;
+  }
+  let pathname: string;
+  try {
+    pathname = decodeURIComponent(new URL(req.url ?? "/", "http://localhost").pathname);
+  } catch {
+    pathname = "/";
+  }
+  const filePath = path.normalize(path.join(DIST, pathname === "/" ? "index.html" : pathname));
+  if (filePath !== DIST && !filePath.startsWith(DIST + path.sep)) {
+    res.writeHead(403);
+    res.end("forbidden");
+    return;
+  }
+
+  if (path.extname(filePath) !== "") {
+    // Real file (hashed asset, favicon, …). Missing asset = real 404.
+    try {
+      const data = await fsp.readFile(filePath);
+      const type = MIME[path.extname(filePath).toLowerCase()] ?? "application/octet-stream";
+      res.writeHead(200, { "content-type": type, "cache-control": "no-cache" });
+      res.end(data);
+    } catch {
+      res.writeHead(404);
+      res.end("not found");
+    }
+    return;
+  }
+
+  // Extension-less path → SPA route: serve index.html.
+  try {
+    const data = await fsp.readFile(path.join(DIST, "index.html"));
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache" });
+    res.end(data);
+  } catch {
+    res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+    res.end("frontend build not found — run `npm run build` (produces dist/)");
+  }
+}
 
 const store = new Store();
 const rigs = new Map<PlatformKey, Rig>();
@@ -23,8 +91,8 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({ ok: true, platforms: PLATFORMS, uptime: process.uptime() }));
     return;
   }
-  res.writeHead(404);
-  res.end("not found");
+  // Single-service deploy: everything else is the frontend.
+  void serveFrontend(req, res);
 });
 
 const wss = new WebSocketServer({ server, path: "/ws" });

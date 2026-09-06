@@ -126,6 +126,16 @@ export function isLiveConnected(platform: Platform): boolean {
   return !!entry && entry.ws.readyState === WebSocket.OPEN;
 }
 
+/**
+ * Same-origin worker endpoint — the single-service deploy serves the frontend
+ * AND the /ws socket on one domain, so the deck can auto-connect with nothing
+ * pasted into the Worker card.
+ */
+export function defaultWorkerUrl(): string {
+  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${proto}//${window.location.host}/ws`;
+}
+
 /** Accept wss://, ws://, https:// or bare domains; pin the ?platform= param. */
 function normalizeWsUrl(input: string, platform: Platform): string {
   let u = input.trim();

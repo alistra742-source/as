@@ -1,0 +1,13 @@
+node_modules
+dist
+worker/node_modules
+worker/dist
+worker/data
+data
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+*.tsbuildinfo
+*.log
