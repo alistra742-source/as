@@ -5,7 +5,7 @@ import type { BrowserContext, Page } from "playwright-core";
 import { env, stealth, driverInfo, START_URLS, type PlatformKey } from "./config.js";
 import type { RemoteCmd, ServerMsg } from "./protocol.js";
 import { Store } from "./store.js";
-import { asHumanPage, armAmbient, humanScroll, humanTap, humanType, jitter, readingPause, sleep, thinkingPause } from "./human.js";
+import { asHumanPage, humanTap, humanType, jitter, readingPause, sleep, thinkingPause } from "./human.js";
 
 /**
  * The rig drives the **Clearcote** browser the **nodriver** way: the binary is
@@ -36,6 +36,10 @@ export class Rig {
   private detectBusy = false;
   private idleBusy = false;
   private lastInputAt = 0;
+  private pendingCmds = 0;
+  /** See exec(): queued deck commands, drained one at a time. */
+  private cmdQueue: { cmd: RemoteCmd; resolve: () => void; reject: (e: unknown) => void }[] = [];
+  private draining = false;
 
   constructor(platform: PlatformKey, store: Store) {
     this.platform = platform;
@@ -120,7 +124,6 @@ export class Rig {
     if (this.control && !this.control.isClosed()) return this.control;
     const page = await ctx.newPage();
     this.control = page;
-    armAmbient(page);
     page.on("framenavigated", (frame) => {
       if (frame !== page.mainFrame()) return;
       const url = frame.url();
@@ -145,9 +148,7 @@ export class Rig {
 
   async newEnginePage(): Promise<Page> {
     const ctx = await this.ensureContext();
-    const page = await ctx.newPage();
-    armAmbient(page);
-    return page;
+    return ctx.newPage();
   }
 
   private startLoops() {
@@ -183,6 +184,7 @@ export class Rig {
   private async idleDrift() {
     const page = this.control;
     if (!page || page.isClosed() || this.idleBusy || this.detectBusy) return;
+    if (this.pendingCmds > 0) return; // never drift while commands are in flight
     if (Date.now() - this.lastInputAt < 45_000) return;
     this.idleBusy = true;
     try {
@@ -276,7 +278,47 @@ export class Rig {
     }
   }
 
-  async exec(cmd: RemoteCmd): Promise<void> {
+  /**
+   * All deck commands (tap/scroll/type/key/navigate) run strictly one at a
+   * time. The humanized cursor is a single shared resource: two concurrent
+   * glides interleave native mouse moves and presses land in the wrong place.
+   * Consecutive scrolls are coalesced (a drag sends dozens of tiny deltas) so
+   * drag-scrolling stays fluid without breaking the one-at-a-time guarantee.
+   */
+  exec(cmd: RemoteCmd): Promise<void> {
+    const last = this.cmdQueue[this.cmdQueue.length - 1];
+    if (cmd.t === "scroll" && last && last.cmd.t === "scroll") {
+      last.cmd.dy += cmd.dy; // merge into the queued scroll
+      return Promise.resolve();
+    }
+    this.pendingCmds += 1;
+    return new Promise<void>((resolve, reject) => {
+      this.cmdQueue.push({ cmd, resolve, reject });
+      void this.drain();
+    }).finally(() => {
+      this.pendingCmds -= 1;
+    });
+  }
+
+  private async drain(): Promise<void> {
+    if (this.draining) return;
+    this.draining = true;
+    try {
+      while (this.cmdQueue.length > 0) {
+        const item = this.cmdQueue.shift()!;
+        try {
+          await this.execInner(item.cmd);
+          item.resolve();
+        } catch (err) {
+          item.reject(err);
+        }
+      }
+    } finally {
+      this.draining = false;
+    }
+  }
+
+  private async execInner(cmd: RemoteCmd): Promise<void> {
     const page = this.control;
     if (!page || page.isClosed()) throw new Error("Control page not open");
     this.lastInputAt = Date.now();
@@ -309,9 +351,9 @@ export class Rig {
         const height = vp?.[1] || page.viewportSize()?.height || 900;
         const x = cmd.x * width;
         const y = cmd.y * height;
-        // Humanized: the SDK glides there (min-jerk path, tremor, dwell) and
-        // presses with a human hold; we add the pre-tap "eyes on the target"
-        // pause and a post-tap beat around it.
+        // Humanized single-glide press: the SDK moves the cursor there as
+        // native trusted events (min-jerk path, tremor), then we press and
+        // release with a human hold — see humanTap().
         await humanTap(page, x, y);
         // If the tap landed in a text field, tell the deck so it can pop the
         // user's own device keyboard and route keystrokes to that field.
@@ -333,9 +375,10 @@ export class Rig {
         return;
       }
       case "scroll":
-        // Human scroll: eased native wheel deltas with reading pauses between
-        // bursts (the SDK adds per-step easing + mid-scroll pauses).
-        await humanScroll(page, cmd.dy);
+        // Direct wheel — the SDK's humanize wrapper eases it into native
+        // wheel deltas with mid-scroll pauses itself. No extra chunking so a
+        // drag-scroll feels immediate and never backs up the command queue.
+        await page.mouse.wheel(0, cmd.dy);
         return;
       case "type":
         // User-routed keystrokes: human inter-key timing, NO typos (the SDK

@@ -97,12 +97,18 @@ export async function humanScroll(page: Page, dy: number): Promise<void> {
 }
 
 /**
- * A human "tap": approach dwell (eyes land before the finger), click, then a
- * beat before the page reacts. The click itself is the SDK's humanized
- * move+press+release.
+ * A human "tap" with ONE glide and a deterministic press. The move goes
+ * through the SDK's humanized mouse.move (minimum-jerk path, tremor); then we
+ * press with explicit down/up instead of the SDK's wrapped click — the
+ * wrapper's down() re-pins the cursor to the exact target right before the
+ * press, and nothing else can move it in between. Every step is still a
+ * native, trusted input event.
  */
 export async function humanTap(page: Page, x: number, y: number): Promise<void> {
-  await readingPause(140, 480);
-  await page.mouse.click(x, y);
-  await sleep(jitter(80, 260));
+  await page.mouse.move(x, y); // humanized glide (the whole "approach" delay)
+  await sleep(jitter(30, 90)); // eyes settle on the target
+  await page.mouse.down(); // wrapper re-pins to (x, y), then presses
+  await sleep(jitter(60, 140)); // human press-hold dwell
+  await page.mouse.up();
+  await sleep(jitter(30, 80)); // beat before the page reacts
 }

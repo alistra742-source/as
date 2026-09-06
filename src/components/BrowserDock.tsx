@@ -233,7 +233,11 @@ function LiveViewport({ platform }: { platform: Platform }) {
     const wasDrag = drag.current?.moved;
     drag.current = null;
     if (!el || wasDrag) return;
-    const rect = el.getBoundingClientRect();
+    // Measure against the RENDERED IMAGE, not the container: the frame is
+    // object-contain inside the box, so letterboxing would skew every tap
+    // toward the middle and clicks would land off-target.
+    const target = el.querySelector("img") ?? el;
+    const rect = target.getBoundingClientRect();
     send({
       t: "tap",
       x: Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width)),
@@ -284,7 +288,7 @@ function LiveViewport({ platform }: { platform: Platform }) {
               onPointerUp={onPointerUp}
               onPointerLeave={() => (drag.current = null)}
               onWheel={(e) => send({ t: "scroll", dy: e.deltaY })}
-              className="relative aspect-[16/10] w-full cursor-crosshair touch-none select-none overflow-hidden rounded-xl border border-line bg-ink-900"
+              className="relative aspect-[64/45] w-full cursor-crosshair touch-none select-none overflow-hidden rounded-xl border border-line bg-ink-900"
             >
               {frame ? (
                 <img src={`data:image/jpeg;base64,${frame}`} alt="Live browser" draggable={false} className="h-full w-full object-contain" />
