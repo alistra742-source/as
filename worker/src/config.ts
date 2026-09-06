@@ -28,10 +28,12 @@ export const stealth = {
   cacheDir: process.env.CLEARCOTE_CACHE_DIR || undefined,
   /** Pin a Clearcote browser build (e.g. "149" / "latest"). Defaults to the SDK's pinned release. */
   browserVersion: process.env.CLEARCOTE_BROWSER_VERSION || undefined,
-  /** Fingerprint persona OS. "windows" is the default anti-bot persona (a
-   * Windows Chrome desktop on a Linux host is what commercial anti-detect
-   * browsers do). */
-  platform: (process.env.STEALTH_PLATFORM || "windows") as "windows" | "linux" | "macos" | "android",
+  /** Fingerprint persona OS. Defaults to "linux" — Clearcote's own default
+   * for the Linux binary, and the only host-coherent choice: a Windows
+   * persona on a Linux host without a Windows-captured fingerprint profile
+   * produces incoherent font/canvas hashes (the SDK warns loudly). Set
+   * "windows"/"macos" only together with a matching captured profile. */
+  platform: (process.env.STEALTH_PLATFORM || "linux") as "windows" | "linux" | "macos" | "android",
   /** Stable per-platform identity seed — same seed, same machine, forever.
    * Includes the worker token so two deployments get unlinkable identities. */
   seed: (p: PlatformKey) =>

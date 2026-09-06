@@ -139,9 +139,12 @@ wss.on("connection", (ws, req) => {
       rig.clients.add(client);
       send(ws, { type: "ready", sessionId: `rig-${platform}`, url: START_URLS[platform], driver: driverInfo() });
       send(ws, { type: "engine", state: engine.snapshot() });
-      void rig.openControlSession().catch((e) =>
-        send(ws, { type: "error", message: `Browser start failed: ${(e as Error).message}` })
-      );
+      // Browser-start failures are logged to the console AND the client so the
+      // reason is always visible in the deploy log and the deck.
+      void rig.openControlSession().catch((e) => {
+        console.error(`[${platform}] open control session failed: ${(e as Error).message}`);
+        send(ws, { type: "error", message: `Browser start failed: ${(e as Error).message}` });
+      });
       return;
     }
 

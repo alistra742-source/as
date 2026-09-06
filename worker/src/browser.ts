@@ -67,6 +67,9 @@ export class Rig {
     try {
       this.context = await launchPersistentContext(profile, {
         headless: stealth.headless,
+        // Generous first-launch budget: a cold Railway volume + first profile
+        // creation can exceed Playwright's default 30 s wait for the browser.
+        timeout: 120_000,
         // NOTE: no explicit viewport — on a headed window the SDK forces
         // viewport: null (an emulated viewport on a real window is a tell);
         // when headless, the SDK fits window/screen geometry itself.
@@ -91,6 +94,7 @@ export class Rig {
       return this.context;
     } catch (err) {
       const raw = (err as Error).message || String(err);
+      console.error(`[${this.platform}] Clearcote browser start failed: ${raw}`);
       if (!stealth.headless && !process.env.DISPLAY) {
         throw new Error(
           `Headed mode needs a display — none is available (set STEALTH_HEADLESS=true or run under Xvfb). Underlying error: ${raw}`

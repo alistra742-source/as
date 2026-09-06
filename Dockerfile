@@ -21,6 +21,8 @@ FROM node:22-bookworm-slim
 # ever builds on another architecture instead of crashing at runtime.
 RUN [ "$(uname -m)" = "x86_64" ] || { echo "[build] Clearcote ships x64 binaries only — build this image for linux/amd64"; exit 1; }
 
+# Union of Clearcote's own container deps + the classic Chromium runtime set:
+# any missing lib here shows up as a silent browser hang at runtime.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     xz-utils \
     ca-certificates \
@@ -31,6 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libasound2 \
     libatk1.0-0 \
     libatk-bridge2.0-0 \
+    libatspi2.0-0 \
     libcups2 \
     libdrm2 \
     libxkbcommon0 \
@@ -44,11 +47,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpango-1.0-0 \
     libcairo2 \
     libx11-6 \
+    libx11-xcb1 \
     libexpat1 \
     libdbus-1-3 \
     libxi6 \
     libxtst6 \
+    libxcursor1 \
+    libglib2.0-0 \
     libgtk-3-0 \
+    libegl1 \
+    libgl1 \
+    libwayland-client0 \
+    libxshmfence1 \
     fontconfig \
     fonts-liberation \
     fonts-noto-color-emoji \
@@ -82,8 +92,11 @@ RUN npm prune --omit=dev
 # to run headless and skip Xvfb. The entrypoint starts Xvfb; as a belt-and-
 # braces fallback the worker also boots Xvfb itself if it finds headed mode
 # without a DISPLAY.
+# Linux persona: the Linux binary's coherent default — a windows persona on a
+# linux host needs a Windows-captured fingerprint profile (see env.example).
 ENV NODE_ENV=production \
     STEALTH_HEADLESS=false \
+    STEALTH_PLATFORM=linux \
     XVFB_SCREEN=1280x900x24
 
 COPY worker/entrypoint.sh /entrypoint.sh
