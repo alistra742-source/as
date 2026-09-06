@@ -15,6 +15,18 @@
 # on a bare container — the #1 Linux fingerprint tell. The browser runs HEADED
 # under Xvfb by default (headed Chrome avoids headless-mode tells); set
 # STEALTH_HEADLESS=true to opt out.
+#
+# Stage 0 — build the setpriority shim. Containers don't get CAP_SYS_NICE, so
+# setpriority() returns EPERM; the Clearcote pre-release binary is a
+# DCHECK-enabled build and fatals on that (base/process/process_linux.cc:201
+# DPCHECK "result == 0"). The shim makes it a harmless no-op, exactly like a
+# release Chromium behaves.
+FROM node:22-bookworm-slim AS shim-builder
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev \
+  && rm -rf /var/lib/apt/lists/*
+COPY worker/nice-shim.c /src/nice-shim.c
+RUN gcc -shared -fPIC -O2 -o /nice-shim.so /src/nice-shim.c
+
 FROM node:22-bookworm-slim
 
 # Clearcote ships x64 binaries only — fail fast (with a clear message) if this
@@ -87,6 +99,10 @@ RUN node worker/download-browser.mjs
 # Drop build-only tooling from the final image.
 RUN npm prune --omit=dev
 
+# The setpriority shim (built in stage 0) — injected into the browser via
+# LD_PRELOAD (see worker/nice-shim.c for the why).
+COPY --from=shim-builder /nice-shim.so /app/nice-shim.so
+
 # Headed under Xvfb by default (the official Clearcote container does the
 # same: headed Chrome avoids headless-mode tells). Set STEALTH_HEADLESS=true
 # to run headless and skip Xvfb. The entrypoint starts Xvfb; as a belt-and-
@@ -97,6 +113,7 @@ RUN npm prune --omit=dev
 ENV NODE_ENV=production \
     STEALTH_HEADLESS=false \
     STEALTH_PLATFORM=linux \
+    STEALTH_NICE_SHIM=/app/nice-shim.so \
     XVFB_SCREEN=1280x900x24
 
 COPY worker/entrypoint.sh /entrypoint.sh

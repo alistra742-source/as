@@ -91,6 +91,13 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 > fingerprint identity**, which can re-trigger login challenges — pick a token, keep it, and
 > don't rotate it.
 
+> **Container note:** Docker/Railway containers don't grant `CAP_SYS_NICE`, so `setpriority()`
+> returns `EPERM`. Release Chromium silently ignores that; Clearcote's pre-release builds have
+> DCHECKs enabled and would fatal (`base/process/process_linux.cc` `DPCHECK(result == 0)`).
+> The image therefore builds a tiny `setpriority` shim (`worker/nice-shim.c`) and preloads it
+> into the browser (`STEALTH_NICE_SHIM`) — priorities stay at their defaults, exactly as in a
+> release build.
+
 ## Rules the engine enforces
 
 | Rule | Value | Where |

@@ -89,6 +89,12 @@ export class Rig {
         // Where the verified binary lives (pre-downloaded in Docker builds).
         cacheDir: stealth.cacheDir,
         version: stealth.browserVersion,
+        // Containers lack CAP_SYS_NICE: setpriority() returns EPERM, and the
+        // Clearcote DCHECK build fatals on it. The shim (built into the
+        // Docker image) makes it a harmless no-op, like release Chromium.
+        ...(stealth.niceShim && fs.existsSync(stealth.niceShim)
+          ? { env: { LD_PRELOAD: stealth.niceShim } }
+          : {}),
       });
       this.control = null;
       return this.context;

@@ -28,6 +28,13 @@ export const stealth = {
   cacheDir: process.env.CLEARCOTE_CACHE_DIR || undefined,
   /** Pin a Clearcote browser build (e.g. "149" / "latest"). Defaults to the SDK's pinned release. */
   browserVersion: process.env.CLEARCOTE_BROWSER_VERSION || undefined,
+  /**
+   * Optional LD_PRELOAD shim for setpriority(). Containers lack CAP_SYS_NICE,
+   * so setpriority() returns EPERM — and the Clearcote pre-release binary is
+   * DCHECK-enabled, so it FATALs where a release Chromium would silently
+   * ignore it. The Docker image builds the shim and sets this automatically.
+   */
+  niceShim: process.env.STEALTH_NICE_SHIM || "",
   /** Fingerprint persona OS. Defaults to "linux" — Clearcote's own default
    * for the Linux binary, and the only host-coherent choice: a Windows
    * persona on a Linux host without a Windows-captured fingerprint profile
