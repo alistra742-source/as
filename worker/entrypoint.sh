@@ -3,7 +3,8 @@
 #
 # Headed-by-default: the Clearcote browser runs under Xvfb (a real X display),
 # because headed Chrome avoids headless-mode tells. Set STEALTH_HEADLESS=true
-# to run headless and skip Xvfb entirely.
+# to run headless and skip Xvfb entirely. (The worker also starts Xvfb itself
+# if it ever finds headed mode without a DISPLAY — this is the primary path.)
 set -e
 cd /app
 

@@ -64,30 +64,45 @@ export class Rig {
     console.log(
       `[${this.platform}] launching Clearcote browser (persona: ${stealth.platform}, humanized input: ${stealth.humanize ? "on" : "off"}, light stealth: ${stealth.lightStealth ? "on" : "off"}, profile: ${profile})`
     );
-    this.context = await launchPersistentContext(profile, {
-      headless: stealth.headless,
-      // NOTE: no explicit viewport — on a headed window the SDK forces
-      // viewport: null (an emulated viewport on a real window is a tell);
-      // when headless, the SDK fits window/screen geometry itself.
-      ...(stealth.headless ? { viewport: { width: 1280, height: 900 } } : {}),
-      locale: "en-US",
-      timezoneId: stealth.timezone,
-      args: LAUNCH_ARGS,
-      // Clearcote persona: one coherent, seed-stable machine identity per platform.
-      fingerprint: stealth.seed(this.platform),
-      platform: stealth.platform,
-      lightStealth: stealth.lightStealth,
-      timezone: stealth.timezone,
-      acceptLanguage: stealth.acceptLanguage,
-      // nodriver-style human input: trusted native events, motor persona, typos.
-      humanize: stealth.humanize,
-      showCursor: stealth.showCursor,
-      // Where the verified binary lives (pre-downloaded in Docker builds).
-      cacheDir: stealth.cacheDir,
-      version: stealth.browserVersion,
-    });
-    this.control = null;
-    return this.context;
+    try {
+      this.context = await launchPersistentContext(profile, {
+        headless: stealth.headless,
+        // NOTE: no explicit viewport — on a headed window the SDK forces
+        // viewport: null (an emulated viewport on a real window is a tell);
+        // when headless, the SDK fits window/screen geometry itself.
+        ...(stealth.headless ? { viewport: { width: 1280, height: 900 } } : {}),
+        locale: "en-US",
+        timezoneId: stealth.timezone,
+        args: LAUNCH_ARGS,
+        // Clearcote persona: one coherent, seed-stable machine identity per platform.
+        fingerprint: stealth.seed(this.platform),
+        platform: stealth.platform,
+        lightStealth: stealth.lightStealth,
+        timezone: stealth.timezone,
+        acceptLanguage: stealth.acceptLanguage,
+        // nodriver-style human input: trusted native events, motor persona, typos.
+        humanize: stealth.humanize,
+        showCursor: stealth.showCursor,
+        // Where the verified binary lives (pre-downloaded in Docker builds).
+        cacheDir: stealth.cacheDir,
+        version: stealth.browserVersion,
+      });
+      this.control = null;
+      return this.context;
+    } catch (err) {
+      const raw = (err as Error).message || String(err);
+      if (!stealth.headless && !process.env.DISPLAY) {
+        throw new Error(
+          `Headed mode needs a display — none is available (set STEALTH_HEADLESS=true or run under Xvfb). Underlying error: ${raw}`
+        );
+      }
+      if (/no build for|not (exist|found)/i.test(raw)) {
+        throw new Error(`Clearcote browser unavailable: ${raw} — check CLEARCOTE_CACHE_DIR and rebuild the image (the browser is pre-downloaded at build time).`);
+      }
+      throw new Error(
+        `Clearcote launch failed: ${raw} — typical causes: missing Chromium runtime libs (compare with the Dockerfile apt list), no display in headed mode, or a damaged browser cache (delete it and relaunch to re-download).`
+      );
+    }
   }
 
   async openControlSession(): Promise<Page> {

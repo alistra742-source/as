@@ -17,6 +17,10 @@
 # STEALTH_HEADLESS=true to opt out.
 FROM node:22-bookworm-slim
 
+# Clearcote ships x64 binaries only — fail fast (with a clear message) if this
+# ever builds on another architecture instead of crashing at runtime.
+RUN [ "$(uname -m)" = "x86_64" ] || { echo "[build] Clearcote ships x64 binaries only — build this image for linux/amd64"; exit 1; }
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     xz-utils \
     ca-certificates \
@@ -55,24 +59,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # DevDependencies (typescript, vite, etc.) are needed for the build step, so
-# do NOT set NODE_ENV=production before this point.
-COPY package.json ./
-RUN npm install --no-audit --no-fund
+# do NOT set NODE_ENV=production before this point. npm ci + the committed
+# package-lock.json = byte-for-byte the same dependency tree we build locally.
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
 
 COPY . .
 RUN npm run build
 
 # Pre-download + SHA-256-verify the Clearcote browser so deploys never touch
-# GitHub at runtime. Runtime reads it from the same cache dir (CLEARCOTE_CACHE_DIR).
+# GitHub at runtime. Runtime reads it from the same cache dir
+# (CLEARCOTE_CACHE_DIR). Progress is logged so this step is visible in the
+# build output; any failure fails the build with the underlying error.
 ENV CLEARCOTE_CACHE_DIR=/app/.clearcote-browser
-RUN node -e "import('clearcote').then(async (m) => { const p = await m.download({ cacheDir: process.env.CLEARCOTE_CACHE_DIR, quiet: true }); console.log('[build] clearcote browser ready:', p); })"
+RUN node worker/download-browser.mjs
 
 # Drop build-only tooling from the final image.
 RUN npm prune --omit=dev
 
 # Headed under Xvfb by default (the official Clearcote container does the
 # same: headed Chrome avoids headless-mode tells). Set STEALTH_HEADLESS=true
-# to run headless and skip Xvfb.
+# to run headless and skip Xvfb. The entrypoint starts Xvfb; as a belt-and-
+# braces fallback the worker also boots Xvfb itself if it finds headed mode
+# without a DISPLAY.
 ENV NODE_ENV=production \
     STEALTH_HEADLESS=false \
     XVFB_SCREEN=1280x900x24

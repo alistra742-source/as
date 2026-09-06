@@ -7,6 +7,11 @@ import type { ClientMsg, ServerMsg } from "./protocol.js";
 import { Store } from "./store.js";
 import { Rig } from "./browser.js";
 import { GrowthEngine } from "./engine.js";
+import { ensureDisplay } from "./display.js";
+
+// Headed-by-default: make sure a display exists before anything touches the
+// browser (starts Xvfb itself if the entrypoint was bypassed).
+ensureDisplay();
 
 /** Built frontend lives in dist/ at the repo root (single-service deploy). */
 const DIST = path.resolve("dist");
