@@ -2,7 +2,7 @@ import http from "node:http";
 import { promises as fsp } from "node:fs";
 import path from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
-import { env, PLATFORMS, START_URLS, type PlatformKey } from "./config.js";
+import { env, driverInfo, PLATFORMS, START_URLS, stealth, type PlatformKey } from "./config.js";
 import type { ClientMsg, ServerMsg } from "./protocol.js";
 import { Store } from "./store.js";
 import { Rig } from "./browser.js";
@@ -132,7 +132,7 @@ wss.on("connection", (ws, req) => {
         send: (m: ServerMsg) => send(ws, m),
       } as { __ws: WebSocket; send: (m: ServerMsg) => void };
       rig.clients.add(client);
-      send(ws, { type: "ready", sessionId: `rig-${platform}`, url: START_URLS[platform] });
+      send(ws, { type: "ready", sessionId: `rig-${platform}`, url: START_URLS[platform], driver: driverInfo() });
       send(ws, { type: "engine", state: engine.snapshot() });
       void rig.openControlSession().catch((e) =>
         send(ws, { type: "error", message: `Browser start failed: ${(e as Error).message}` })
@@ -172,6 +172,10 @@ wss.on("connection", (ws, req) => {
 server.listen(env.port, "0.0.0.0", () => {
   console.log(`[viraldeck-worker] listening on 0.0.0.0:${env.port}`);
   console.log(`[viraldeck-worker] platforms: ${PLATFORMS.join(", ")}`);
+  console.log(
+    `[viraldeck-worker] driver: Clearcote browser (${stealth.platform} persona, light stealth: ${stealth.lightStealth ? "on" : "off"}) ` +
+      `driven nodriver-style (raw CDP, trusted humanized input: ${stealth.humanize ? "on" : "off"})`
+  );
   console.log(
     env.groqKey
       ? `[viraldeck-worker] Groq connected (${env.groqModel})`

@@ -1,3 +1,5 @@
+import type { DriverInfo } from "./protocol";
+
 export type Platform = "tiktok" | "instagram" | "youtube";
 
 export type Niche = "stories" | "scary" | "facts";
@@ -23,6 +25,8 @@ export interface BrowserSession {
   state: SessionState;
   url: string;
   startedAt: number;
+  /** Live sessions only: what drives the remote browser (Clearcote + nodriver-style input). */
+  driver?: DriverInfo | null;
 }
 
 export interface MetricCheck {

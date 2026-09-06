@@ -60,6 +60,13 @@ function DockToolbar({ platform }: { platform: Platform }) {
         <div className="ml-auto flex items-center gap-1.5">
           {room.session?.mode === "demo" && <Chip tone="amber" className="font-mono">SIMULATED</Chip>}
           {room.session?.mode === "live" && <Chip tone="green">live worker</Chip>}
+          {room.session?.driver && (
+            <span
+              title={`Clearcote anti-fingerprint browser · ${room.session.driver.platform} persona · driven nodriver-style over raw CDP · trusted humanized input ${room.session.driver.humanize ? "on" : "off"} · light stealth ${room.session.driver.lightStealth ? "on" : "off"}`}
+            >
+              <Chip tone="violet">🛡 Clearcote · human</Chip>
+            </span>
+          )}
           {room.session && (
             <button
               onClick={() => closeSession(platform)}
@@ -189,8 +196,8 @@ function LiveViewport({ platform }: { platform: Platform }) {
       },
       onEngine: (state) => applyLiveEngine(platform, state),
       onPostOk: (_id, _at, url) => applyLivePostOk(platform, url),
-      onReady: (url) => {
-        setSession(platform, { url, state: "open" });
+      onReady: (url, driver) => {
+        setSession(platform, { url, state: "open", driver: driver ?? null });
       },
       onInputFocus: () => setKbOpen(true),
       onError: (message) => setLive(platform, { lastError: message }),

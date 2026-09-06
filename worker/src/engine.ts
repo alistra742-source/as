@@ -1,13 +1,29 @@
-import { HOUR_MS, type PlatformKey } from "./config.js";
+import { HOUR_MS, stealth, type PlatformKey } from "./config.js";
 import type { EngineSnapshot, LastPostSnapshot, ServerMsg } from "./protocol.js";
 import { now } from "./protocol.js";
 import { Store, type WorkerPost } from "./store.js";
 import { Rig, readVideoStats, scrapeCandidates, scrapeCommentSample } from "./browser.js";
 import { downloadVideo, uploadToPlatform } from "./uploads.js";
 import { groqAvailable, interpretMetrics, judgeCandidate, writeCaption } from "./groq.js";
+import { jitter, readingPause, sleep, thinkingPause } from "./human.js";
 
 const uid = () => `wp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
-const CHECK_INTERVAL_MS = 5 * 60_000;
+const LOOP_TICK_MS = 60_000;
+
+/**
+ * Humanized cadence: the 1-post/hour rule still holds (slots are never
+ * shorter than the cadence), but every scheduled time gets a random upward
+ * jitter so posts and checks never land on a metronome beat — a fixed,
+ * clock-perfect schedule is a classic bot tell.
+ */
+function jitteredCadenceMs(e: ReturnType<Store["engine"]>): number {
+  return e.cadenceHours * HOUR_MS + jitter(0, stealth.cadenceJitterMin * 60_000);
+}
+
+/** Random 0–bootDelayMaxMin minutes before the first engine action. */
+function warmupMs(): number {
+  return jitter(0.5, Math.max(1, stealth.bootDelayMaxMin)) * 60_000;
+}
 
 const NICHE_CYCLE = ["stories", "scary", "facts"];
 
@@ -83,14 +99,17 @@ export class GrowthEngine {
     if (e.running) return;
     e.running = true;
     e.phase = "analyzing";
-    e.nextRunAt = null; // first cycle runs the initial discovery + post immediately
-    e.message = "Engine armed. Analyzing account + algorithm, scanning faceless content.";
+    // Human stealth: a process that starts posting the instant it is armed is
+    // a bot tell. Warm up for a random 0–N minutes first, then run the first
+    // cycle. (When the user wants an immediate manual post, manualPost still
+    // runs right away — the warm-up only gates *automatic* actions.)
+    e.nextRunAt = now() + warmupMs();
+    e.message = "Engine armed — warming up like a human before the first automatic pass.";
     e.errorCount = 0;
     this.store.save();
     this.log("ok", `🛰 Engine armed for ${this.platform} — 1 post/hour, ${this.audienceLabel()}, ${e.thresholdViews.toLocaleString()}+/hr trigger, ${e.likesFloor.toLocaleString()}+ likes discovery floor.`);
     this.pushEngine();
     this.ensureLoop();
-    void this.runCycle("start");
   }
 
   stop() {
@@ -113,7 +132,14 @@ export class GrowthEngine {
     const e = this.store.engine(this.platform);
     if (e.running) {
       this.ensureLoop();
-      void this.runCycle("boot");
+      // A fresh boot that posts instantly is a tell — but an engine that was
+      // already mid-cadence keeps its existing schedule.
+      if (!e.nextRunAt) {
+        e.nextRunAt = now() + warmupMs();
+        e.message = "Resumed after restart — warming up before the next automatic pass.";
+        this.store.save();
+        this.pushEngine();
+      }
     }
   }
 
@@ -121,7 +147,7 @@ export class GrowthEngine {
     if (this.timer) return;
     this.timer = setInterval(() => {
       if (this.store.engine(this.platform).running) void this.runCycle("tick");
-    }, CHECK_INTERVAL_MS);
+    }, LOOP_TICK_MS);
     this.timer.unref?.();
   }
 
@@ -139,6 +165,17 @@ export class GrowthEngine {
         this.pushEngine();
         return;
       }
+      // Human stealth: never act before the jittered warm-up / next-slot time.
+      if (e.nextRunAt && now() < e.nextRunAt) {
+        const waitMin = Math.max(1, Math.round((e.nextRunAt - now()) / 60_000));
+        e.phase = "waiting";
+        e.message = e.lastRunAt
+          ? `Next automatic pass in ~${waitMin} min (human-jittered).`
+          : `Warming up — next automatic pass in ~${waitMin} min.`;
+        this.store.save();
+        this.pushEngine();
+        return;
+      }
       await this.metricsPass(e);
       if (!e.running) return;
       await this.postingPass(e);
@@ -147,7 +184,7 @@ export class GrowthEngine {
       e.errorCount += 1;
       e.phase = "error";
       e.message = `Cycle error — ${(err as Error).message.slice(0, 140)}`;
-      e.nextRunAt = now() + (e.errorCount <= 3 ? 15 * 60_000 : HOUR_MS);
+      e.nextRunAt = now() + (e.errorCount <= 3 ? 15 * 60_000 : HOUR_MS) + jitter(1, 6) * 60_000;
       this.store.save();
       this.pushEngine();
     } finally {
@@ -163,13 +200,21 @@ export class GrowthEngine {
       if (!e.running) return;
       const age = nowMs - post.postedAt;
       const last = post.checks[post.checks.length - 1];
-      const dueFirst = post.checks.length === 0 && age >= HOUR_MS - 5 * 60_000;
-      const dueNext = post.checks.length > 0 && post.checks.length < 4 && last && nowMs - last.at >= HOUR_MS - 5 * 60_000;
+      // Human stealth: reads happen a random few minutes AFTER they become due
+      // (a stats check on the exact hour mark every hour is a bot tell).
+      const dueFirst = post.checks.length === 0 && age >= HOUR_MS - jitter(5, 5 + stealth.metricsJitterMin) * 60_000;
+      const dueNext =
+        post.checks.length > 0 &&
+        post.checks.length < 4 &&
+        !!last &&
+        nowMs - last.at >= HOUR_MS - jitter(5, 5 + stealth.metricsJitterMin) * 60_000;
       if (!dueFirst && !dueNext) continue;
       this.log("info", `Reading stats for ${post.id.slice(-5)}…`);
       const page = await this.rig.newEnginePage();
       try {
+        // Land on the page like a person: load, look, then read.
         const stats = await readVideoStats(page, post.url);
+        await readingPause(400, 1200);
         await page.close().catch(() => undefined);
         if (stats.views == null && stats.likes == null) {
           this.log("warn", `Could not read stats for ${post.url.slice(0, 60)}… (page may block scraping) — retrying next hour.`);
@@ -219,8 +264,8 @@ export class GrowthEngine {
       return;
     }
     if (recent) {
-      e.nextRunAt = nowMs + e.cadenceHours * HOUR_MS;
-      e.message = "Hourly slot used (manual or auto) — next post scheduled in 1h.";
+      e.nextRunAt = nowMs + jitteredCadenceMs(e);
+      e.message = "Hourly slot used (manual or auto) — next post scheduled in ~1h (human-jittered).";
       this.store.save();
       this.pushEngine();
       return;
@@ -260,7 +305,10 @@ export class GrowthEngine {
       let best: Awaited<ReturnType<typeof judgeCandidate>> | null = null;
       let bestUrl = "";
       for (const c of candidates.slice(0, 3)) {
+        // A human doesn't teleport between clips: read a comment sample, then
+        // dwell before judging.
         const sample = await scrapeCommentSample(page, c.url).catch(() => "");
+        await readingPause(600, 1600);
         const judge = await judgeCandidate({ niche, title: c.title, likes: c.likes, views: c.views, comments: c.comments, commentSample: sample });
         this.log("ai", judge.verdict === "post" ? `Candidate cleared: “${c.title.slice(0, 60)}…” — ${judge.reason}` : `Candidate skipped: “${c.title.slice(0, 50)}…” — ${judge.reason}`);
         if (judge.verdict === "post" && !best) {
@@ -285,6 +333,8 @@ export class GrowthEngine {
       this.pushEngine();
 
       const caption = best.caption || (await writeCaption({ niche, hook: best.angle }));
+      // A human sits with the chosen clip for a beat before publishing it.
+      await thinkingPause(800, 2600);
       const video = await downloadVideo(page, this.rig.context!, bestUrl, (t) => this.log("info", t));
       const result = await uploadToPlatform(this.platform, page, video, caption, (t) => this.log("info", t));
       const post: WorkerPost = {
@@ -300,7 +350,8 @@ export class GrowthEngine {
       };
       this.store.addPost(this.platform, post);
       e.phase = "waiting";
-      e.nextRunAt = now() + e.cadenceHours * HOUR_MS;
+      e.nextRunAt = now() + jitteredCadenceMs(e);
+      e.lastRunAt = now();
       e.message = `Posted “${caption.slice(0, 48)}…” — 1 of 1 slot used this hour.`;
       e.errorCount = 0;
       e.niche = NICHE_CYCLE[(NICHE_CYCLE.indexOf(niche as never) + 1) % NICHE_CYCLE.length];
@@ -359,7 +410,7 @@ export class GrowthEngine {
       this.log("ok", `✅ Manual publish done — ${this.audienceLabel()}, caption “${(caption || "Posted via ViralDeck").slice(0, 60)}”.`);
       e.lastRunAt = now();
       if (e.running) {
-        e.nextRunAt = now() + e.cadenceHours * HOUR_MS;
+        e.nextRunAt = now() + jitteredCadenceMs(e);
         e.phase = "waiting";
         e.message = "Manual post logged — hourly slot reserved. Metrics read starts in ~1h.";
       } else {

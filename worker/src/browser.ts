@@ -1,19 +1,24 @@
 import fs from "node:fs";
 import path from "node:path";
-import { chromium, type BrowserContext, type Page } from "playwright";
-import { env, START_URLS, type PlatformKey } from "./config.js";
+import { launchPersistentContext } from "clearcote";
+import type { BrowserContext, Page } from "playwright-core";
+import { env, stealth, driverInfo, START_URLS, type PlatformKey } from "./config.js";
 import type { RemoteCmd, ServerMsg } from "./protocol.js";
 import { Store } from "./store.js";
+import { asHumanPage, armAmbient, humanScroll, humanTap, humanType, jitter, readingPause, sleep, thinkingPause } from "./human.js";
 
+/**
+ * The rig drives the **Clearcote** browser the **nodriver** way: the binary is
+ * launched directly by the Clearcote SDK (no WebDriver / chromedriver layer,
+ * `--enable-automation` stripped, engine-level fingerprint spoofing compiled
+ * into Chromium's C++), and every input goes out as native trusted events with
+ * a human motor persona (`humanize`). No vanilla Chromium is ever launched.
+ */
 const LAUNCH_ARGS = [
+  // Container runtime needs (the sandbox/uid sandbox and /dev/shm are absent in Docker).
   "--no-sandbox",
   "--disable-dev-shm-usage",
-  "--disable-blink-features=AutomationControlled",
-  "--disable-features=IsolateOrigins,site-per-process",
 ];
-
-const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 export interface RigClient {
   send: (msg: ServerMsg) => void;
@@ -27,7 +32,10 @@ export class Rig {
   control: Page | null = null;
   private frameTimer: NodeJS.Timeout | null = null;
   private loginTimer: NodeJS.Timeout | null = null;
+  private idleTimer: NodeJS.Timeout | null = null;
   private detectBusy = false;
+  private idleBusy = false;
+  private lastInputAt = 0;
 
   constructor(platform: PlatformKey, store: Store) {
     this.platform = platform;
@@ -52,21 +60,29 @@ export class Rig {
 
   async ensureContext(): Promise<BrowserContext> {
     if (this.context) return this.context;
-    if (env.browserbaseApiKey && env.browserbaseProjectId) {
-      const browser = await chromium.connectOverCDP(
-        `wss://connect.browserbase.com/v1/project/${env.browserbaseProjectId}?apiKey=${env.browserbaseApiKey}`
-      );
-      this.context = browser.contexts()[0] ?? (await browser.newContext({ viewport: { width: 1280, height: 900 } }));
-    } else {
-      this.context = await chromium.launchPersistentContext(this.profileDir(), {
-        headless: true,
-        viewport: { width: 1280, height: 900 },
-        userAgent: UA,
-        locale: "en-US",
-        timezoneId: "America/New_York",
-        args: LAUNCH_ARGS,
-      });
-    }
+    const profile = this.profileDir();
+    console.log(
+      `[${this.platform}] launching Clearcote browser (persona: ${stealth.platform}, humanized input: ${stealth.humanize ? "on" : "off"}, light stealth: ${stealth.lightStealth ? "on" : "off"}, profile: ${profile})`
+    );
+    this.context = await launchPersistentContext(profile, {
+      headless: stealth.headless,
+      viewport: { width: 1280, height: 900 },
+      locale: "en-US",
+      timezoneId: stealth.timezone,
+      args: LAUNCH_ARGS,
+      // Clearcote persona: one coherent, seed-stable machine identity per platform.
+      fingerprint: stealth.seed(this.platform),
+      platform: stealth.platform,
+      lightStealth: stealth.lightStealth,
+      timezone: stealth.timezone,
+      acceptLanguage: stealth.acceptLanguage,
+      // nodriver-style human input: trusted native events, motor persona, typos.
+      humanize: stealth.humanize,
+      showCursor: stealth.showCursor,
+      // Where the verified binary lives (pre-downloaded in Docker builds).
+      cacheDir: stealth.cacheDir,
+      version: stealth.browserVersion,
+    });
     this.control = null;
     return this.context;
   }
@@ -76,6 +92,7 @@ export class Rig {
     if (this.control && !this.control.isClosed()) return this.control;
     const page = await ctx.newPage();
     this.control = page;
+    armAmbient(page);
     page.on("framenavigated", (frame) => {
       if (frame !== page.mainFrame()) return;
       const url = frame.url();
@@ -83,7 +100,12 @@ export class Rig {
       this.broadcast({ type: "nav", url, title: url });
       void this.detectLogin();
     });
-    this.broadcast({ type: "ready", sessionId: `rig-${this.platform}`, url: START_URLS[this.platform] });
+    this.broadcast({
+      type: "ready",
+      sessionId: `rig-${this.platform}`,
+      url: START_URLS[this.platform],
+      driver: driverInfo(),
+    });
     this.startLoops();
     try {
       await page.goto(START_URLS[this.platform], { waitUntil: "domcontentloaded", timeout: 45_000 });
@@ -95,7 +117,9 @@ export class Rig {
 
   async newEnginePage(): Promise<Page> {
     const ctx = await this.ensureContext();
-    return ctx.newPage();
+    const page = await ctx.newPage();
+    armAmbient(page);
+    return page;
   }
 
   private startLoops() {
@@ -104,6 +128,12 @@ export class Rig {
     }
     if (!this.loginTimer) {
       this.loginTimer = setInterval(() => void this.detectLogin(), 5000);
+    }
+    // Idle drift: a parked, perfectly still session is a bot tell. Small
+    // ambient cursor motion + the occasional micro-scroll keep the account
+    // looking lived-in between deck commands.
+    if (!this.idleTimer && stealth.idleDrift) {
+      this.idleTimer = setInterval(() => void this.idleDrift(), 60_000);
     }
   }
 
@@ -115,6 +145,32 @@ export class Rig {
     if (this.loginTimer) {
       clearInterval(this.loginTimer);
       this.loginTimer = null;
+    }
+    if (this.idleTimer) {
+      clearInterval(this.idleTimer);
+      this.idleTimer = null;
+    }
+  }
+
+  private async idleDrift() {
+    const page = this.control;
+    if (!page || page.isClosed() || this.idleBusy || this.detectBusy) return;
+    if (Date.now() - this.lastInputAt < 45_000) return;
+    this.idleBusy = true;
+    try {
+      const hp = asHumanPage(page);
+      // Ambient motion never clicks and never scrolls — pure pointer entropy.
+      await hp.ambientMotion?.(Math.round(jitter(700, 1600)));
+      if (Math.random() < 0.3) {
+        // A tiny, human-scaled scroll — like a thumb resting on the feed.
+        const dy = Math.round(jitter(50, 140)) * (Math.random() < 0.2 ? -1 : 1);
+        await page.mouse.wheel(0, dy);
+        await sleep(jitter(200, 700));
+      }
+    } catch {
+      /* best-effort ambient behavior */
+    } finally {
+      this.idleBusy = false;
     }
   }
 
@@ -195,6 +251,7 @@ export class Rig {
   async exec(cmd: RemoteCmd): Promise<void> {
     const page = this.control;
     if (!page || page.isClosed()) throw new Error("Control page not open");
+    this.lastInputAt = Date.now();
     switch (cmd.t) {
       case "ping":
         return;
@@ -211,11 +268,17 @@ export class Rig {
         await page.goto(START_URLS[this.platform], { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
         return;
       case "navigate":
+        await thinkingPause(300, 900);
         await page.goto(cmd.url, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
         return;
       case "tap": {
         const vp = page.viewportSize() ?? { width: 1280, height: 900 };
-        await page.mouse.click(cmd.x * vp.width, cmd.y * vp.height);
+        const x = cmd.x * vp.width;
+        const y = cmd.y * vp.height;
+        // Humanized: the SDK glides there (min-jerk path, tremor, dwell) and
+        // presses with a human hold; we add the pre-tap "eyes on the target"
+        // pause and a post-tap beat around it.
+        await humanTap(page, x, y);
         // If the tap landed in a text field, tell the deck so it can pop the
         // user's own device keyboard and route keystrokes to that field.
         const onField = await page
@@ -236,12 +299,18 @@ export class Rig {
         return;
       }
       case "scroll":
-        await page.mouse.wheel(0, cmd.dy);
+        // Human scroll: eased native wheel deltas with reading pauses between
+        // bursts (the SDK adds per-step easing + mid-scroll pauses).
+        await humanScroll(page, cmd.dy);
         return;
       case "type":
-        await page.keyboard.type(cmd.text, { delay: 18 });
+        // User-routed keystrokes: human inter-key timing, NO typos (the SDK
+        // humanize wrapper still adds the per-key hold dwell, so these stay
+        // native trusted key events).
+        await humanType(page, cmd.text);
         return;
       case "key":
+        await sleep(jitter(40, 160));
         await page.keyboard.press(cmd.key);
         return;
     }
@@ -301,7 +370,14 @@ export async function scrapeCandidates(
         ? "https://www.instagram.com/reels/"
         : page.url();
   await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
-  await page.waitForTimeout(4000);
+  await sleep(4000);
+
+  // A human watches the feed before harvesting it: a few small scrolls with
+  // reading pauses so the account's feed behavior matches a real viewer.
+  await page.mouse.wheel(0, Math.round(jitter(300, 700)));
+  await readingPause(500, 1600);
+  await page.mouse.wheel(0, Math.round(jitter(400, 900)));
+  await readingPause(700, 2200);
 
   const items = await page.evaluate(() => {
     const out: { url: string; label: string }[] = [];
@@ -353,9 +429,9 @@ async function scrapeYouTubeCandidates(
     await page
       .goto(`https://www.youtube.com/results?search_query=${q}`, { waitUntil: "domcontentloaded", timeout: 45_000 })
       .catch(() => undefined);
-    await page.waitForTimeout(3500);
+    await sleep(3500);
     await page.evaluate(() => window.scrollBy(0, 2200)).catch(() => undefined);
-    await page.waitForTimeout(1800);
+    await readingPause(1200, 2600);
     hrefs = await page.evaluate(() => {
       const out: string[] = [];
       const seen = new Set<string>();
@@ -376,7 +452,7 @@ async function scrapeYouTubeCandidates(
     if (candidates.length >= 8) break;
     try {
       await page.goto(href, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => undefined);
-      await page.waitForTimeout(2400);
+      await sleep(2400);
       const s = await page.evaluate(() => {
         const cnt = (raw: string | null | undefined): number | null => {
           if (!raw) return null;
@@ -420,7 +496,7 @@ export async function scrapeCommentSample(page: Page, url: string): Promise<stri
   try {
     if (url.includes("youtube.com")) return ""; // Shorts comments need interaction; judged on stats.
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => undefined);
-    await page.waitForTimeout(2000);
+    await sleep(2000);
     return await page.evaluate(() => {
       const sels = [
         '[data-e2e="comment-item"] [data-e2e="comment-text"]',
@@ -449,7 +525,7 @@ export interface VideoStats {
 export async function readVideoStats(page: Page, url: string): Promise<VideoStats> {
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => undefined);
-    await page.waitForTimeout(1500);
+    await sleep(1500);
   } catch {
     return { views: null, likes: null, comments: null };
   }
@@ -537,4 +613,3 @@ export async function readVideoStats(page: Page, url: string): Promise<VideoStat
     return { views: null, likes: null, comments: null };
   }
 }
-
