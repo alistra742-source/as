@@ -5,7 +5,7 @@ import { WebSocketServer, type WebSocket } from "ws";
 import { env, driverInfo, PLATFORMS, START_URLS, stealth, type PlatformKey } from "./config.js";
 import type { ClientMsg, ServerMsg } from "./protocol.js";
 import { Store } from "./store.js";
-import { Rig } from "./browser.js";
+import { Rig, browserPreflight } from "./browser.js";
 import { GrowthEngine } from "./engine.js";
 import { ensureDisplay } from "./display.js";
 
@@ -180,6 +180,11 @@ wss.on("connection", (ws, req) => {
 server.listen(env.port, "0.0.0.0", () => {
   console.log(`[viraldeck-worker] listening on 0.0.0.0:${env.port}`);
   console.log(`[viraldeck-worker] platforms: ${PLATFORMS.join(", ")}`);
+  const pre = browserPreflight();
+  (pre.ok ? console.log : console.error)(`[viraldeck-worker] browser: ${pre.detail}`);
+  console.log(
+    `[viraldeck-worker] mode: ${stealth.headless ? "headless" : `headed (DISPLAY=${process.env.DISPLAY || "unset!"})`}, profiles in ${env.dataDir}, frame every ${Math.max(400, env.frameIntervalMs)} ms`
+  );
   console.log(
     `[viraldeck-worker] driver: Clearcote browser (${stealth.platform} persona, light stealth: ${stealth.lightStealth ? "on" : "off"}) ` +
       `driven nodriver-style (raw CDP, trusted humanized input: ${stealth.humanize ? "on" : "off"})`

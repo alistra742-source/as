@@ -110,7 +110,8 @@ COPY --from=shim-builder /nice-shim.so /app/nice-shim.so
 # without a DISPLAY.
 # Linux persona: the Linux binary's coherent default — a windows persona on a
 # linux host needs a Windows-captured fingerprint profile (see env.example).
-ENV NODE_ENV=production \
+ENV STORAGE_DIR=/app/data \
+    NODE_ENV=production \
     STEALTH_HEADLESS=false \
     STEALTH_PLATFORM=linux \
     STEALTH_NICE_SHIM=/app/nice-shim.so \

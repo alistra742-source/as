@@ -167,6 +167,10 @@ function LiveViewport({ platform }: { platform: Platform }) {
   const applyLivePostOk = useDeck((s) => s.applyLivePostOk);
   const [frame, setFrame] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
+  // What the worker is doing while there is no frame yet (launch progress /
+  // the exact failure) — the deck must never sit on a silent placeholder.
+  const [boot, setBoot] = useState<{ text: string; error: boolean } | null>(null);
+  const [waitedSec, setWaitedSec] = useState(0);
   const [kbOpen, setKbOpen] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const drag = useRef<{ x: number; y: number; moved: boolean } | null>(null);
@@ -178,12 +182,16 @@ function LiveViewport({ platform }: { platform: Platform }) {
     // Empty URL = same-origin auto-connect (single-service deploy).
     const url = wsUrl.trim() || defaultWorkerUrl();
     const disconnect = connectLive(platform, url, token, {
-      onFrame: (data) => setFrame(data),
+      onFrame: (data) => {
+        setFrame(data);
+        setBoot(null);
+      },
       onNav: (url) => {
         setSession(platform, { url });
       },
       onLogin: (loggedIn) => setSession(platform, { state: loggedIn ? "logged-in" : "open" }),
       onLog: (level, text) => {
+        if (level === "info" || level === "warn") setBoot((b) => (b?.error ? b : { text, error: false }));
         const known = ["info", "ok", "warn", "ai", "err"];
         addLog(platform, [
           {
@@ -200,10 +208,17 @@ function LiveViewport({ platform }: { platform: Platform }) {
         setSession(platform, { url, state: "open", driver: driver ?? null });
       },
       onInputFocus: () => setKbOpen(true),
-      onError: (message) => setLive(platform, { lastError: message }),
+      onError: (message) => {
+        setLive(platform, { lastError: message });
+        setBoot({ text: message, error: true });
+      },
       onStateChange: (ok) => {
         setConnected(ok);
-        if (!ok) {
+        if (ok) {
+          setBoot({ text: "Connected — starting the remote browser…", error: false });
+        } else {
+          setFrame(null);
+          setBoot({ text: "Connection dropped — reconnecting…", error: true });
           // Auto-retry while the room is open and the worker is configured.
           window.setTimeout(() => setAttempt((a) => a + 1), 6000);
         }
@@ -214,6 +229,16 @@ function LiveViewport({ platform }: { platform: Platform }) {
   }, [platform, wsUrl, token, attempt]);
 
   useEffect(() => setLive(platform, { connected }), [connected, platform, setLive]);
+
+  // Seconds spent without a frame — a wall clock beats a spinner that never ends.
+  useEffect(() => {
+    if (frame || !connected) {
+      setWaitedSec(0);
+      return;
+    }
+    const id = window.setInterval(() => setWaitedSec((s) => s + 1), 1000);
+    return () => window.clearInterval(id);
+  }, [frame, connected]);
 
   const send = useCallback((cmd: RemoteCmd) => sendBusCmd(platform, cmd), [platform]);
 
@@ -293,7 +318,31 @@ function LiveViewport({ platform }: { platform: Platform }) {
               {frame ? (
                 <img src={`data:image/jpeg;base64,${frame}`} alt="Live browser" draggable={false} className="h-full w-full object-contain" />
               ) : (
-                <div className="flex h-full items-center justify-center text-xs text-faint">waiting for first frame…</div>
+                <div className="flex h-full flex-col items-center justify-center gap-2 px-6 text-center">
+                  {boot?.error ? (
+                    <WifiOff className="size-5 text-danger-400" />
+                  ) : (
+                    <Loader2 className="size-5 animate-spin text-amber-400" />
+                  )}
+                  <p className={cn("text-xs", boot?.error ? "text-danger-400" : "text-slate-300")}>
+                    {boot?.text ?? "Starting the remote browser…"}
+                  </p>
+                  <p className="font-mono text-[10px] text-faint">
+                    {waitedSec < 60 ? `${waitedSec}s` : `${Math.floor(waitedSec / 60)}m ${waitedSec % 60}s`} without a frame
+                    {waitedSec >= 90 && !boot?.error && " — a cold headed launch on a small Railway plan can take ~1–2 min; if this passes 3 min, check the deploy log"}
+                  </p>
+                  {(boot?.error || waitedSec >= 180) && (
+                    <button
+                      onClick={() => {
+                        setBoot({ text: "Reconnecting…", error: false });
+                        setAttempt((a) => a + 1);
+                      }}
+                      className="mt-1 rounded-md border border-line bg-ink-800 px-2.5 py-1 text-[11px] font-semibold text-slate-200 hover:bg-ink-700"
+                    >
+                      Retry browser start
+                    </button>
+                  )}
+                </div>
               )}
               <div className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center pb-2">
                 <div className="flex items-center gap-1.5 rounded-full border border-line bg-ink-950/85 px-3 py-1 text-[10px] text-slate-300">

@@ -34,4 +34,14 @@ if [ -n "${STEALTH_NICE_SHIM}" ] && [ -f "${STEALTH_NICE_SHIM}" ]; then
   echo "[viraldeck] setpriority shim active: ${STEALTH_NICE_SHIM}"
 fi
 
+# A redeploy leaves Chromium's Singleton{Lock,Socket,Cookie} symlinks behind
+# on the persistent volume. They name the OLD container's hostname, so the new
+# browser refuses the profile ("in use on another computer") and never starts.
+# Nothing else uses these profiles: always clear them before boot.
+DATA_DIR="${STORAGE_DIR:-/app/data}"
+for lock in "${DATA_DIR}"/profile-*/Singleton*; do
+  [ -e "$lock" ] || [ -L "$lock" ] || continue
+  rm -f "$lock" && echo "[viraldeck] cleared stale profile lock: ${lock}"
+done
+
 exec node worker/dist/index.js

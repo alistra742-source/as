@@ -91,6 +91,13 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 > fingerprint identity**, which can re-trigger login challenges — pick a token, keep it, and
 > don't rotate it.
 
+> **Resources:** a headed Clearcote (Chromium 149 + Xvfb) needs roughly **1 GB RAM and a real
+> CPU share** per room. On Railway's smallest plans the first launch can take 1–2 minutes and
+> an OOM-kill shows up in the dock as *"The browser process was killed right after start"*. If
+> the dock keeps reporting that, raise the service's memory or set `STEALTH_HEADLESS=true`
+> (no Xvfb, ~40 % less memory; slightly weaker stealth). The dock now shows launch progress
+> and the exact failure instead of a silent "waiting for first frame".
+
 > **Container note:** Docker/Railway containers don't grant `CAP_SYS_NICE`, so `setpriority()`
 > returns `EPERM`. Release Chromium silently ignores that; Clearcote's pre-release builds have
 > DCHECKs enabled and would fatal (`base/process/process_linux.cc` `DPCHECK(result == 0)`).

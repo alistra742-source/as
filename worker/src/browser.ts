@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { launchPersistentContext } from "clearcote";
+import { launchPersistentContext, RELEASE } from "clearcote";
 import type { BrowserContext, Page } from "playwright-core";
 import { env, stealth, driverInfo, START_URLS, type PlatformKey } from "./config.js";
 import type { RemoteCmd, ServerMsg } from "./protocol.js";
@@ -24,6 +24,33 @@ export interface RigClient {
   send: (msg: ServerMsg) => void;
 }
 
+/**
+ * Boot-time preflight: say exactly where the browser binary is expected and
+ * whether it is there. A deploy whose image was built without the browser (or
+ * whose CLEARCOTE_CACHE_DIR points elsewhere) used to fail silently at the
+ * first socket — now the deploy log says so on line 5.
+ */
+export function browserPreflight(): { ok: boolean; detail: string } {
+  if (process.env.CLEARCOTE_BINARY) {
+    const ok = fs.existsSync(process.env.CLEARCOTE_BINARY);
+    return { ok, detail: `CLEARCOTE_BINARY=${process.env.CLEARCOTE_BINARY} (${ok ? "present" : "MISSING"})` };
+  }
+  if (!stealth.cacheDir) {
+    return { ok: true, detail: "no CLEARCOTE_CACHE_DIR — the SDK will use its default cache and download on first launch (slow; fine locally)" };
+  }
+  const base = path.join(stealth.cacheDir, RELEASE.tag);
+  const verified = fs.existsSync(path.join(base, ".verified"));
+  const browserDir = path.join(base, "browser");
+  const hasTree = fs.existsSync(browserDir);
+  const ok = verified && hasTree;
+  return {
+    ok,
+    detail: ok
+      ? `Clearcote ${RELEASE.tag} (Chromium ${RELEASE.version}) cached at ${base}`
+      : `browser cache ${base} is ${!hasTree ? "missing" : "unverified"} — the image must run \`node worker/download-browser.mjs\` at build time with the same CLEARCOTE_CACHE_DIR; first launch will try to download (${(RELEASE.size / 1e6).toFixed(0)} MB) and fail if the network is blocked`,
+  };
+}
+
 export class Rig {
   platform: PlatformKey;
   store: Store;
@@ -40,6 +67,19 @@ export class Rig {
   /** See exec(): queued deck commands, drained one at a time. */
   private cmdQueue: { cmd: RemoteCmd; resolve: () => void; reject: (e: unknown) => void }[] = [];
   private draining = false;
+  /** In-flight launch (deduped: N sockets connecting at once = one browser). */
+  private launching: Promise<BrowserContext> | null = null;
+  /** Last fatal browser error, replayed to every socket that connects while
+   * the browser is down — so the deck never sits on "waiting for first frame"
+   * after a reconnect swallowed the original error. */
+  private lastFatal: string | null = null;
+  /** Raw CDP session used for screenshots (no Playwright screenshot pipeline:
+   * that one waits for fonts/animations and can stall for minutes on a busy
+   * page — the deck saw nothing for hours). */
+  private shotSession: import("playwright-core").CDPSession | null = null;
+  private shotBusy = false;
+  private frameFailures = 0;
+  private framesSent = 0;
 
   constructor(platform: PlatformKey, store: Store) {
     this.platform = platform;
@@ -64,10 +104,39 @@ export class Rig {
 
   async ensureContext(): Promise<BrowserContext> {
     if (this.context) return this.context;
+    if (this.launching) return this.launching;
+    this.launching = this.launchContext().finally(() => {
+      this.launching = null;
+    });
+    return this.launching;
+  }
+
+  /**
+   * A profile carries Chromium's Singleton{Lock,Socket,Cookie} symlinks. On a
+   * persistent volume they survive a crash/redeploy, and because they name the
+   * OLD container's hostname, Chromium decides "the profile is in use on
+   * another computer" and exits instead of starting. Always clear them: this
+   * process is the only user of this profile.
+   */
+  private clearStaleLocks(profile: string) {
+    for (const name of ["SingletonLock", "SingletonSocket", "SingletonCookie"]) {
+      try {
+        fs.rmSync(path.join(profile, name), { force: true });
+      } catch {
+        /* best-effort */
+      }
+    }
+  }
+
+  private async launchContext(): Promise<BrowserContext> {
     const profile = this.profileDir();
+    this.clearStaleLocks(profile);
+    this.lastFatal = null;
+    this.status(`Launching the Clearcote browser (${stealth.headless ? "headless" : "headed on Xvfb"}, ${stealth.platform} persona)…`);
     console.log(
       `[${this.platform}] launching Clearcote browser (persona: ${stealth.platform}, humanized input: ${stealth.humanize ? "on" : "off"}, light stealth: ${stealth.lightStealth ? "on" : "off"}, profile: ${profile})`
     );
+    const t0 = Date.now();
     try {
       this.context = await launchPersistentContext(profile, {
         headless: stealth.headless,
@@ -101,28 +170,74 @@ export class Rig {
           : {}),
       });
       this.control = null;
+      this.status(`Browser up in ${Math.round((Date.now() - t0) / 100) / 10}s — opening ${START_URLS[this.platform]}`);
+      // If the browser dies later (OOM kill, crash), drop everything so the
+      // next connect relaunches instead of screenshotting a corpse forever.
+      this.context.on("close", () => {
+        console.error(`[${this.platform}] browser closed unexpectedly — will relaunch on next connect`);
+        this.lastFatal = "The browser process exited (crash or out-of-memory). Reconnecting will relaunch it.";
+        this.broadcast({ type: "error", message: `Browser exited: ${this.lastFatal}` });
+        this.teardown();
+      });
       return this.context;
     } catch (err) {
       const raw = (err as Error).message || String(err);
       console.error(`[${this.platform}] Clearcote browser start failed: ${raw}`);
+      let friendly: string;
       if (!stealth.headless && !process.env.DISPLAY) {
-        throw new Error(
-          `Headed mode needs a display — none is available (set STEALTH_HEADLESS=true or run under Xvfb). Underlying error: ${raw}`
-        );
+        friendly = `Headed mode needs a display — none is available (set STEALTH_HEADLESS=true or run under Xvfb). Underlying error: ${raw}`;
+      } else if (/no build for|not (exist|found)/i.test(raw)) {
+        friendly = `Clearcote browser unavailable: ${raw} — check CLEARCOTE_CACHE_DIR and rebuild the image (the browser is pre-downloaded at build time).`;
+      } else if (/fetch failed|ENOTFOUND|ECONNREFUSED|getaddrinfo/i.test(raw)) {
+        friendly = `The Clearcote browser binary is not in the cache and could not be downloaded (${raw}). The Docker image pre-downloads it at build time into CLEARCOTE_CACHE_DIR — make sure the build ran \`node worker/download-browser.mjs\` and that CLEARCOTE_CACHE_DIR points at that directory at runtime.`;
+      } else if (/Timeout .*exceeded|timed out/i.test(raw)) {
+        friendly = `Clearcote browser did not come up within the launch timeout: ${raw} — the container is probably starved (Railway free/hobby CPU + a 150 MB Chromium). Give the service more resources or set STEALTH_HEADLESS=true.`;
+      } else if (/SIGKILL|Target closed|browser has been closed/i.test(raw)) {
+        friendly = `The browser process was killed right after start: ${raw} — almost always out-of-memory. Raise the service memory (Chromium wants ≥1 GB) or set STEALTH_HEADLESS=true.`;
+      } else {
+        friendly = `Clearcote launch failed: ${raw} — typical causes: missing Chromium runtime libs (compare with the Dockerfile apt list), no display in headed mode, or a damaged browser cache (delete it and relaunch to re-download).`;
       }
-      if (/no build for|not (exist|found)/i.test(raw)) {
-        throw new Error(`Clearcote browser unavailable: ${raw} — check CLEARCOTE_CACHE_DIR and rebuild the image (the browser is pre-downloaded at build time).`);
-      }
-      throw new Error(
-        `Clearcote launch failed: ${raw} — typical causes: missing Chromium runtime libs (compare with the Dockerfile apt list), no display in headed mode, or a damaged browser cache (delete it and relaunch to re-download).`
-      );
+      this.lastFatal = friendly;
+      throw new Error(friendly);
     }
   }
 
+  /** Deck-visible progress line (also in the deploy log). */
+  private status(text: string) {
+    console.log(`[${this.platform}] ${text}`);
+    this.broadcast({ type: "log", level: "info", text, at: Date.now() });
+  }
+
+  /** Forget the dead browser without touching sockets. */
+  private teardown() {
+    this.stopLoops();
+    this.shotSession = null;
+    this.context = null;
+    this.control = null;
+  }
+
+  /**
+   * Called for every socket that authenticates. Idempotent: if the browser is
+   * already up it just makes sure frames are flowing to the new client; if a
+   * launch is in progress it joins it; if the last launch failed it replays
+   * the error to THIS socket and retries the launch (nothing else would).
+   */
   async openControlSession(): Promise<Page> {
+    if (this.control && !this.control.isClosed()) {
+      this.startLoops();
+      void this.pushFrame(); // don't make a reconnecting deck wait a full interval
+      return this.control;
+    }
+    if (this.lastFatal) {
+      this.broadcast({ type: "error", message: `Browser start failed: ${this.lastFatal} — retrying…` });
+    }
     const ctx = await this.ensureContext();
-    if (this.control && !this.control.isClosed()) return this.control;
-    const page = await ctx.newPage();
+    if (this.control && !this.control.isClosed()) return this.control; // raced with a parallel connect
+    // Reuse the page Chromium opens with the profile instead of adding a
+    // second one: a persistent context always starts with one (about:blank)
+    // tab, and a headed extra window on Xvfb only slows the first paint.
+    const existing = ctx.pages()[0];
+    const page = existing && !existing.isClosed() ? existing : await ctx.newPage();
     this.control = page;
     page.on("framenavigated", (frame) => {
       if (frame !== page.mainFrame()) return;
@@ -131,17 +246,25 @@ export class Rig {
       this.broadcast({ type: "nav", url, title: url });
       void this.detectLogin();
     });
+    page.on("close", () => {
+      if (this.control === page) this.control = null;
+      this.shotSession = null;
+    });
     this.broadcast({
       type: "ready",
       sessionId: `rig-${this.platform}`,
       url: START_URLS[this.platform],
       driver: driverInfo(),
     });
+    // Frames FIRST — the deck must see the tab (even blank) while the site
+    // loads; a slow/blocked TikTok load used to look identical to a dead worker.
     this.startLoops();
+    void this.pushFrame();
     try {
       await page.goto(START_URLS[this.platform], { waitUntil: "domcontentloaded", timeout: 45_000 });
-    } catch {
-      /* page may be mid-challenge; frames still stream */
+    } catch (e) {
+      console.warn(`[${this.platform}] first navigation did not settle: ${(e as Error).message}`);
+      /* page may be mid-challenge or slow; frames still stream */
     }
     return page;
   }
@@ -204,14 +327,42 @@ export class Rig {
     }
   }
 
+  /**
+   * One frame to every client. Uses a raw CDP `Page.captureScreenshot`
+   * instead of Playwright's `page.screenshot()`: the latter serialises through
+   * a task queue and waits for fonts, animations and a stable layout — on a
+   * heavy, still-loading TikTok/YouTube page that can block for minutes, and
+   * a timer that keeps stacking blocked screenshots never delivers anything.
+   * The CDP call returns whatever is on screen right now, in ~20-60 ms.
+   */
   private async pushFrame() {
     const page = this.control;
-    if (this.clients.size === 0 || !page || page.isClosed()) return;
+    if (this.clients.size === 0 || !page || page.isClosed() || this.shotBusy) return;
+    this.shotBusy = true;
     try {
-      const shot = await page.screenshot({ type: "jpeg", quality: 52 });
-      this.broadcast({ type: "frame", data: shot.toString("base64"), at: Date.now() });
-    } catch {
-      /* page navigating — skip this frame */
+      if (!this.shotSession) {
+        this.shotSession = await page.context().newCDPSession(page);
+        await this.shotSession.send("Page.enable").catch(() => undefined);
+      }
+      const { data } = await this.shotSession.send("Page.captureScreenshot", {
+        format: "jpeg",
+        quality: 52,
+        fromSurface: true,
+        optimizeForSpeed: true,
+      });
+      this.broadcast({ type: "frame", data, at: Date.now() });
+      this.frameFailures = 0;
+      if (this.framesSent++ === 0) console.log(`[${this.platform}] first frame streamed to the deck`);
+    } catch (e) {
+      // Navigation in flight / target swapped: drop the session and rebuild
+      // it next tick. Keep the noise out of the log unless it persists.
+      this.shotSession = null;
+      this.frameFailures += 1;
+      if (this.frameFailures === 5 || this.frameFailures % 50 === 0) {
+        console.warn(`[${this.platform}] ${this.frameFailures} consecutive frame captures failed: ${(e as Error).message}`);
+      }
+    } finally {
+      this.shotBusy = false;
     }
   }
 
@@ -396,13 +547,14 @@ export class Rig {
   async close() {
     this.stopLoops();
     this.clients.clear();
+    const ctx = this.context;
+    this.teardown();
+    this.lastFatal = null;
     try {
-      await this.context?.close();
+      await ctx?.close();
     } catch {
       /* already closed */
     }
-    this.context = null;
-    this.control = null;
   }
 }
 
