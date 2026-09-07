@@ -107,7 +107,12 @@ export async function humanScroll(page: Page, dy: number): Promise<void> {
 export async function humanTap(page: Page, x: number, y: number): Promise<void> {
   await page.mouse.move(x, y); // humanized glide (the whole "approach" delay)
   await sleep(jitter(30, 90)); // eyes settle on the target
-  await page.mouse.down(); // wrapper re-pins to (x, y), then presses
+  // Re-pin right before the press. With the Clearcote wrapper active this is
+  // a no-op-sized native move (the wrapper does the same internally); without
+  // it, it is what guarantees the press happens at (x, y) and not wherever
+  // Playwright's own cursor bookkeeping last was.
+  await page.mouse.move(x, y);
+  await page.mouse.down(); // press exactly where the cursor is
   await sleep(jitter(60, 140)); // human press-hold dwell
   await page.mouse.up();
   await sleep(jitter(30, 80)); // beat before the page reacts

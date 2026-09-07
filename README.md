@@ -86,6 +86,15 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
    and streams the *real* platform in your dock. Click, drag to scroll, tap **Keyboard** to
    type with your phone's keyboard, log in, then hit **Start**.
 
+> **Input note (why clicks now land):** the Clearcote SDK installs its humanize wrapper via
+> `context.browser()`, which Playwright returns as `null` for persistent contexts — the exact
+> launch path a logged-in profile needs. So the wrapper silently never attached and every
+> click/keystroke was plain Playwright input. The worker now attaches the wrapper itself on
+> every page (`worker/src/humanizeAttach.ts`); the deploy log prints
+> `control tab input: Clearcote humanized (trusted, persona-driven)` on connect, and each tap
+> logs the element it hit (`tap @ (x,y) → button "Log in"; focus: …`) so a "click did nothing"
+> report is diagnosable from the log.
+
 > **Login identity warning:** the Clearcote persona is fixed per platform and derived from
 > your `WORKER_TOKEN` (`STEALTH_FINGERPRINT` overrides it). Changing either **changes the
 > fingerprint identity**, which can re-trigger login challenges — pick a token, keep it, and

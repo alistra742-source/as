@@ -6,6 +6,7 @@ import { env, stealth, driverInfo, START_URLS, type PlatformKey } from "./config
 import type { RemoteCmd, ServerMsg } from "./protocol.js";
 import { Store } from "./store.js";
 import { asHumanPage, humanTap, humanType, jitter, readingPause, sleep, thinkingPause } from "./human.js";
+import { ensureHumanized, humanizeContext, isHumanized } from "./humanizeAttach.js";
 
 /**
  * The rig drives the **Clearcote** browser the **nodriver** way: the binary is
@@ -222,6 +223,10 @@ export class Rig {
           : {}),
       });
       this.control = null;
+      // The SDK skips its own humanize install on persistent contexts
+      // (context.browser() is null there) — see humanizeAttach.ts. Attach it
+      // ourselves so every page really gets humanized, trusted input.
+      humanizeContext(this.context, this.humanizeOpts());
       this.status(`Browser up in ${Math.round((Date.now() - t0) / 100) / 10}s — opening ${START_URLS[this.platform]}`);
       // If the browser dies later (OOM kill, crash), drop everything so the
       // next connect relaunches instead of screenshotting a corpse forever.
@@ -254,6 +259,10 @@ export class Rig {
     }
   }
 
+  private humanizeOpts() {
+    return { humanize: stealth.humanize, showCursor: stealth.showCursor, seed: stealth.seed(this.platform) };
+  }
+
   /** Deck-visible progress line (also in the deploy log). */
   private status(text: string) {
     console.log(`[${this.platform}] ${text}`);
@@ -279,6 +288,7 @@ export class Rig {
       // same page is not a fluke, and hammering it just thrashes memory.
       if (this.crashes >= 3) await sleep(4000);
       const page = await ctx.newPage();
+      await ensureHumanized(page, this.humanizeOpts());
       this.wireControlPage(page);
       this.control = page;
       void this.pushFrame();
@@ -325,6 +335,8 @@ export class Rig {
     const existing = ctx.pages()[0];
     const page = existing && !existing.isClosed() ? existing : await ctx.newPage();
     this.control = page;
+    const humanized = await ensureHumanized(page, this.humanizeOpts());
+    console.log(`[${this.platform}] control tab input: ${humanized ? "Clearcote humanized (trusted, persona-driven)" : "PLAIN PLAYWRIGHT — humanize wrapper not active"}`);
     this.wireControlPage(page);
     this.broadcast({
       type: "ready",
@@ -381,7 +393,9 @@ export class Rig {
 
   async newEnginePage(): Promise<Page> {
     const ctx = await this.ensureContext();
-    return ctx.newPage();
+    const page = await ctx.newPage();
+    await ensureHumanized(page, this.humanizeOpts());
+    return page;
   }
 
   private startLoops() {
@@ -615,27 +629,37 @@ export class Rig {
         const height = vp?.[1] || page.viewportSize()?.height || 900;
         const x = cmd.x * width;
         const y = cmd.y * height;
+        if (!isHumanized(page)) await ensureHumanized(page, this.humanizeOpts());
         // Humanized single-glide press: the SDK moves the cursor there as
         // native trusted events (min-jerk path, tremor), then we press and
         // release with a human hold — see humanTap().
         await humanTap(page, x, y);
-        // If the tap landed in a text field, tell the deck so it can pop the
-        // user's own device keyboard and route keystrokes to that field.
-        const onField = await page
-          .evaluate(() => {
-            const el = document.activeElement as HTMLElement | null;
-            if (!el) return false;
-            const tag = el.tagName;
-            return (
-              tag === "INPUT" ||
-              tag === "TEXTAREA" ||
-              el.isContentEditable ||
-              el.getAttribute("contenteditable") === "true" ||
-              el.getAttribute("role") === "textbox"
-            );
-          })
-          .catch(() => false);
-        if (onField) this.broadcast({ type: "input-focused" });
+        // What did the tap hit? Used for the device-keyboard hint AND logged,
+        // so "I clicked X and nothing happened" is diagnosable from the deploy
+        // log: the element under the point, and whether it took focus.
+        const hit = await page
+          .evaluate(
+            ([px, py]) => {
+              const at = document.elementFromPoint(px, py) as HTMLElement | null;
+              const el = document.activeElement as HTMLElement | null;
+              const isField = (n: HTMLElement | null) =>
+                !!n &&
+                (n.tagName === "INPUT" ||
+                  n.tagName === "TEXTAREA" ||
+                  n.isContentEditable ||
+                  n.getAttribute("contenteditable") === "true" ||
+                  n.getAttribute("role") === "textbox");
+              const desc = (n: HTMLElement | null) =>
+                n
+                  ? `${n.tagName.toLowerCase()}${n.id ? "#" + n.id : ""}${n.getAttribute("role") ? "[role=" + n.getAttribute("role") + "]" : ""} "${(n.innerText || n.getAttribute("aria-label") || n.getAttribute("placeholder") || "").trim().slice(0, 40)}"`
+                  : "nothing";
+              return { under: desc(at), focused: desc(el), onField: isField(el) || isField(at) };
+            },
+            [x, y] as [number, number]
+          )
+          .catch(() => ({ under: "?", focused: "?", onField: false }));
+        console.log(`[${this.platform}] tap @ (${Math.round(x)},${Math.round(y)}) → ${hit.under}; focus: ${hit.focused}${isHumanized(page) ? "" : " [PLAIN input]"}`);
+        if (hit.onField) this.broadcast({ type: "input-focused" });
         return;
       }
       case "scroll":
