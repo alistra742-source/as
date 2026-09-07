@@ -171,6 +171,13 @@ function LiveViewport({ platform }: { platform: Platform }) {
   // the exact failure) — the deck must never sit on a silent placeholder.
   const [boot, setBoot] = useState<{ text: string; error: boolean } | null>(null);
   const [waitedSec, setWaitedSec] = useState(0);
+  const [toast, setToast] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!toast) return;
+    const id = window.setTimeout(() => setToast(null), 4500);
+    return () => window.clearTimeout(id);
+  }, [toast]);
   const [kbOpen, setKbOpen] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const drag = useRef<{ x: number; y: number; moved: boolean } | null>(null);
@@ -210,7 +217,14 @@ function LiveViewport({ platform }: { platform: Platform }) {
       onInputFocus: () => setKbOpen(true),
       onError: (message) => {
         setLive(platform, { lastError: message });
-        setBoot({ text: message, error: true });
+        // Only browser-level failures replace the picture. A single failed
+        // command (e.g. a scroll that hit a crashing tab) is shown as a toast
+        // over the stream, which keeps flowing.
+        if (/^Command failed/.test(message)) {
+          setToast(message.replace(/^Command failed:\s*/, ""));
+        } else {
+          setBoot({ text: message, error: true });
+        }
       },
       onStateChange: (ok) => {
         setConnected(ok);
@@ -342,6 +356,13 @@ function LiveViewport({ platform }: { platform: Platform }) {
                       Retry browser start
                     </button>
                   )}
+                </div>
+              )}
+              {toast && (
+                <div className="pointer-events-none absolute inset-x-0 top-0 flex justify-center pt-2">
+                  <div className="max-w-[90%] truncate rounded-full border border-danger-400/40 bg-ink-950/90 px-3 py-1 text-[11px] text-danger-400">
+                    {toast}
+                  </div>
                 </div>
               )}
               <div className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center pb-2">

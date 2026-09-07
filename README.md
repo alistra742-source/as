@@ -91,12 +91,17 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 > fingerprint identity**, which can re-trigger login challenges — pick a token, keep it, and
 > don't rotate it.
 
-> **Resources:** a headed Clearcote (Chromium 149 + Xvfb) needs roughly **1 GB RAM and a real
-> CPU share** per room. On Railway's smallest plans the first launch can take 1–2 minutes and
-> an OOM-kill shows up in the dock as *"The browser process was killed right after start"*. If
-> the dock keeps reporting that, raise the service's memory or set `STEALTH_HEADLESS=true`
-> (no Xvfb, ~40 % less memory; slightly weaker stealth). The dock now shows launch progress
-> and the exact failure instead of a silent "waiting for first frame".
+> **Resources — read this if TikTok "doesn't load":** a TikTok tab alone is **600–900 MB** in
+> its renderer process; headed Clearcote (Chromium 149 + Xvfb) needs roughly **1.5–2 GB RAM**
+> per service to be comfortable. When the container is smaller, the kernel OOM-kills the
+> renderer: the dock shows *"… Target crashed"* (or *"The browser process was killed right
+> after start"*) and the tab goes dark. The worker now (a) runs the browser on a memory diet
+> (one renderer per site, no GPU process, capped JS heap, Chrome's own OOM intervention),
+> (b) **auto-reopens a crashed tab at the same URL** and logs *"TAB CRASHED … container memory
+> X of Y, N OOM kill(s)"* to the deploy log so you can see it *was* memory, and (c) surfaces
+> launch progress/errors in the dock instead of a silent "waiting for first frame". If crashes
+> keep coming: **Railway → service → Settings → Resources → raise memory to ≥ 2 GB**, or set
+> `STEALTH_HEADLESS=true` (no Xvfb, ~40 % less memory; slightly weaker stealth).
 
 > **Container note:** Docker/Railway containers don't grant `CAP_SYS_NICE`, so `setpriority()`
 > returns `EPERM`. Release Chromium silently ignores that; Clearcote's pre-release builds have

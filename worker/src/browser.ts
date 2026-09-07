@@ -18,10 +18,58 @@ const LAUNCH_ARGS = [
   // Container runtime needs (the sandbox/uid sandbox and /dev/shm are absent in Docker).
   "--no-sandbox",
   "--disable-dev-shm-usage",
+  // ---- Memory diet. A TikTok tab is 600-900 MB in one renderer; on a small
+  // container the kernel OOM-kills that renderer => "Target crashed" and the
+  // dock goes dark. None of these change anything a page can observe.
+  // One renderer per site-instance, not per iframe-origin (TikTok embeds
+  // dozens of third-party frames; each would be its own ~50 MB process).
+  "--disable-features=IsolateOrigins,site-per-process,ProcessPerSiteUpToMainFrameThreshold",
+  "--renderer-process-limit=3",
+  // Cap V8 heap per renderer (MB). Real Chrome sets this itself on low-RAM
+  // devices; it is a hint to the GC, not a visible flag.
+  "--js-flags=--max-old-space-size=384",
+  // No GPU process on Xvfb (llvmpipe is CPU anyway): saves ~80-120 MB and
+  // one more process that can be OOM-killed. Software compositing stays.
+  "--disable-gpu",
+  // Chrome's own OOM intervention: pause/kill bloated ad frames before the
+  // kernel kills the whole tab. Merged with the SDK's own feature list.
+  "--enable-features=OomIntervention,MemoryPurgeOnFreeze",
 ];
 
 export interface RigClient {
   send: (msg: ServerMsg) => void;
+}
+
+/**
+ * "used/limit MB (N OOM kills)" from the container's cgroup, or "" when not in
+ * a cgroup-limited environment. Printed next to every crash so the deploy log
+ * answers "was it memory?" without guessing.
+ */
+export function memoryReport(): string {
+  const read = (f: string) => {
+    try {
+      return fs.readFileSync(f, "utf8").trim();
+    } catch {
+      return "";
+    }
+  };
+  const mb = (v: string) => (v && v !== "max" ? `${Math.round(Number(v) / 1e6)} MB` : "no limit");
+  // cgroup v2
+  const cur = read("/sys/fs/cgroup/memory.current");
+  if (cur) {
+    const max = read("/sys/fs/cgroup/memory.max");
+    const events = read("/sys/fs/cgroup/memory.events");
+    const kills = /oom_kill (\d+)/.exec(events)?.[1] ?? "?";
+    return `container memory ${mb(cur)} of ${mb(max)}, ${kills} OOM kill(s) so far`;
+  }
+  // cgroup v1
+  const cur1 = read("/sys/fs/cgroup/memory/memory.usage_in_bytes");
+  if (cur1) {
+    const max1 = read("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+    const kills = /oom_kill (\d+)/.exec(read("/sys/fs/cgroup/memory/memory.oom_control"))?.[1] ?? "?";
+    return `container memory ${mb(cur1)} of ${mb(max1)}, ${kills} OOM kill(s) so far`;
+  }
+  return "";
 }
 
 /**
@@ -80,6 +128,10 @@ export class Rig {
   private shotBusy = false;
   private frameFailures = 0;
   private framesSent = 0;
+  /** Last main-frame URL of the control tab (so a crashed tab reopens where it was). */
+  private lastUrl = "";
+  private crashes = 0;
+  private recovering = false;
 
   constructor(platform: PlatformKey, store: Store) {
     this.platform = platform;
@@ -208,6 +260,40 @@ export class Rig {
     this.broadcast({ type: "log", level: "info", text, at: Date.now() });
   }
 
+  /**
+   * Replace a crashed control tab with a fresh one at the same URL. Playwright
+   * marks a crashed page permanently dead (every call throws "Target
+   * crashed"), so the old page is closed and a new one takes over. Commands
+   * queued meanwhile wait on `recovering` rather than failing.
+   */
+  private async recoverFromCrash(dead: Page, url: string) {
+    if (this.recovering) return;
+    this.recovering = true;
+    this.shotSession = null;
+    if (this.control === dead) this.control = null;
+    try {
+      await dead.close().catch(() => undefined);
+      const ctx = this.context;
+      if (!ctx) return;
+      // Back off a little if it keeps dying: the 3rd crash in a row on the
+      // same page is not a fluke, and hammering it just thrashes memory.
+      if (this.crashes >= 3) await sleep(4000);
+      const page = await ctx.newPage();
+      this.wireControlPage(page);
+      this.control = page;
+      void this.pushFrame();
+      const target = this.crashes >= 3 && this.platform === "tiktok" ? START_URLS.tiktok : url;
+      await page.goto(target, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
+      this.status(`Tab reopened after crash #${this.crashes} at ${target}`);
+    } catch (e) {
+      console.error(`[${this.platform}] tab recovery failed: ${(e as Error).message}`);
+      this.broadcast({ type: "error", message: `Tab crashed and could not be reopened: ${(e as Error).message}. Reconnect to relaunch the browser.` });
+      this.teardown();
+    } finally {
+      this.recovering = false;
+    }
+  }
+
   /** Forget the dead browser without touching sockets. */
   private teardown() {
     this.stopLoops();
@@ -239,17 +325,7 @@ export class Rig {
     const existing = ctx.pages()[0];
     const page = existing && !existing.isClosed() ? existing : await ctx.newPage();
     this.control = page;
-    page.on("framenavigated", (frame) => {
-      if (frame !== page.mainFrame()) return;
-      const url = frame.url();
-      if (!url || url === "about:blank") return;
-      this.broadcast({ type: "nav", url, title: url });
-      void this.detectLogin();
-    });
-    page.on("close", () => {
-      if (this.control === page) this.control = null;
-      this.shotSession = null;
-    });
+    this.wireControlPage(page);
     this.broadcast({
       type: "ready",
       sessionId: `rig-${this.platform}`,
@@ -267,6 +343,40 @@ export class Rig {
       /* page may be mid-challenge or slow; frames still stream */
     }
     return page;
+  }
+
+  /** Event wiring shared by the first control tab and any crash-replacement tab. */
+  private wireControlPage(page: Page) {
+    page.on("framenavigated", (frame) => {
+      if (frame !== page.mainFrame()) return;
+      const url = frame.url();
+      if (!url || url === "about:blank") return;
+      this.broadcast({ type: "nav", url, title: url });
+      void this.detectLogin();
+    });
+    page.on("close", () => {
+      if (this.control === page) this.control = null;
+      this.shotSession = null;
+    });
+    // The renderer died (OOM kill / SIGSEGV). The browser itself is fine —
+    // open a fresh tab at the same URL instead of failing every command with
+    // "Target crashed" until someone restarts the service.
+    page.on("crash", () => {
+      const url = this.lastUrl || START_URLS[this.platform];
+      const mem = memoryReport();
+      console.error(`[${this.platform}] TAB CRASHED (renderer killed) at ${url}${mem ? ` — ${mem}` : ""}`);
+      this.broadcast({
+        type: "log",
+        level: "warn",
+        text: `⚠️ The ${this.platform} tab crashed (its renderer process was killed — almost always out-of-memory${mem ? `; ${mem}` : ""}). Reopening it…`,
+        at: Date.now(),
+      });
+      this.crashes += 1;
+      void this.recoverFromCrash(page, url);
+    });
+    page.on("framenavigated", (frame) => {
+      if (frame === page.mainFrame()) this.lastUrl = frame.url();
+    });
   }
 
   async newEnginePage(): Promise<Page> {
@@ -470,6 +580,9 @@ export class Rig {
   }
 
   private async execInner(cmd: RemoteCmd): Promise<void> {
+    // A crashed tab is being replaced: hold the command briefly instead of
+    // failing it with "Target crashed".
+    for (let i = 0; i < 40 && (this.recovering || (!this.control && this.context)); i++) await sleep(250);
     const page = this.control;
     if (!page || page.isClosed()) throw new Error("Control page not open");
     this.lastInputAt = Date.now();
