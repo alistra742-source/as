@@ -1,0 +1,244 @@
+/**
+ * Unit test for the page-side tap logic, run against a hand-built fake DOM — no
+ * browser needed, so it runs anywhere:
+ *
+ *   npm test
+ *
+ * The DOM below mirrors what the deck actually has to survive: TikTok's
+ * "verify it's really you" list (plain <div> rows with cursor:pointer and the
+ * handler on the parent of the label span), rows separated by a hairline gap,
+ * and a click-anywhere backdrop that must never be mistaken for a target.
+ */
+import test from "node:test";
+import vm from "node:vm";
+import assert from "node:assert/strict";
+import { CONTAINER_VIEWPORT_RATIO, INTERACTIVE_SEL, MAX_NUDGE_PX, tapAim, tapProbe } from "../worker/src/tapAim.ts";
+
+const VIEWPORT = { w: 1280, h: 900 };
+
+/* ------------------------------- fake DOM -------------------------------- */
+
+function el(tag, rect, { cursor = "auto", attrs = {}, text = "", id = "" } = {}) {
+  const box = { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom, width: rect.right - rect.left, height: rect.bottom - rect.top };
+  const node = {
+    tagName: tag.toUpperCase(),
+    id,
+    innerText: text,
+    textContent: text,
+    isContentEditable: false,
+    parentElement: null,
+    __cursor: cursor,
+    __attrs: attrs,
+    getBoundingClientRect: () => box,
+    getAttribute: (n) => (n in attrs ? attrs[n] : null),
+    getRootNode: () => ({}),
+    matches(sel) {
+      return sel
+        .split(",")
+        .map((s) => s.trim())
+        .some((part) =>
+          part.startsWith("[")
+            ? (() => {
+                const [name, value] = part.slice(1, -1).split("=");
+                const v = attrs[name];
+                return value ? v === value.replace(/"/g, "") : v !== undefined && v !== null;
+              })()
+            : part.toLowerCase() === tag.toLowerCase()
+        );
+    },
+  };
+  return node;
+}
+
+/** A document whose elementFromPoint is driven by a list of boxes (last wins). */
+function domFor(nodes, { activeElement = null, scrollY = 0 } = {}) {
+  const hit = (x, y) => {
+    for (let i = nodes.length - 1; i >= 0; i--) {
+      const r = nodes[i].getBoundingClientRect();
+      if (r.width < 1 || r.height < 1) continue;
+      if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return nodes[i];
+    }
+    return null;
+  };
+  return {
+    document: {
+      elementFromPoint: hit,
+      activeElement,
+      documentElement: { clientWidth: VIEWPORT.w, clientHeight: VIEWPORT.h },
+    },
+    window: {
+      getComputedStyle: (n) => ({ cursor: n?.__cursor ?? "auto" }),
+      innerWidth: VIEWPORT.w,
+      innerHeight: VIEWPORT.h,
+      scrollY,
+    },
+  };
+}
+
+function withDom(nodes, opts) {
+  const dom = domFor(nodes, opts);
+  globalThis.document = dom.document;
+  globalThis.window = dom.window;
+  return () => {
+    delete globalThis.document;
+    delete globalThis.window;
+  };
+}
+
+const aim = (x, y) => tapAim([x, y, INTERACTIVE_SEL, MAX_NUDGE_PX, CONTAINER_VIEWPORT_RATIO]);
+
+/** The modal, as TikTok renders it. */
+function verifyModal() {
+  const backdrop = el("div", { left: 0, top: 0, right: VIEWPORT.w, bottom: VIEWPORT.h }, { attrs: { onclick: "close()" } });
+  const card = el("div", { left: 200, top: 150, right: 700, bottom: 470 });
+  const title = el("h2", { left: 230, top: 180, right: 500, bottom: 215 }, { text: "Verify it's really you" });
+  const email = el("div", { left: 220, top: 260, right: 680, bottom: 322 }, { cursor: "pointer", text: "Email a***2@gmail.com" });
+  const emailIcon = el("span", { left: 236, top: 280, right: 256, bottom: 300 });
+  const password = el("div", { left: 220, top: 330, right: 680, bottom: 392 }, { cursor: "pointer", text: "Password" });
+  const pwLabel = el("span", { left: 270, top: 345, right: 360, bottom: 375 }, { text: "Password" });
+  const hairline = el("div", { left: 220, top: 322, right: 680, bottom: 330 });
+  const next = el("button", { left: 220, top: 410, right: 680, bottom: 452 }, { text: "Next" });
+  email.parentElement = card;
+  emailIcon.parentElement = email;
+  password.parentElement = card;
+  pwLabel.parentElement = password;
+  hairline.parentElement = card;
+  next.parentElement = card;
+  title.parentElement = card;
+  card.parentElement = backdrop;
+  backdrop.parentElement = null;
+  return { backdrop, card, email, password, pwLabel, hairline, next, all: [backdrop, card, title, email, emailIcon, password, pwLabel, hairline, next] };
+}
+
+/* --------------------------------- tests --------------------------------- */
+
+test("a press already on the row is never moved", () => {
+  const m = verifyModal();
+  const off = withDom(m.all);
+  try {
+    assert.equal(aim(400, 360), null, "dead centre of Password: nothing to fix");
+    assert.equal(aim(300, 355), null, "on the row's own <span> label: the press already reaches the handler");
+    assert.equal(aim(230, 430), null, "on a real <button>: untouched");
+  } finally { off(); }
+});
+
+test("a press in the hairline gap between two rows is clamped onto a row", () => {
+  const m = verifyModal();
+  const off = withDom(m.all);
+  try {
+    // 4px into an 8px gap, with a clickable backdrop under the whole page: the
+    // point belongs to neither row, so it must end up on one of their edges —
+    // never on the gap, and never on the backdrop.
+    const a = aim(400, 326);
+    assert.ok(a, "a press in the gap clicks nothing unless it is pulled onto a row");
+    assert.ok(a.y === 320 || a.y === 332, `equidistant point picks one of the two edges, got ${a.y}`);
+    assert.equal(a.x, 400, "the horizontal aim is preserved");
+    // 2px closer to Email: Email wins, because it is the nearer control.
+    const b = aim(400, 324);
+    assert.ok(b && b.y === 320, "the nearer row is the one that gets the press");
+    assert.ok(Math.abs(b.dy) <= MAX_NUDGE_PX, "and never further than the assist radius");
+  } finally { off(); }
+});
+
+test("a press just below the Password row is pulled back onto it", () => {
+  const m = verifyModal();
+  const off = withDom(m.all);
+  try {
+    const a = aim(400, 397); // 5px under the row, above the Next button
+    assert.ok(a);
+    assert.equal(a.y, 390);
+    assert.match(a.label, /Password/);
+  } finally { off(); }
+});
+
+test("a viewport-filling container is never mistaken for the target", () => {
+  const box = el("div", { left: 0, top: 0, right: VIEWPORT.w, bottom: VIEWPORT.h }, { attrs: { onclick: "dismiss()" } });
+  const off = withDom([box]);
+  try {
+    assert.equal(aim(900, 700), null, "tapping the backdrop to dismiss the modal stays a tap on the backdrop");
+    const tiny = el("a", { left: 900 - 20, top: 700 - 40, right: 900 - 4, bottom: 700 - 24 }, { text: "far link" });
+    tiny.parentElement = box;
+    assert.equal(aim(900, 700), null, `further away than ${MAX_NUDGE_PX}px is a deliberate miss, not a near-miss`);
+  } finally { off(); }
+});
+
+test("nothing found at all leaves the press exactly where it was aimed", () => {
+  const feed = el("div", { left: 0, top: 0, right: VIEWPORT.w, bottom: VIEWPORT.h }, { text: "feed" });
+  const off = withDom([feed]);
+  try {
+    assert.equal(aim(600, 400), null);
+    assert.equal(aim(-40, -40), null, "off-window point: no crash, no nudge");
+    assert.equal(tapProbe([600, 400, INTERACTIVE_SEL]).interactive, false, "a press on a plain node is the log line that explains a dead click");
+  } finally { off(); }
+});
+
+test("zero-size controls and display:none rows are not nudged onto", () => {
+  const hidden = el("div", { left: 0, top: 0, right: 400, bottom: 40 }, { cursor: "pointer", text: "hidden row" });
+  const ghost = el("div", { left: 0, top: 0, right: 0, bottom: 0 }, { cursor: "pointer" });
+  const off = withDom([hidden, ghost]);
+  try {
+    assert.equal(aim(200, 60), null, "a control with no box of its own is not something to land on");
+  } finally { off(); }
+});
+
+test("the walk-up crosses a shadow boundary to find the host control", () => {
+  const host = el("div", { left: 100, top: 300, right: 300, bottom: 350 }, { cursor: "pointer", text: "Use a passkey" });
+  const inner = el("span", { left: 100, top: 352, right: 300, bottom: 400 });
+  inner.getRootNode = () => ({ host });
+  const off = withDom([host, inner]);
+  try {
+    const a = aim(150, 356); // on a node inside the shadow tree, 6px under the host row
+    assert.ok(a, "the handler lives on the host, so the host is what has to be pressed");
+    assert.equal(a.y, 348);
+  } finally { off(); }
+});
+
+test("the report says whether the press landed on a control at all", () => {
+  const m = verifyModal();
+  const off = withDom(m.all);
+  try {
+    const onRow = tapProbe([400, 360, INTERACTIVE_SEL]);
+    const onPadding = tapProbe([660, 240, INTERACTIVE_SEL]); // card padding, inside the click-anywhere backdrop
+    assert.equal(onRow.interactive, true);
+    assert.match(onRow.under, /div "Password"/);
+    // `interactive` is deliberately generous: a clickable *ancestor* counts, so
+    // tapping a modal backdrop to dismiss it is not reported as a dead click.
+    assert.equal(onPadding.interactive, true, "an ancestor with a handler still receives the press");
+  } finally { off(); }
+});
+
+test("the report raises the device keyboard only for real fields", () => {
+  const input = el("input", { left: 220, top: 400, right: 680, bottom: 440 }, { attrs: { placeholder: "Password" } });
+  const off = withDom([input], { activeElement: input, scrollY: 120 });
+  try {
+    const r = tapProbe([300, 420, INTERACTIVE_SEL]);
+    assert.equal(r.onField, true);
+    assert.equal(r.focused, 'input "Password"', "the focused field is named by its placeholder, not left blank");
+    assert.equal(r.scrollY, 120, "scroll offset is reported so a mid-press page move shows up in the log");
+  } finally { off(); }
+});
+
+test("the container filter is a viewport ratio, not a guess about a specific site", () => {
+  const maxArea = VIEWPORT.w * VIEWPORT.h * CONTAINER_VIEWPORT_RATIO;
+  const wide = el("div", { left: 0, top: 0, right: VIEWPORT.w, bottom: 300 }, { cursor: "pointer" }); // a real full-width bar
+  assert.ok(wide.getBoundingClientRect().width * wide.getBoundingClientRect().height < maxArea, "a full-width bar must still count as a control");
+  const page = el("div", { left: 0, top: 0, right: VIEWPORT.w, bottom: VIEWPORT.h }, { cursor: "pointer" });
+  assert.ok(page.getBoundingClientRect().width * page.getBoundingClientRect().height > maxArea, "the page itself must not");
+});
+
+test("the serialized source is self-contained: it runs in a bare realm", () => {
+  // Playwright stringifies these functions and evaluates them IN THE PAGE, where
+  // this module does not exist. A reference to any module-scope constant would
+  // therefore be a silent ReferenceError swallowed by the `.catch(() => null)`
+  // — the assist would do nothing forever and the tests above would still pass,
+  // because they import the module. So run the exact string that gets sent.
+  const m = verifyModal();
+  const dom = domFor(m.all);
+  const ctx = { document: dom.document, window: dom.window };
+  const args = JSON.stringify([400, 326, INTERACTIVE_SEL, MAX_NUDGE_PX, CONTAINER_VIEWPORT_RATIO]);
+  const nudged = vm.runInNewContext(`(${tapAim.toString()})(${args})`, ctx);
+  assert.ok(nudged && (nudged.y === 320 || nudged.y === 332), "aim assist works from its serialized form");
+  const report = vm.runInNewContext(`(${tapProbe.toString()})(${JSON.stringify([400, 360, INTERACTIVE_SEL])})`, ctx);
+  assert.equal(report.interactive, true, "the report works from its serialized form");
+  assert.throws(() => vm.runInNewContext(`(${tapAim.toString()})(${args})`, { window: dom.window }), "…and really does need only document + window");
+});

@@ -65,6 +65,9 @@ live dock shows a **🛡 Clearcote · human** badge with the exact driver config
    hit the 3,000-view trigger, and schedule "similar content". The demo compresses time
    (~45 s per simulated hour) so you can watch a full cycle; the real worker uses true hours.
 
+`npm test` covers the live dock's tap geometry (frame→page mapping and the aim assist) with a fake
+DOM — no browser, no network, no server.
+
 Demo mode never touches the network. The banner above the browser says SIMULATED.
 
 ## Deploy (one service, zero config)
@@ -94,6 +97,27 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 > `control tab input: Clearcote humanized (trusted, persona-driven)` on connect, and each tap
 > logs the element it hit (`tap @ (x,y) → button "Log in"; focus: …`) so a "click did nothing"
 > report is diagnosable from the log.
+
+> **Tap-path note (why a tap on a small row used to do nothing):** a tap travels from a pixel in the
+> deck to a coordinate in a remote page, and three separate things were breaking it. (1) **The
+> mapping.** The deck divided the press point by the viewport *box*, but the streamed frame is
+> `object-contain` inside it — when the remote window's ratio isn't 64/45 (headed Chromium under
+> Xvfb: it isn't) the image is letterboxed and every tap is pulled toward the vertical centre: the row
+> you aimed at and the row the browser pressed were different places (measured skew ~16 px on a login
+> row, ~40 px on a modal's back arrow, ~67 px near the footer). `src/lib/tapMapping.ts` now measures
+> against the displayed image, and the box adopts the frame's own ratio so the black bars are gone.
+> (2) **The gesture.** A press was discarded as "a drag" if *any single* `movementY` sample exceeded
+> 2 px — which a thumb on glass does on almost every tap — so the tap was never sent at all (and the
+> page scrolled a few px instead). Scroll now begins at 5 px of travel and only cancels the click
+> past 12 px. (3) **The aim.** A fingertip lands on the gap between two rows, or on the `<span>`
+> whose handler lives on the parent `<div>` (that is how TikTok's "verify it's really you" list is
+> built), and a well-formed trusted click on nothing looks exactly like a broken browser. The worker
+> now clamps a press into the nearest control's box (`worker/src/tapAim.ts`: ≤16 px of travel,
+> clamped never centred, viewport-filling containers ignored so tapping a backdrop to dismiss a modal
+> stays a tap on the backdrop) and logs `tap nudged to "Password" (+0px, 6px)`. Every tap also logs
+> what it hit and whether the page moved under the glide (`tap @ (430,421) → div "Password" … · page
+> moved 240px mid-press`), so a "click did nothing" report is a diagnosable sentence. Both sides of
+> the geometry are unit-tested with no browser: `npm test`.
 
 > **Login identity warning:** the Clearcote persona is fixed per platform and derived from
 > your `WORKER_TOKEN` (`STEALTH_FINGERPRINT` overrides it). Changing either **changes the

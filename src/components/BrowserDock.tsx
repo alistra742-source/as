@@ -17,9 +17,15 @@ import type { Platform } from "../lib/types";
 import { START_URL } from "../lib/types";
 import type { RemoteCmd } from "../lib/protocol";
 import { connectLive, defaultWorkerUrl, sendBusCmd } from "../lib/liveBus";
+import { markerPercent, pointToPageFraction } from "../lib/tapMapping";
 import { useDeck } from "../state/deck";
 import { Chip, StatusDot, cn } from "./ui";
 import { DemoBrowser } from "./DemoBrowser";
+
+/** How far the pointer may travel and still count as a tap (CSS px). */
+const TAP_SLOP_PX = 12;
+/** How far it must travel before the deck starts scrolling (CSS px). */
+const SCROLL_START_PX = 5;
 
 export function BrowserDock({ platform }: { platform: Platform }) {
   const session = useDeck((s) => s.rooms[platform].session);
@@ -180,8 +186,26 @@ function LiveViewport({ platform }: { platform: Platform }) {
   }, [toast]);
   const [kbOpen, setKbOpen] = useState(false);
   const [attempt, setAttempt] = useState(0);
-  const drag = useRef<{ x: number; y: number; moved: boolean } | null>(null);
+  /**
+   * A tap becomes a click only while the pointer stays within TAP_SLOP_PX of
+   * where it went down. Past that it is a drag-scroll. SCROLL_START_PX is the
+   * smaller threshold at which scrolling already begins, so a flick is
+   * immediate without turning every shaky thumb-press into a swallowed tap.
+   */
+  const drag = useRef<{ x0: number; y0: number; ly: number; moved: boolean; pid: number } | null>(null);
   const viewportRef = useRef<HTMLDivElement | null>(null);
+  const imgRef = useRef<HTMLImageElement | null>(null);
+  /** The screenshot's real pixel size — the box adopts its aspect ratio. */
+  const [frameSize, setFrameSize] = useState<{ w: number; h: number } | null>(null);
+  const [tapMark, setTapMark] = useState<{ x: number; y: number; at: number } | null>(null);
+
+  // The "here is where your press landed" marker is a check, not a decoration —
+  // fade it once it has served its purpose.
+  useEffect(() => {
+    if (!tapMark) return;
+    const id = window.setTimeout(() => setTapMark(null), 900);
+    return () => window.clearTimeout(id);
+  }, [tapMark]);
 
   const { wsUrl, token } = room.live;
 
@@ -232,6 +256,7 @@ function LiveViewport({ platform }: { platform: Platform }) {
           setBoot({ text: "Connected — starting the remote browser…", error: false });
         } else {
           setFrame(null);
+          setFrameSize(null);
           setBoot({ text: "Connection dropped — reconnecting…", error: true });
           // Auto-retry while the room is open and the worker is configured.
           window.setTimeout(() => setAttempt((a) => a + 1), 6000);
@@ -256,32 +281,61 @@ function LiveViewport({ platform }: { platform: Platform }) {
 
   const send = useCallback((cmd: RemoteCmd) => sendBusCmd(platform, cmd), [platform]);
 
-  const onPointerDown = () => {
-    drag.current = { x: 0, y: 0, moved: false };
-  };
-  const onPointerMove = (e: RPointerEvent<HTMLDivElement>) => {
-    if (!drag.current) return;
-    const dy = e.movementY;
-    if (Math.abs(dy) > 2 || drag.current.moved) {
-      drag.current.moved = true;
-      send({ t: "scroll", dy });
+  const onPointerDown = (e: RPointerEvent<HTMLDivElement>) => {
+    // Ignore a second finger; the first one owns the gesture.
+    if (drag.current && drag.current.pid !== e.pointerId) return;
+    drag.current = { x0: e.clientX, y0: e.clientY, ly: e.clientY, moved: false, pid: e.pointerId };
+    // Own the pointer: the release must reach us even if the thumb slides off
+    // the box (an onPointerLeave used to drop the gesture, and with it the tap).
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      /* no capture support — the box handlers still get the release */
     }
   };
+
+  const onPointerMove = (e: RPointerEvent<HTMLDivElement>) => {
+    const d = drag.current;
+    if (!d || d.pid !== e.pointerId) return;
+    // Distance travelled from where the finger went DOWN — not one sample of
+    // movementY. A single 3 px sample used to declare "that was a drag" and
+    // silently swallow the tap; a thumb on glass jitters that much on every
+    // press. Scroll starts early (a flick must feel immediate), but the
+    // gesture only *stops being a click* once it is clearly a drag.
+    const travelled = Math.hypot(e.clientX - d.x0, e.clientY - d.y0);
+    const step = e.clientY - d.ly;
+    d.ly = e.clientY;
+    if (travelled >= TAP_SLOP_PX) d.moved = true;
+    if (travelled > SCROLL_START_PX && step) send({ t: "scroll", dy: step });
+  };
+
   const onPointerUp = (e: RPointerEvent<HTMLDivElement>) => {
-    const el = viewportRef.current;
-    const wasDrag = drag.current?.moved;
+    const d = drag.current;
     drag.current = null;
-    if (!el || wasDrag) return;
-    // Measure against the RENDERED IMAGE, not the container: the frame is
-    // object-contain inside the box, so letterboxing would skew every tap
-    // toward the middle and clicks would land off-target.
-    const target = el.querySelector("img") ?? el;
-    const rect = target.getBoundingClientRect();
-    send({
-      t: "tap",
-      x: Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width)),
-      y: Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height)),
-    });
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    } catch {
+      /* already released */
+    }
+    if (!d || d.pid !== e.pointerId) return; // release we did not start / not our finger
+    if (d.moved) return; // a drag was a scroll, never a click
+    const el = viewportRef.current;
+    if (!el) return;
+    // Map the release onto the DISPLAYED FRAME, not onto the box — see
+    // src/lib/tapMapping.ts for why that distinction is the difference between a
+    // click on the Password row and a click on the gap above it.
+    const box = el.getBoundingClientRect();
+    const natural = imgRef.current ? { w: imgRef.current.naturalWidth, h: imgRef.current.naturalHeight } : null;
+    const frac = pointToPageFraction(box, natural, e.clientX, e.clientY);
+    if (!frac) {
+      setToast("That tap landed on the black bar, not on the page");
+      return;
+    }
+    send({ t: "tap", x: frac.x, y: frac.y });
+    // Show exactly where the press will land, so an alignment problem is
+    // visible in the deck instead of deniable.
+    const at = markerPercent(box, e.clientX, e.clientY);
+    setTapMark({ x: at.x, y: at.y, at: Date.now() });
   };
 
   return (
@@ -325,12 +379,27 @@ function LiveViewport({ platform }: { platform: Platform }) {
               onPointerDown={onPointerDown}
               onPointerMove={onPointerMove}
               onPointerUp={onPointerUp}
-              onPointerLeave={() => (drag.current = null)}
+              onPointerCancel={() => (drag.current = null)}
               onWheel={(e) => send({ t: "scroll", dy: e.deltaY })}
-              className="relative aspect-[64/45] w-full cursor-crosshair touch-none select-none overflow-hidden rounded-xl border border-line bg-ink-900"
+              // The box adopts the screenshot's own ratio (64/45 is just the
+              // worker's default 1280x900 window) so the page fills it edge to
+              // edge instead of floating in black bars.
+              style={{ aspectRatio: frameSize ? `${frameSize.w} / ${frameSize.h}` : "64 / 45" }}
+              className="relative max-h-[78vh] w-full cursor-crosshair touch-none select-none overflow-hidden rounded-xl border border-line bg-ink-900"
             >
               {frame ? (
-                <img src={`data:image/jpeg;base64,${frame}`} alt="Live browser" draggable={false} className="h-full w-full object-contain" />
+                <img
+                  ref={imgRef}
+                  src={`data:image/jpeg;base64,${frame}`}
+                  alt="Live browser"
+                  draggable={false}
+                  onLoad={(e) => {
+                    const el = e.currentTarget;
+                    if (!el.naturalWidth || !el.naturalHeight) return;
+                    setFrameSize((s) => (s && s.w === el.naturalWidth && s.h === el.naturalHeight ? s : { w: el.naturalWidth, h: el.naturalHeight }));
+                  }}
+                  className="h-full w-full object-contain"
+                />
               ) : (
                 <div className="flex h-full flex-col items-center justify-center gap-2 px-6 text-center">
                   {boot?.error ? (
@@ -362,6 +431,16 @@ function LiveViewport({ platform }: { platform: Platform }) {
                 <div className="pointer-events-none absolute inset-x-0 top-0 flex justify-center pt-2">
                   <div className="max-w-[90%] truncate rounded-full border border-danger-400/40 bg-ink-950/90 px-3 py-1 text-[11px] text-danger-400">
                     {toast}
+                  </div>
+                </div>
+              )}
+              {tapMark && (
+                <div
+                  className="pointer-events-none absolute z-10 -translate-x-1/2 -translate-y-1/2"
+                  style={{ left: `${tapMark.x}%`, top: `${tapMark.y}%` }}
+                >
+                  <div className="flex size-6 animate-pulse-dot items-center justify-center rounded-full border border-amber-400/80 bg-amber-400/20">
+                    <div className="size-1.5 rounded-full bg-amber-300" />
                   </div>
                 </div>
               )}

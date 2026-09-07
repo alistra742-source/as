@@ -7,6 +7,7 @@ import type { RemoteCmd, ServerMsg } from "./protocol.js";
 import { Store } from "./store.js";
 import { asHumanPage, humanTap, humanType, jitter, readingPause, sleep, thinkingPause } from "./human.js";
 import { ensureHumanized, humanizeContext, isHumanized } from "./humanizeAttach.js";
+import { CONTAINER_VIEWPORT_RATIO, INTERACTIVE_SEL, MAX_NUDGE_PX, tapAim, tapProbe, type AimResult, type TapReport } from "./tapAim.js";
 
 /**
  * The rig drives the **Clearcote** browser the **nodriver** way: the binary is
@@ -40,6 +41,22 @@ const LAUNCH_ARGS = [
 export interface RigClient {
   send: (msg: ServerMsg) => void;
 }
+
+/** Visual-viewport metrics, in CSS px — see Rig.viewportMetrics(). */
+interface PageMetrics {
+  w: number;
+  h: number;
+  ox: number;
+  oy: number;
+  scale: number;
+  /** Vertical scroll offset, read in the same round-trip as the sizes. */
+  sy: number;
+  /** True when the page could not be asked (mid-navigation) and the numbers are
+   * the last known or a default: fine for aiming, useless for change-detection. */
+  stale?: boolean;
+}
+
+const clamp01 = (v: number) => Math.min(1, Math.max(0, v));
 
 /**
  * "used/limit MB (N OOM kills)" from the container's cgroup, or "" when not in
@@ -98,6 +115,18 @@ export function browserPreflight(): { ok: boolean; detail: string } {
       ? `Clearcote ${RELEASE.tag} (Chromium ${RELEASE.version}) cached at ${base}`
       : `browser cache ${base} is ${!hasTree ? "missing" : "unverified"} — the image must run \`node worker/download-browser.mjs\` at build time with the same CLEARCOTE_CACHE_DIR; first launch will try to download (${(RELEASE.size / 1e6).toFixed(0)} MB) and fail if the network is blocked`,
   };
+}
+
+/**
+ * Where the press should actually go (aim correction) and what it hit
+ * afterwards. Both are one CDP round-trip that evaluates `tapAim` / `tapProbe`
+ * in the page — see tapAim.ts for the rules. Neither may fail a tap: a probe
+ * that races a navigation simply means "press where the user aimed".
+ */
+async function resolveTapPoint(page: Page, x: number, y: number): Promise<AimResult> {
+  return page
+    .evaluate(tapAim, [x, y, INTERACTIVE_SEL, MAX_NUDGE_PX, CONTAINER_VIEWPORT_RATIO] as [number, number, string, number, number])
+    .catch(() => null);
 }
 
 export class Rig {
@@ -261,6 +290,58 @@ export class Rig {
 
   private humanizeOpts() {
     return { humanize: stealth.humanize, showCursor: stealth.showCursor, seed: stealth.seed(this.platform) };
+  }
+
+  /**
+   * Live page metrics for input mapping: the VISUAL viewport (what the streamed
+   * screenshot actually shows) and its offset from the layout viewport origin
+   * (page zoom), in CSS px.
+   *
+   * Read fresh on every input — a window resize or a focus-zoom must not leave
+   * the next press at stale coordinates — and on failure (mid-navigation,
+   * target swap) fall back to the last good reading rather than a guessed
+   * 1280x900, which is what made taps drift into the wrong third of the page
+   * whenever a press raced a navigation.
+   */
+  private lastVp: PageMetrics | null = null;
+  private async viewportMetrics(page: Page): Promise<PageMetrics> {
+    for (let tries = 0; tries < 3; tries++) {
+      const m = await page
+        .evaluate(() => {
+          // At page zoom `s` the visual viewport (what the screenshot shows)
+          // covers innerWidth/s of layout CSS px, starting at its offset. At the
+          // default s=1 that is exactly innerWidth/innerHeight — including the
+          // classic scrollbar gutter, which the capture has and
+          // `visualViewport.width` does not.
+          const vv = window.visualViewport;
+          const scale = vv?.scale || 1;
+          return {
+            w: Math.round((window.innerWidth || vv?.width || 1280) / scale),
+            h: Math.round((window.innerHeight || vv?.height || 900) / scale),
+            ox: Math.round(vv?.offsetLeft || 0),
+            oy: Math.round(vv?.offsetTop || 0),
+            scale,
+            sy: Math.round(window.scrollY),
+          } satisfies PageMetrics;
+        })
+        .catch(() => undefined);
+      if (m && m.w > 1 && m.h > 1) {
+        this.lastVp = m;
+        return m;
+      }
+      await sleep(150); // off-protocol: a CDP round-trip per retry would itself be a tell
+    }
+    return (
+      this.lastVp ?? {
+        w: page.viewportSize()?.width ?? 1280,
+        h: page.viewportSize()?.height ?? 900,
+        ox: 0,
+        oy: 0,
+        scale: 1,
+        sy: 0,
+        stale: true,
+      }
+    );
   }
 
   /** Deck-visible progress line (also in the deploy log). */
@@ -435,15 +516,22 @@ export class Rig {
     if (Date.now() - this.lastInputAt < 45_000) return;
     this.idleBusy = true;
     try {
-      const hp = asHumanPage(page);
-      // Ambient motion never clicks and never scrolls — pure pointer entropy.
-      await hp.ambientMotion?.(Math.round(jitter(700, 1600)));
-      if (Math.random() < 0.3) {
-        // A tiny, human-scaled scroll — like a thumb resting on the feed.
-        const dy = Math.round(jitter(50, 140)) * (Math.random() < 0.2 ? -1 : 1);
-        await page.mouse.wheel(0, dy);
-        await sleep(jitter(200, 700));
-      }
+      // Drift shares the cursor with the deck — same lock, same one-at-a-time
+      // guarantee, or the two glides overwrite each other's tracked position.
+      await this.withInput(async () => {
+        // A command queued while we were waiting for the lock outranks us:
+        // the human is back, drop this drift round entirely.
+        if (this.cmdQueue.length > 0) return;
+        const hp = asHumanPage(page);
+        // Ambient motion never clicks and never scrolls — pure pointer entropy.
+        await hp.ambientMotion?.(Math.round(jitter(700, 1600)));
+        if (Math.random() < 0.3) {
+          // A tiny, human-scaled scroll — like a thumb resting on the feed.
+          const dy = Math.round(jitter(50, 140)) * (Math.random() < 0.2 ? -1 : 1);
+          await page.mouse.wheel(0, dy);
+          await sleep(jitter(200, 700));
+        }
+      });
     } catch {
       /* best-effort ambient behavior */
     } finally {
@@ -582,7 +670,7 @@ export class Rig {
       while (this.cmdQueue.length > 0) {
         const item = this.cmdQueue.shift()!;
         try {
-          await this.execInner(item.cmd);
+          await this.withInput(() => this.execInner(item.cmd));
           item.resolve();
         } catch (err) {
           item.reject(err);
@@ -591,6 +679,28 @@ export class Rig {
     } finally {
       this.draining = false;
     }
+  }
+
+  /**
+   * One cursor per page, and everything that moves it shares this FIFO lock.
+   *
+   * Clearcote's humanize wrapper tracks a single position per page and re-pins
+   * `mouse.down()` to *that* before pressing. So two interleaved inputs do not
+   * merely look robotic — they overwrite each other's tracked position, and the
+   * press fires wherever the OTHER glide last was. The one that can hit you
+   * without any second caller is the idle drift: it starts on a timer, glides
+   * for up to ~1.6 s, and its wheel even re-anchors the cursor mid-glide. A
+   * drift that begins 20 ms before your tap = a trusted, humanized, perfectly
+   * formed click on `<body>` instead of the Password row.
+   */
+  private inputTail: Promise<unknown> = Promise.resolve();
+  private withInput<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.inputTail.then(fn, fn);
+    this.inputTail = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
   }
 
   private async execInner(cmd: RemoteCmd): Promise<void> {
@@ -620,45 +730,51 @@ export class Rig {
         await page.goto(cmd.url, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
         return;
       case "tap": {
-        // Real window size in CSS px (the SDK's own convention: with
-        // viewport:null on a headed window, viewportSize() is null for life).
-        const vp = await page
-          .evaluate(() => [window.innerWidth, window.innerHeight])
-          .catch(() => undefined);
-        const width = vp?.[0] || page.viewportSize()?.width || 1280;
-        const height = vp?.[1] || page.viewportSize()?.height || 900;
-        const x = cmd.x * width;
-        const y = cmd.y * height;
+        if (!Number.isFinite(cmd.x) || !Number.isFinite(cmd.y)) throw new Error("A tap needs numeric x/y fractions");
+        // Convert the deck's fraction to CSS px through the page's own live
+        // metrics (which also snapshot the scroll offset, pre-press), because the
+        // two coordinate systems are not the same thing:
+        // the SDK forces `viewport: null` on a headed window (so only the page
+        // knows its real size — a guessed 1280x900 was quietly skewing every
+        // press), and a login form that auto-focuses a field can zoom, which
+        // offsets the *visual* viewport the screenshot shows from the *layout*
+        // viewport Playwright presses into.
+        const m = await this.viewportMetrics(page);
+        let x = Math.round(clamp01(cmd.x) * m.w + m.ox);
+        let y = Math.round(clamp01(cmd.y) * m.h + m.oy);
         if (!isHumanized(page)) await ensureHumanized(page, this.humanizeOpts());
+        // Aim assist: a finger lands on the line between two rows, on the grey
+        // padding inside a card, on the text label whose handler lives on its
+        // parent. TikTok's "verify it's really you" list is exactly that — plain
+        // <div> rows, handler up the tree — so a raw pixel press that misses the
+        // handler's node does nothing at all. Clamp the press onto the nearest
+        // control instead (see tapAim.ts).
+        const aim = await resolveTapPoint(page, x, y);
+        if (aim) {
+          console.log(`[${this.platform}] tap nudged to "${aim.label}" (${aim.dx >= 0 ? "+" : ""}${Math.round(aim.dx)}px, ${aim.dy >= 0 ? "+" : ""}${Math.round(aim.dy)}px)`);
+          x = aim.x;
+          y = aim.y;
+        }
         // Humanized single-glide press: the SDK moves the cursor there as
         // native trusted events (min-jerk path, tremor), then we press and
         // release with a human hold — see humanTap().
         await humanTap(page, x, y);
-        // What did the tap hit? Used for the device-keyboard hint AND logged,
-        // so "I clicked X and nothing happened" is diagnosable from the deploy
-        // log: the element under the point, and whether it took focus.
-        const hit = await page
-          .evaluate(
-            ([px, py]) => {
-              const at = document.elementFromPoint(px, py) as HTMLElement | null;
-              const el = document.activeElement as HTMLElement | null;
-              const isField = (n: HTMLElement | null) =>
-                !!n &&
-                (n.tagName === "INPUT" ||
-                  n.tagName === "TEXTAREA" ||
-                  n.isContentEditable ||
-                  n.getAttribute("contenteditable") === "true" ||
-                  n.getAttribute("role") === "textbox");
-              const desc = (n: HTMLElement | null) =>
-                n
-                  ? `${n.tagName.toLowerCase()}${n.id ? "#" + n.id : ""}${n.getAttribute("role") ? "[role=" + n.getAttribute("role") + "]" : ""} "${(n.innerText || n.getAttribute("aria-label") || n.getAttribute("placeholder") || "").trim().slice(0, 40)}"`
-                  : "nothing";
-              return { under: desc(at), focused: desc(el), onField: isField(el) || isField(at) };
-            },
-            [x, y] as [number, number]
-          )
-          .catch(() => ({ under: "?", focused: "?", onField: false }));
-        console.log(`[${this.platform}] tap @ (${Math.round(x)},${Math.round(y)}) → ${hit.under}; focus: ${hit.focused}${isHumanized(page) ? "" : " [PLAIN input]"}`);
+        // What the press hit and what took focus — the deck's device-keyboard
+        // hint, and the line that makes "I clicked X and nothing happened"
+        // diagnosable from the deploy log instead of a mystery.
+        const hit: TapReport = await page
+          .evaluate(tapProbe, [x, y, INTERACTIVE_SEL] as [number, number, string])
+          .catch(() => ({ under: "?", focused: "?", onField: false, interactive: true, scrollY: 0 }));
+        // The glide is a few hundred ms of native moves; if the document moved in
+        // that window, the press landed somewhere else than the probe just
+        // measured — which is the last way a well-formed click can still do
+        // nothing, so say so in the log instead of leaving it a mystery.
+        const shifted =
+          !m.stale && Math.abs(m.sy - hit.scrollY) > 2 ? ` · page moved ${Math.round(hit.scrollY - m.sy)}px mid-press` : "";
+        const where = `tap @ (${x},${y})${m.scale !== 1 ? ` [zoom ${m.scale.toFixed(2)}×]` : ""}`;
+        const summary = `${where} → ${hit.under}${hit.interactive ? "" : " · NOT on an interactive element"}; focus: ${hit.focused}${shifted}${isHumanized(page) ? "" : " [PLAIN input]"}`;
+        console.log(`[${this.platform}] ${summary}`);
+        if (shifted || !hit.interactive) this.broadcast({ type: "log", level: "warn", text: `⚠️ ${summary}`, at: Date.now() });
         if (hit.onField) this.broadcast({ type: "input-focused" });
         return;
       }
