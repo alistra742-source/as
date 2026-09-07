@@ -4,6 +4,18 @@
  * messages exactly.
  */
 
+/** What drives the browser on the worker side (shown as a badge in the deck). */
+export interface DriverInfo {
+  engine: "clearcote";
+  /** nodriver-style driving: raw CDP, no WebDriver layer, trusted human input. */
+  drive: "nodriver-cdp";
+  humanize: boolean;
+  lightStealth: boolean;
+  platform: string;
+  headless: boolean;
+  timezone: string;
+}
+
 /** Raw commands sent from the dock to the remote browser. */
 export type RemoteCmd =
   | { t: "navigate"; url: string }
@@ -51,7 +63,7 @@ export interface EngineSnapshot {
 }
 
 export type ServerMsg =
-  | { type: "ready"; sessionId: string; url: string }
+  | { type: "ready"; sessionId: string; url: string; driver?: DriverInfo }
   | { type: "frame"; data: string; at: number } // JPEG base64
   | { type: "nav"; url: string; title: string }
   | { type: "login"; loggedIn: boolean }

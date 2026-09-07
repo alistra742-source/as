@@ -2,11 +2,16 @@ import http from "node:http";
 import { promises as fsp } from "node:fs";
 import path from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
-import { env, PLATFORMS, START_URLS, type PlatformKey } from "./config.js";
+import { env, driverInfo, PLATFORMS, START_URLS, stealth, type PlatformKey } from "./config.js";
 import type { ClientMsg, ServerMsg } from "./protocol.js";
 import { Store } from "./store.js";
-import { Rig } from "./browser.js";
+import { Rig, browserPreflight } from "./browser.js";
 import { GrowthEngine } from "./engine.js";
+import { ensureDisplay } from "./display.js";
+
+// Headed-by-default: make sure a display exists before anything touches the
+// browser (starts Xvfb itself if the entrypoint was bypassed).
+ensureDisplay();
 
 /** Built frontend lives in dist/ at the repo root (single-service deploy). */
 const DIST = path.resolve("dist");
@@ -132,11 +137,14 @@ wss.on("connection", (ws, req) => {
         send: (m: ServerMsg) => send(ws, m),
       } as { __ws: WebSocket; send: (m: ServerMsg) => void };
       rig.clients.add(client);
-      send(ws, { type: "ready", sessionId: `rig-${platform}`, url: START_URLS[platform] });
+      send(ws, { type: "ready", sessionId: `rig-${platform}`, url: START_URLS[platform], driver: driverInfo() });
       send(ws, { type: "engine", state: engine.snapshot() });
-      void rig.openControlSession().catch((e) =>
-        send(ws, { type: "error", message: `Browser start failed: ${(e as Error).message}` })
-      );
+      // Browser-start failures are logged to the console AND the client so the
+      // reason is always visible in the deploy log and the deck.
+      void rig.openControlSession().catch((e) => {
+        console.error(`[${platform}] open control session failed: ${(e as Error).message}`);
+        send(ws, { type: "error", message: `Browser start failed: ${(e as Error).message}` });
+      });
       return;
     }
 
@@ -172,6 +180,15 @@ wss.on("connection", (ws, req) => {
 server.listen(env.port, "0.0.0.0", () => {
   console.log(`[viraldeck-worker] listening on 0.0.0.0:${env.port}`);
   console.log(`[viraldeck-worker] platforms: ${PLATFORMS.join(", ")}`);
+  const pre = browserPreflight();
+  (pre.ok ? console.log : console.error)(`[viraldeck-worker] browser: ${pre.detail}`);
+  console.log(
+    `[viraldeck-worker] mode: ${stealth.headless ? "headless" : `headed (DISPLAY=${process.env.DISPLAY || "unset!"})`}, profiles in ${env.dataDir}, frame every ${Math.max(400, env.frameIntervalMs)} ms`
+  );
+  console.log(
+    `[viraldeck-worker] driver: Clearcote browser (${stealth.platform} persona, light stealth: ${stealth.lightStealth ? "on" : "off"}) ` +
+      `driven nodriver-style (raw CDP, trusted humanized input: ${stealth.humanize ? "on" : "off"})`
+  );
   console.log(
     env.groqKey
       ? `[viraldeck-worker] Groq connected (${env.groqModel})`

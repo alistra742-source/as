@@ -60,6 +60,13 @@ function DockToolbar({ platform }: { platform: Platform }) {
         <div className="ml-auto flex items-center gap-1.5">
           {room.session?.mode === "demo" && <Chip tone="amber" className="font-mono">SIMULATED</Chip>}
           {room.session?.mode === "live" && <Chip tone="green">live worker</Chip>}
+          {room.session?.driver && (
+            <span
+              title={`Clearcote anti-fingerprint browser · ${room.session.driver.platform} persona · driven nodriver-style over raw CDP · trusted humanized input ${room.session.driver.humanize ? "on" : "off"} · light stealth ${room.session.driver.lightStealth ? "on" : "off"}`}
+            >
+              <Chip tone="violet">🛡 Clearcote · human</Chip>
+            </span>
+          )}
           {room.session && (
             <button
               onClick={() => closeSession(platform)}
@@ -160,6 +167,17 @@ function LiveViewport({ platform }: { platform: Platform }) {
   const applyLivePostOk = useDeck((s) => s.applyLivePostOk);
   const [frame, setFrame] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
+  // What the worker is doing while there is no frame yet (launch progress /
+  // the exact failure) — the deck must never sit on a silent placeholder.
+  const [boot, setBoot] = useState<{ text: string; error: boolean } | null>(null);
+  const [waitedSec, setWaitedSec] = useState(0);
+  const [toast, setToast] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!toast) return;
+    const id = window.setTimeout(() => setToast(null), 4500);
+    return () => window.clearTimeout(id);
+  }, [toast]);
   const [kbOpen, setKbOpen] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const drag = useRef<{ x: number; y: number; moved: boolean } | null>(null);
@@ -171,12 +189,16 @@ function LiveViewport({ platform }: { platform: Platform }) {
     // Empty URL = same-origin auto-connect (single-service deploy).
     const url = wsUrl.trim() || defaultWorkerUrl();
     const disconnect = connectLive(platform, url, token, {
-      onFrame: (data) => setFrame(data),
+      onFrame: (data) => {
+        setFrame(data);
+        setBoot(null);
+      },
       onNav: (url) => {
         setSession(platform, { url });
       },
       onLogin: (loggedIn) => setSession(platform, { state: loggedIn ? "logged-in" : "open" }),
       onLog: (level, text) => {
+        if (level === "info" || level === "warn") setBoot((b) => (b?.error ? b : { text, error: false }));
         const known = ["info", "ok", "warn", "ai", "err"];
         addLog(platform, [
           {
@@ -189,14 +211,28 @@ function LiveViewport({ platform }: { platform: Platform }) {
       },
       onEngine: (state) => applyLiveEngine(platform, state),
       onPostOk: (_id, _at, url) => applyLivePostOk(platform, url),
-      onReady: (url) => {
-        setSession(platform, { url, state: "open" });
+      onReady: (url, driver) => {
+        setSession(platform, { url, state: "open", driver: driver ?? null });
       },
       onInputFocus: () => setKbOpen(true),
-      onError: (message) => setLive(platform, { lastError: message }),
+      onError: (message) => {
+        setLive(platform, { lastError: message });
+        // Only browser-level failures replace the picture. A single failed
+        // command (e.g. a scroll that hit a crashing tab) is shown as a toast
+        // over the stream, which keeps flowing.
+        if (/^Command failed/.test(message)) {
+          setToast(message.replace(/^Command failed:\s*/, ""));
+        } else {
+          setBoot({ text: message, error: true });
+        }
+      },
       onStateChange: (ok) => {
         setConnected(ok);
-        if (!ok) {
+        if (ok) {
+          setBoot({ text: "Connected — starting the remote browser…", error: false });
+        } else {
+          setFrame(null);
+          setBoot({ text: "Connection dropped — reconnecting…", error: true });
           // Auto-retry while the room is open and the worker is configured.
           window.setTimeout(() => setAttempt((a) => a + 1), 6000);
         }
@@ -207,6 +243,16 @@ function LiveViewport({ platform }: { platform: Platform }) {
   }, [platform, wsUrl, token, attempt]);
 
   useEffect(() => setLive(platform, { connected }), [connected, platform, setLive]);
+
+  // Seconds spent without a frame — a wall clock beats a spinner that never ends.
+  useEffect(() => {
+    if (frame || !connected) {
+      setWaitedSec(0);
+      return;
+    }
+    const id = window.setInterval(() => setWaitedSec((s) => s + 1), 1000);
+    return () => window.clearInterval(id);
+  }, [frame, connected]);
 
   const send = useCallback((cmd: RemoteCmd) => sendBusCmd(platform, cmd), [platform]);
 
@@ -226,7 +272,11 @@ function LiveViewport({ platform }: { platform: Platform }) {
     const wasDrag = drag.current?.moved;
     drag.current = null;
     if (!el || wasDrag) return;
-    const rect = el.getBoundingClientRect();
+    // Measure against the RENDERED IMAGE, not the container: the frame is
+    // object-contain inside the box, so letterboxing would skew every tap
+    // toward the middle and clicks would land off-target.
+    const target = el.querySelector("img") ?? el;
+    const rect = target.getBoundingClientRect();
     send({
       t: "tap",
       x: Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width)),
@@ -277,12 +327,43 @@ function LiveViewport({ platform }: { platform: Platform }) {
               onPointerUp={onPointerUp}
               onPointerLeave={() => (drag.current = null)}
               onWheel={(e) => send({ t: "scroll", dy: e.deltaY })}
-              className="relative aspect-[16/10] w-full cursor-crosshair touch-none select-none overflow-hidden rounded-xl border border-line bg-ink-900"
+              className="relative aspect-[64/45] w-full cursor-crosshair touch-none select-none overflow-hidden rounded-xl border border-line bg-ink-900"
             >
               {frame ? (
                 <img src={`data:image/jpeg;base64,${frame}`} alt="Live browser" draggable={false} className="h-full w-full object-contain" />
               ) : (
-                <div className="flex h-full items-center justify-center text-xs text-faint">waiting for first frame…</div>
+                <div className="flex h-full flex-col items-center justify-center gap-2 px-6 text-center">
+                  {boot?.error ? (
+                    <WifiOff className="size-5 text-danger-400" />
+                  ) : (
+                    <Loader2 className="size-5 animate-spin text-amber-400" />
+                  )}
+                  <p className={cn("text-xs", boot?.error ? "text-danger-400" : "text-slate-300")}>
+                    {boot?.text ?? "Starting the remote browser…"}
+                  </p>
+                  <p className="font-mono text-[10px] text-faint">
+                    {waitedSec < 60 ? `${waitedSec}s` : `${Math.floor(waitedSec / 60)}m ${waitedSec % 60}s`} without a frame
+                    {waitedSec >= 90 && !boot?.error && " — a cold headed launch on a small Railway plan can take ~1–2 min; if this passes 3 min, check the deploy log"}
+                  </p>
+                  {(boot?.error || waitedSec >= 180) && (
+                    <button
+                      onClick={() => {
+                        setBoot({ text: "Reconnecting…", error: false });
+                        setAttempt((a) => a + 1);
+                      }}
+                      className="mt-1 rounded-md border border-line bg-ink-800 px-2.5 py-1 text-[11px] font-semibold text-slate-200 hover:bg-ink-700"
+                    >
+                      Retry browser start
+                    </button>
+                  )}
+                </div>
+              )}
+              {toast && (
+                <div className="pointer-events-none absolute inset-x-0 top-0 flex justify-center pt-2">
+                  <div className="max-w-[90%] truncate rounded-full border border-danger-400/40 bg-ink-950/90 px-3 py-1 text-[11px] text-danger-400">
+                    {toast}
+                  </div>
+                </div>
               )}
               <div className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center pb-2">
                 <div className="flex items-center gap-1.5 rounded-full border border-line bg-ink-950/85 px-3 py-1 text-[10px] text-slate-300">

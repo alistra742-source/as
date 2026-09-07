@@ -11,6 +11,24 @@ the engine keep the account growing on your rules:
   only posts clips that clear its quality bar.
 - Niches it cycles: **faceless stories · scary stories · fun facts**.
 
+## Stealth stack — Clearcote browser, nodriver-style human input
+
+No vanilla Chromium anywhere. The worker drives the open-source
+**[Clearcote](https://github.com/clearcotelabs/clearcote-browser)** browser — a de-Googled
+Chromium with fingerprint control compiled **into the engine itself** (C++), not injected via
+detectable JS patches — the **nodriver** way:
+
+| Layer | What it does |
+| --- | --- |
+| **Clearcote binary** | Engine-level persona: one coherent, seed-stable “machine” per platform (UA + UA-CH + TLS/JA4 + canvas/WebGL/audio/fonts/GPU all agree). `--enable-automation` is stripped, `navigator.webdriver` stays `false`. The verified binary is SHA-256-checked and pre-downloaded at Docker build time. In Docker the browser runs **headed under Xvfb** (headed Chrome avoids headless-mode tells — the official Clearcote container does the same). |
+| **nodriver-style driving** | Raw CDP, no chromedriver / WebDriver layer. Playwright-core attaches over CDP like nodriver does — no driver artifacts, and the engine neutralizes CDP `Runtime.enable` leaks. |
+| **Humanized input (trusted events)** | Every click, keystroke and scroll is dispatched as a **native trusted event** (`isTrusted === true`) by the SDK's humanize layer: minimum-jerk cursor paths with tremor + overshoot, Fitts-scaled speeds, key-hold dwells, eased scrolls with reading pauses, ambient cursor drift, and ~2% fat-finger typos that are auto-corrected (engine-typed captions only — keystrokes *you* route from the deck are typed clean). |
+| **Human scheduling** | The 1-post/hour rule always holds, but every slot gets a random upward jitter (default up to +9 min), the first automatic pass waits a random 0–8 min after arm/boot, and stats reads land a few random minutes after they're due. Nothing happens on a metronome beat. |
+| **Idle drift** | Between deck commands the logged-in session does small ambient cursor motions and the occasional micro-scroll, so the account never looks parked. |
+
+Everything is env-configurable — see `worker/env.example` (`STEALTH_*`, `CLEARCOTE_*`). The
+live dock shows a **🛡 Clearcote · human** badge with the exact driver config.
+
 ## Architecture
 
 ```
@@ -18,9 +36,11 @@ the engine keep the account growing on your rules:
 │  One service (this repo, one Railway deploy)                               │
 │                                                                            │
 │  · Vite/React frontend (Main / TikTok / IG / YT, demo browser, engine UI)  │
-│  · Node + Playwright Chromium backend — serves the app AND the /ws socket  │
-│      on the same domain: live browser stream, click/scroll/type, uploads,  │
-│      Groq captions + reviews, hourly engine + metrics, login profiles      │
+│  · Node backend — serves the app AND the /ws socket on the same domain:    │
+│      live browser stream, click/scroll/type, uploads, Groq captions +      │
+│      reviews, hourly engine + metrics, login profiles                     │
+│  · Clearcote browser driven nodriver-style (raw CDP, humanized trusted     │
+│      input) — no vanilla Chromium in the image                             │
 └──────────────────────────────────────────────────────────────┬─────────────┘
                                                                │ Railway volume
                                                                ▼
@@ -51,22 +71,60 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 
 1. **Push this repo to GitHub**, then on Railway create a service from it (repo root — the
    root `Dockerfile` is picked up automatically). That's it: the same service serves the app
-   and the browser backend on one domain.
+   and the browser backend on one domain. The image is Debian bookworm (the same base as the
+   official Clearcote container) with the full Chromium runtime + font set; during the build
+   the **verified Clearcote browser** is downloaded and SHA-256-checked into
+   `/app/.clearcote-browser`, so deploys never touch GitHub at runtime. The browser runs
+   **headed under Xvfb** by default (`STEALTH_HEADLESS=false` in the image — headed avoids
+   headless-mode tells).
 2. Add a **volume** mounted at `/app/data` (keeps your logins + state across restarts).
 3. Set one environment variable: `GROQ_API_KEY` (get one at console.groq.com — free tier is
    plenty). Optional: `GROQ_MODEL`, `WORKER_TOKEN` (if set, paste the same value in the
-   Worker card), `BROWSERBASE_API_KEY` + `BROWSERBASE_PROJECT_ID` (cloud browsers with
-   residential-grade IPs — use these if TikTok blocks datacenter logins).
+   Worker card), and the stealth knobs in `worker/env.example` (`STEALTH_PLATFORM`,
+   `STEALTH_HEADLESS`, `STEALTH_CADENCE_JITTER_MIN`, …). Sensible defaults are on out of the box.
 4. Open the app, hit **＋ Live browser** in any room — it auto-connects to the same domain
    and streams the *real* platform in your dock. Click, drag to scroll, tap **Keyboard** to
    type with your phone's keyboard, log in, then hit **Start**.
+
+> **Input note (why clicks now land):** the Clearcote SDK installs its humanize wrapper via
+> `context.browser()`, which Playwright returns as `null` for persistent contexts — the exact
+> launch path a logged-in profile needs. So the wrapper silently never attached and every
+> click/keystroke was plain Playwright input. The worker now attaches the wrapper itself on
+> every page (`worker/src/humanizeAttach.ts`); the deploy log prints
+> `control tab input: Clearcote humanized (trusted, persona-driven)` on connect, and each tap
+> logs the element it hit (`tap @ (x,y) → button "Log in"; focus: …`) so a "click did nothing"
+> report is diagnosable from the log.
+
+> **Login identity warning:** the Clearcote persona is fixed per platform and derived from
+> your `WORKER_TOKEN` (`STEALTH_FINGERPRINT` overrides it). Changing either **changes the
+> fingerprint identity**, which can re-trigger login challenges — pick a token, keep it, and
+> don't rotate it.
+
+> **Resources — read this if TikTok "doesn't load":** a TikTok tab alone is **600–900 MB** in
+> its renderer process; headed Clearcote (Chromium 149 + Xvfb) needs roughly **1.5–2 GB RAM**
+> per service to be comfortable. When the container is smaller, the kernel OOM-kills the
+> renderer: the dock shows *"… Target crashed"* (or *"The browser process was killed right
+> after start"*) and the tab goes dark. The worker now (a) runs the browser on a memory diet
+> (one renderer per site, no GPU process, capped JS heap, Chrome's own OOM intervention),
+> (b) **auto-reopens a crashed tab at the same URL** and logs *"TAB CRASHED … container memory
+> X of Y, N OOM kill(s)"* to the deploy log so you can see it *was* memory, and (c) surfaces
+> launch progress/errors in the dock instead of a silent "waiting for first frame". If crashes
+> keep coming: **Railway → service → Settings → Resources → raise memory to ≥ 2 GB**, or set
+> `STEALTH_HEADLESS=true` (no Xvfb, ~40 % less memory; slightly weaker stealth).
+
+> **Container note:** Docker/Railway containers don't grant `CAP_SYS_NICE`, so `setpriority()`
+> returns `EPERM`. Release Chromium silently ignores that; Clearcote's pre-release builds have
+> DCHECKs enabled and would fatal (`base/process/process_linux.cc` `DPCHECK(result == 0)`).
+> The image therefore builds a tiny `setpriority` shim (`worker/nice-shim.c`) and preloads it
+> into the browser (`STEALTH_NICE_SHIM`) — priorities stay at their defaults, exactly as in a
+> release build.
 
 ## Rules the engine enforces
 
 | Rule | Value | Where |
 | --- | --- | --- |
 | Audience | Everyone (YouTube: visibility **Public**) | `worker/src/uploads.ts` + enforced in UI |
-| Cadence | 1 post / 1 hour | `worker/src/engine.ts` (also demo engine) |
+| Cadence | 1 post / 1 hour (slots only ever jittered *longer*) | `worker/src/engine.ts` (also demo engine) |
 | Hit trigger | 3,000+ views in first hour | engine metric pass, editable per room |
 | Discovery floor | 50K+ likes | `scrapeCandidates` filter + Groq judge |
 | Groq roles | captions, candidate review, performance reads | `worker/src/groq.ts` |
@@ -78,10 +136,17 @@ nothing silently breaks.
 
 - Automating logins/posting can violate TikTok/Instagram/YouTube terms and may get accounts
   flagged. This tool keeps **your** login in **your** browser profile — no passwords are stored
-  in code — but platform anti-bot heuristics (datacenter IPs, headless fingerprints) may still
-  challenge sessions. If TikTok/IG/YouTube challenge your session, do the verification manually
-  in the dock; the worker waits for the signed-in state. YouTube uploads run through **Studio**,
-  so the logged-in session must be a Google account with an associated channel.
+  in code. The stealth stack masks automation fingerprints and behaves like a human at the
+  input level, but it cannot change **where your traffic comes from**: a datacenter IP is still
+  the strongest signal platforms have. For real accounts, run the worker on a connection with
+  a residential-grade IP (or put a SOCKS5 proxy in front of it — Clearcote keeps the persona
+  coherent with the proxy region via `geoip`, and `webrtcIp` matches the egress IP). If a
+  platform challenges the session anyway, do the verification manually in the dock; the worker
+  waits for the signed-in state. YouTube uploads run through **Studio**, so the logged-in
+  session must be a Google account with an associated channel.
+- Humanized input is deliberately slower than raw automation (a 200-char caption types over
+  30–60 s, uploads take minutes) — that's the point. Engine-typed captions include the
+  occasional auto-corrected typo; keystrokes you type from the deck do not.
 - Page selectors used by the uploaders (`worker/src/uploads.ts`) are best-effort and change
   over time. Failures are logged to the deck activity feed and never silently swallowed — you
   can always finish an upload by hand in the live browser.

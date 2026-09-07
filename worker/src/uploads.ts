@@ -1,4 +1,5 @@
-import type { BrowserContext, Page } from "playwright";
+import type { BrowserContext, Page } from "playwright-core";
+import { readingPause, sleep, thinkingPause } from "./human.js";
 
 export interface VideoFile {
   name: string;
@@ -19,7 +20,7 @@ export async function downloadVideo(
 ): Promise<VideoFile> {
   log(`Opening source video page…`);
   await page.goto(sourceUrl, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
-  await page.waitForTimeout(3500);
+  await sleep(3500);
   const direct = await page.evaluate(() => {
     const v = document.querySelector("video");
     const src = (v?.currentSrc || v?.src || "") as string;
@@ -52,7 +53,8 @@ export async function downloadVideo(
 export async function uploadTikTok(page: Page, video: VideoFile, caption: string, log: StepLog) {
   log("Opening TikTok upload studio…");
   await page.goto("https://www.tiktok.com/upload", { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
-  await page.waitForTimeout(2500);
+  await sleep(2500);
+  await readingPause(600, 1800);
 
   const fileInput = page.locator('input[type="file"]').first();
   try {
@@ -62,7 +64,7 @@ export async function uploadTikTok(page: Page, video: VideoFile, caption: string
     throw new Error("Upload studio didn't expose a file input (TikTok may be challenging this session).");
   }
   log("Video processing in studio…");
-  await page.waitForTimeout(4000);
+  await sleep(4000);
 
   // Caption editor — try several known containers.
   const captionSel = [
@@ -76,7 +78,8 @@ export async function uploadTikTok(page: Page, video: VideoFile, caption: string
     if ((await el.count()) > 0) {
       try {
         await el.click({ timeout: 4000 });
-        await page.keyboard.type(caption.slice(0, 2200), { delay: 12 });
+        await thinkingPause(400, 1400); // compose before typing
+        await page.keyboard.type(caption.slice(0, 2200)); // humanized (trusted events, typos auto-corrected)
         typed = true;
         break;
       } catch {
@@ -96,6 +99,7 @@ export async function uploadTikTok(page: Page, video: VideoFile, caption: string
   }
 
   log("Publishing to Everyone…");
+  await readingPause(800, 2200); // a human checks the draft before hitting Post
   const postBtn = page.locator('button[data-e2e="post_button"], button:has-text("Post")').last();
   await postBtn.click({ timeout: 15_000 }).catch(() => undefined);
   try {
@@ -112,7 +116,8 @@ export async function uploadTikTok(page: Page, video: VideoFile, caption: string
 export async function uploadInstagram(page: Page, video: VideoFile, caption: string, log: StepLog) {
   log("Opening Instagram create flow…");
   await page.goto("https://www.instagram.com/create/select/", { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
-  await page.waitForTimeout(2500);
+  await sleep(2500);
+  await readingPause(600, 1800);
 
   const fileInput = page.locator('input[type="file"]').first();
   try {
@@ -128,14 +133,15 @@ export async function uploadInstagram(page: Page, video: VideoFile, caption: str
     const next = page.locator('div[role="button"]:has-text("Next"), button:has-text("Next")').last();
     if ((await next.count()) === 0) break;
     await next.click({ timeout: 4000 }).catch(() => undefined);
-    await page.waitForTimeout(1500);
+    await sleep(1500);
   }
 
   const captionBox = page.locator('div[role="textbox"]').first();
   try {
     await captionBox.waitFor({ state: "visible", timeout: 20_000 });
     await captionBox.click();
-    await page.keyboard.type(caption.slice(0, 2200), { delay: 12 });
+    await thinkingPause(400, 1400); // compose before typing
+    await page.keyboard.type(caption.slice(0, 2200)); // humanized (trusted events, typos auto-corrected)
   } catch {
     log("Caption box not found — continuing without caption.");
   }
@@ -144,10 +150,11 @@ export async function uploadInstagram(page: Page, video: VideoFile, caption: str
   const fbToggle = page.locator('div[role="button"]:has-text("Also post to Facebook"), div[role="checkbox"]').first();
   if ((await fbToggle.count()) > 0) {
     await fbToggle.click().catch(() => undefined);
-    await page.waitForTimeout(500);
+    await sleep(500);
   }
 
   log("Publishing reel…");
+  await readingPause(800, 2200); // a human checks the draft before hitting Share
   const share = page.locator('div[role="button"]:has-text("Share"), button:has-text("Share")').last();
   await share.click({ timeout: 15_000 }).catch(() => undefined);
   try {
@@ -182,7 +189,8 @@ export async function uploadToPlatform(
 export async function uploadYouTube(page: Page, video: VideoFile, caption: string, log: StepLog) {
   log("Opening YouTube Studio upload flow…");
   await page.goto("https://www.youtube.com/upload", { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
-  await page.waitForTimeout(2500);
+  await sleep(2500);
+  await readingPause(600, 1800);
 
   const signedOut = await page.evaluate(() => {
     const u = location.href;
@@ -212,7 +220,8 @@ export async function uploadYouTube(page: Page, video: VideoFile, caption: strin
   }
   try {
     await titleBox.click({ timeout: 8000 });
-    await page.keyboard.type(caption.slice(0, 90), { delay: 10 });
+    await thinkingPause(400, 1400); // compose before typing
+    await page.keyboard.type(caption.slice(0, 90)); // humanized (trusted events, typos auto-corrected)
     log(`Title set: “${caption.slice(0, 60)}…”`);
   } catch {
     log("Could not type the title automatically — paste it in the studio draft if needed.");
@@ -224,7 +233,7 @@ export async function uploadYouTube(page: Page, video: VideoFile, caption: strin
     .first();
   if ((await notKids.count()) > 0) {
     await notKids.click({ timeout: 4000 }).catch(() => undefined);
-    await page.waitForTimeout(300);
+    await sleep(300);
   }
 
   // Visibility = Public (the “Everyone” audience). Best-effort: pick the
@@ -234,7 +243,7 @@ export async function uploadYouTube(page: Page, video: VideoFile, caption: strin
     .first();
   if ((await visPublic.count()) > 0) {
     await visPublic.click({ timeout: 5000 }).catch(() => undefined);
-    await page.waitForTimeout(400);
+    await sleep(400);
     log("Visibility set to Public (Everyone).");
   }
 

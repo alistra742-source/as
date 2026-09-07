@@ -1,22 +1,103 @@
 import fs from "node:fs";
 import path from "node:path";
-import { chromium, type BrowserContext, type Page } from "playwright";
-import { env, START_URLS, type PlatformKey } from "./config.js";
+import { launchPersistentContext, RELEASE } from "clearcote";
+import type { BrowserContext, Page } from "playwright-core";
+import { env, stealth, driverInfo, START_URLS, type PlatformKey } from "./config.js";
 import type { RemoteCmd, ServerMsg } from "./protocol.js";
 import { Store } from "./store.js";
+import { asHumanPage, humanTap, humanType, jitter, readingPause, sleep, thinkingPause } from "./human.js";
+import { ensureHumanized, humanizeContext, isHumanized } from "./humanizeAttach.js";
 
+/**
+ * The rig drives the **Clearcote** browser the **nodriver** way: the binary is
+ * launched directly by the Clearcote SDK (no WebDriver / chromedriver layer,
+ * `--enable-automation` stripped, engine-level fingerprint spoofing compiled
+ * into Chromium's C++), and every input goes out as native trusted events with
+ * a human motor persona (`humanize`). No vanilla Chromium is ever launched.
+ */
 const LAUNCH_ARGS = [
+  // Container runtime needs (the sandbox/uid sandbox and /dev/shm are absent in Docker).
   "--no-sandbox",
   "--disable-dev-shm-usage",
-  "--disable-blink-features=AutomationControlled",
-  "--disable-features=IsolateOrigins,site-per-process",
+  // ---- Memory diet. A TikTok tab is 600-900 MB in one renderer; on a small
+  // container the kernel OOM-kills that renderer => "Target crashed" and the
+  // dock goes dark. None of these change anything a page can observe.
+  // One renderer per site-instance, not per iframe-origin (TikTok embeds
+  // dozens of third-party frames; each would be its own ~50 MB process).
+  "--disable-features=IsolateOrigins,site-per-process,ProcessPerSiteUpToMainFrameThreshold",
+  "--renderer-process-limit=3",
+  // Cap V8 heap per renderer (MB). Real Chrome sets this itself on low-RAM
+  // devices; it is a hint to the GC, not a visible flag.
+  "--js-flags=--max-old-space-size=384",
+  // No GPU process on Xvfb (llvmpipe is CPU anyway): saves ~80-120 MB and
+  // one more process that can be OOM-killed. Software compositing stays.
+  "--disable-gpu",
+  // Chrome's own OOM intervention: pause/kill bloated ad frames before the
+  // kernel kills the whole tab. Merged with the SDK's own feature list.
+  "--enable-features=OomIntervention,MemoryPurgeOnFreeze",
 ];
-
-const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 export interface RigClient {
   send: (msg: ServerMsg) => void;
+}
+
+/**
+ * "used/limit MB (N OOM kills)" from the container's cgroup, or "" when not in
+ * a cgroup-limited environment. Printed next to every crash so the deploy log
+ * answers "was it memory?" without guessing.
+ */
+export function memoryReport(): string {
+  const read = (f: string) => {
+    try {
+      return fs.readFileSync(f, "utf8").trim();
+    } catch {
+      return "";
+    }
+  };
+  const mb = (v: string) => (v && v !== "max" ? `${Math.round(Number(v) / 1e6)} MB` : "no limit");
+  // cgroup v2
+  const cur = read("/sys/fs/cgroup/memory.current");
+  if (cur) {
+    const max = read("/sys/fs/cgroup/memory.max");
+    const events = read("/sys/fs/cgroup/memory.events");
+    const kills = /oom_kill (\d+)/.exec(events)?.[1] ?? "?";
+    return `container memory ${mb(cur)} of ${mb(max)}, ${kills} OOM kill(s) so far`;
+  }
+  // cgroup v1
+  const cur1 = read("/sys/fs/cgroup/memory/memory.usage_in_bytes");
+  if (cur1) {
+    const max1 = read("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+    const kills = /oom_kill (\d+)/.exec(read("/sys/fs/cgroup/memory/memory.oom_control"))?.[1] ?? "?";
+    return `container memory ${mb(cur1)} of ${mb(max1)}, ${kills} OOM kill(s) so far`;
+  }
+  return "";
+}
+
+/**
+ * Boot-time preflight: say exactly where the browser binary is expected and
+ * whether it is there. A deploy whose image was built without the browser (or
+ * whose CLEARCOTE_CACHE_DIR points elsewhere) used to fail silently at the
+ * first socket — now the deploy log says so on line 5.
+ */
+export function browserPreflight(): { ok: boolean; detail: string } {
+  if (process.env.CLEARCOTE_BINARY) {
+    const ok = fs.existsSync(process.env.CLEARCOTE_BINARY);
+    return { ok, detail: `CLEARCOTE_BINARY=${process.env.CLEARCOTE_BINARY} (${ok ? "present" : "MISSING"})` };
+  }
+  if (!stealth.cacheDir) {
+    return { ok: true, detail: "no CLEARCOTE_CACHE_DIR — the SDK will use its default cache and download on first launch (slow; fine locally)" };
+  }
+  const base = path.join(stealth.cacheDir, RELEASE.tag);
+  const verified = fs.existsSync(path.join(base, ".verified"));
+  const browserDir = path.join(base, "browser");
+  const hasTree = fs.existsSync(browserDir);
+  const ok = verified && hasTree;
+  return {
+    ok,
+    detail: ok
+      ? `Clearcote ${RELEASE.tag} (Chromium ${RELEASE.version}) cached at ${base}`
+      : `browser cache ${base} is ${!hasTree ? "missing" : "unverified"} — the image must run \`node worker/download-browser.mjs\` at build time with the same CLEARCOTE_CACHE_DIR; first launch will try to download (${(RELEASE.size / 1e6).toFixed(0)} MB) and fail if the network is blocked`,
+  };
 }
 
 export class Rig {
@@ -27,7 +108,31 @@ export class Rig {
   control: Page | null = null;
   private frameTimer: NodeJS.Timeout | null = null;
   private loginTimer: NodeJS.Timeout | null = null;
+  private idleTimer: NodeJS.Timeout | null = null;
   private detectBusy = false;
+  private idleBusy = false;
+  private lastInputAt = 0;
+  private pendingCmds = 0;
+  /** See exec(): queued deck commands, drained one at a time. */
+  private cmdQueue: { cmd: RemoteCmd; resolve: () => void; reject: (e: unknown) => void }[] = [];
+  private draining = false;
+  /** In-flight launch (deduped: N sockets connecting at once = one browser). */
+  private launching: Promise<BrowserContext> | null = null;
+  /** Last fatal browser error, replayed to every socket that connects while
+   * the browser is down — so the deck never sits on "waiting for first frame"
+   * after a reconnect swallowed the original error. */
+  private lastFatal: string | null = null;
+  /** Raw CDP session used for screenshots (no Playwright screenshot pipeline:
+   * that one waits for fonts/animations and can stall for minutes on a busy
+   * page — the deck saw nothing for hours). */
+  private shotSession: import("playwright-core").CDPSession | null = null;
+  private shotBusy = false;
+  private frameFailures = 0;
+  private framesSent = 0;
+  /** Last main-frame URL of the control tab (so a crashed tab reopens where it was). */
+  private lastUrl = "";
+  private crashes = 0;
+  private recovering = false;
 
   constructor(platform: PlatformKey, store: Store) {
     this.platform = platform;
@@ -52,30 +157,208 @@ export class Rig {
 
   async ensureContext(): Promise<BrowserContext> {
     if (this.context) return this.context;
-    if (env.browserbaseApiKey && env.browserbaseProjectId) {
-      const browser = await chromium.connectOverCDP(
-        `wss://connect.browserbase.com/v1/project/${env.browserbaseProjectId}?apiKey=${env.browserbaseApiKey}`
-      );
-      this.context = browser.contexts()[0] ?? (await browser.newContext({ viewport: { width: 1280, height: 900 } }));
-    } else {
-      this.context = await chromium.launchPersistentContext(this.profileDir(), {
-        headless: true,
-        viewport: { width: 1280, height: 900 },
-        userAgent: UA,
-        locale: "en-US",
-        timezoneId: "America/New_York",
-        args: LAUNCH_ARGS,
-      });
-    }
-    this.control = null;
-    return this.context;
+    if (this.launching) return this.launching;
+    this.launching = this.launchContext().finally(() => {
+      this.launching = null;
+    });
+    return this.launching;
   }
 
+  /**
+   * A profile carries Chromium's Singleton{Lock,Socket,Cookie} symlinks. On a
+   * persistent volume they survive a crash/redeploy, and because they name the
+   * OLD container's hostname, Chromium decides "the profile is in use on
+   * another computer" and exits instead of starting. Always clear them: this
+   * process is the only user of this profile.
+   */
+  private clearStaleLocks(profile: string) {
+    for (const name of ["SingletonLock", "SingletonSocket", "SingletonCookie"]) {
+      try {
+        fs.rmSync(path.join(profile, name), { force: true });
+      } catch {
+        /* best-effort */
+      }
+    }
+  }
+
+  private async launchContext(): Promise<BrowserContext> {
+    const profile = this.profileDir();
+    this.clearStaleLocks(profile);
+    this.lastFatal = null;
+    this.status(`Launching the Clearcote browser (${stealth.headless ? "headless" : "headed on Xvfb"}, ${stealth.platform} persona)…`);
+    console.log(
+      `[${this.platform}] launching Clearcote browser (persona: ${stealth.platform}, humanized input: ${stealth.humanize ? "on" : "off"}, light stealth: ${stealth.lightStealth ? "on" : "off"}, profile: ${profile})`
+    );
+    const t0 = Date.now();
+    try {
+      this.context = await launchPersistentContext(profile, {
+        headless: stealth.headless,
+        // Generous first-launch budget: a cold Railway volume + first profile
+        // creation can exceed Playwright's default 30 s wait for the browser.
+        timeout: 120_000,
+        // NOTE: no explicit viewport — on a headed window the SDK forces
+        // viewport: null (an emulated viewport on a real window is a tell);
+        // when headless, the SDK fits window/screen geometry itself.
+        ...(stealth.headless ? { viewport: { width: 1280, height: 900 } } : {}),
+        locale: "en-US",
+        timezoneId: stealth.timezone,
+        args: LAUNCH_ARGS,
+        // Clearcote persona: one coherent, seed-stable machine identity per platform.
+        fingerprint: stealth.seed(this.platform),
+        platform: stealth.platform,
+        lightStealth: stealth.lightStealth,
+        timezone: stealth.timezone,
+        acceptLanguage: stealth.acceptLanguage,
+        // nodriver-style human input: trusted native events, motor persona, typos.
+        humanize: stealth.humanize,
+        showCursor: stealth.showCursor,
+        // Where the verified binary lives (pre-downloaded in Docker builds).
+        cacheDir: stealth.cacheDir,
+        version: stealth.browserVersion,
+        // Containers lack CAP_SYS_NICE: setpriority() returns EPERM, and the
+        // Clearcote DCHECK build fatals on it. The shim (built into the
+        // Docker image) makes it a harmless no-op, like release Chromium.
+        ...(stealth.niceShim && fs.existsSync(stealth.niceShim)
+          ? { env: { LD_PRELOAD: stealth.niceShim } }
+          : {}),
+      });
+      this.control = null;
+      // The SDK skips its own humanize install on persistent contexts
+      // (context.browser() is null there) — see humanizeAttach.ts. Attach it
+      // ourselves so every page really gets humanized, trusted input.
+      humanizeContext(this.context, this.humanizeOpts());
+      this.status(`Browser up in ${Math.round((Date.now() - t0) / 100) / 10}s — opening ${START_URLS[this.platform]}`);
+      // If the browser dies later (OOM kill, crash), drop everything so the
+      // next connect relaunches instead of screenshotting a corpse forever.
+      this.context.on("close", () => {
+        console.error(`[${this.platform}] browser closed unexpectedly — will relaunch on next connect`);
+        this.lastFatal = "The browser process exited (crash or out-of-memory). Reconnecting will relaunch it.";
+        this.broadcast({ type: "error", message: `Browser exited: ${this.lastFatal}` });
+        this.teardown();
+      });
+      return this.context;
+    } catch (err) {
+      const raw = (err as Error).message || String(err);
+      console.error(`[${this.platform}] Clearcote browser start failed: ${raw}`);
+      let friendly: string;
+      if (!stealth.headless && !process.env.DISPLAY) {
+        friendly = `Headed mode needs a display — none is available (set STEALTH_HEADLESS=true or run under Xvfb). Underlying error: ${raw}`;
+      } else if (/no build for|not (exist|found)/i.test(raw)) {
+        friendly = `Clearcote browser unavailable: ${raw} — check CLEARCOTE_CACHE_DIR and rebuild the image (the browser is pre-downloaded at build time).`;
+      } else if (/fetch failed|ENOTFOUND|ECONNREFUSED|getaddrinfo/i.test(raw)) {
+        friendly = `The Clearcote browser binary is not in the cache and could not be downloaded (${raw}). The Docker image pre-downloads it at build time into CLEARCOTE_CACHE_DIR — make sure the build ran \`node worker/download-browser.mjs\` and that CLEARCOTE_CACHE_DIR points at that directory at runtime.`;
+      } else if (/Timeout .*exceeded|timed out/i.test(raw)) {
+        friendly = `Clearcote browser did not come up within the launch timeout: ${raw} — the container is probably starved (Railway free/hobby CPU + a 150 MB Chromium). Give the service more resources or set STEALTH_HEADLESS=true.`;
+      } else if (/SIGKILL|Target closed|browser has been closed/i.test(raw)) {
+        friendly = `The browser process was killed right after start: ${raw} — almost always out-of-memory. Raise the service memory (Chromium wants ≥1 GB) or set STEALTH_HEADLESS=true.`;
+      } else {
+        friendly = `Clearcote launch failed: ${raw} — typical causes: missing Chromium runtime libs (compare with the Dockerfile apt list), no display in headed mode, or a damaged browser cache (delete it and relaunch to re-download).`;
+      }
+      this.lastFatal = friendly;
+      throw new Error(friendly);
+    }
+  }
+
+  private humanizeOpts() {
+    return { humanize: stealth.humanize, showCursor: stealth.showCursor, seed: stealth.seed(this.platform) };
+  }
+
+  /** Deck-visible progress line (also in the deploy log). */
+  private status(text: string) {
+    console.log(`[${this.platform}] ${text}`);
+    this.broadcast({ type: "log", level: "info", text, at: Date.now() });
+  }
+
+  /**
+   * Replace a crashed control tab with a fresh one at the same URL. Playwright
+   * marks a crashed page permanently dead (every call throws "Target
+   * crashed"), so the old page is closed and a new one takes over. Commands
+   * queued meanwhile wait on `recovering` rather than failing.
+   */
+  private async recoverFromCrash(dead: Page, url: string) {
+    if (this.recovering) return;
+    this.recovering = true;
+    this.shotSession = null;
+    if (this.control === dead) this.control = null;
+    try {
+      await dead.close().catch(() => undefined);
+      const ctx = this.context;
+      if (!ctx) return;
+      // Back off a little if it keeps dying: the 3rd crash in a row on the
+      // same page is not a fluke, and hammering it just thrashes memory.
+      if (this.crashes >= 3) await sleep(4000);
+      const page = await ctx.newPage();
+      await ensureHumanized(page, this.humanizeOpts());
+      this.wireControlPage(page);
+      this.control = page;
+      void this.pushFrame();
+      const target = this.crashes >= 3 && this.platform === "tiktok" ? START_URLS.tiktok : url;
+      await page.goto(target, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
+      this.status(`Tab reopened after crash #${this.crashes} at ${target}`);
+    } catch (e) {
+      console.error(`[${this.platform}] tab recovery failed: ${(e as Error).message}`);
+      this.broadcast({ type: "error", message: `Tab crashed and could not be reopened: ${(e as Error).message}. Reconnect to relaunch the browser.` });
+      this.teardown();
+    } finally {
+      this.recovering = false;
+    }
+  }
+
+  /** Forget the dead browser without touching sockets. */
+  private teardown() {
+    this.stopLoops();
+    this.shotSession = null;
+    this.context = null;
+    this.control = null;
+  }
+
+  /**
+   * Called for every socket that authenticates. Idempotent: if the browser is
+   * already up it just makes sure frames are flowing to the new client; if a
+   * launch is in progress it joins it; if the last launch failed it replays
+   * the error to THIS socket and retries the launch (nothing else would).
+   */
   async openControlSession(): Promise<Page> {
+    if (this.control && !this.control.isClosed()) {
+      this.startLoops();
+      void this.pushFrame(); // don't make a reconnecting deck wait a full interval
+      return this.control;
+    }
+    if (this.lastFatal) {
+      this.broadcast({ type: "error", message: `Browser start failed: ${this.lastFatal} — retrying…` });
+    }
     const ctx = await this.ensureContext();
-    if (this.control && !this.control.isClosed()) return this.control;
-    const page = await ctx.newPage();
+    if (this.control && !this.control.isClosed()) return this.control; // raced with a parallel connect
+    // Reuse the page Chromium opens with the profile instead of adding a
+    // second one: a persistent context always starts with one (about:blank)
+    // tab, and a headed extra window on Xvfb only slows the first paint.
+    const existing = ctx.pages()[0];
+    const page = existing && !existing.isClosed() ? existing : await ctx.newPage();
     this.control = page;
+    const humanized = await ensureHumanized(page, this.humanizeOpts());
+    console.log(`[${this.platform}] control tab input: ${humanized ? "Clearcote humanized (trusted, persona-driven)" : "PLAIN PLAYWRIGHT — humanize wrapper not active"}`);
+    this.wireControlPage(page);
+    this.broadcast({
+      type: "ready",
+      sessionId: `rig-${this.platform}`,
+      url: START_URLS[this.platform],
+      driver: driverInfo(),
+    });
+    // Frames FIRST — the deck must see the tab (even blank) while the site
+    // loads; a slow/blocked TikTok load used to look identical to a dead worker.
+    this.startLoops();
+    void this.pushFrame();
+    try {
+      await page.goto(START_URLS[this.platform], { waitUntil: "domcontentloaded", timeout: 45_000 });
+    } catch (e) {
+      console.warn(`[${this.platform}] first navigation did not settle: ${(e as Error).message}`);
+      /* page may be mid-challenge or slow; frames still stream */
+    }
+    return page;
+  }
+
+  /** Event wiring shared by the first control tab and any crash-replacement tab. */
+  private wireControlPage(page: Page) {
     page.on("framenavigated", (frame) => {
       if (frame !== page.mainFrame()) return;
       const url = frame.url();
@@ -83,19 +366,36 @@ export class Rig {
       this.broadcast({ type: "nav", url, title: url });
       void this.detectLogin();
     });
-    this.broadcast({ type: "ready", sessionId: `rig-${this.platform}`, url: START_URLS[this.platform] });
-    this.startLoops();
-    try {
-      await page.goto(START_URLS[this.platform], { waitUntil: "domcontentloaded", timeout: 45_000 });
-    } catch {
-      /* page may be mid-challenge; frames still stream */
-    }
-    return page;
+    page.on("close", () => {
+      if (this.control === page) this.control = null;
+      this.shotSession = null;
+    });
+    // The renderer died (OOM kill / SIGSEGV). The browser itself is fine —
+    // open a fresh tab at the same URL instead of failing every command with
+    // "Target crashed" until someone restarts the service.
+    page.on("crash", () => {
+      const url = this.lastUrl || START_URLS[this.platform];
+      const mem = memoryReport();
+      console.error(`[${this.platform}] TAB CRASHED (renderer killed) at ${url}${mem ? ` — ${mem}` : ""}`);
+      this.broadcast({
+        type: "log",
+        level: "warn",
+        text: `⚠️ The ${this.platform} tab crashed (its renderer process was killed — almost always out-of-memory${mem ? `; ${mem}` : ""}). Reopening it…`,
+        at: Date.now(),
+      });
+      this.crashes += 1;
+      void this.recoverFromCrash(page, url);
+    });
+    page.on("framenavigated", (frame) => {
+      if (frame === page.mainFrame()) this.lastUrl = frame.url();
+    });
   }
 
   async newEnginePage(): Promise<Page> {
     const ctx = await this.ensureContext();
-    return ctx.newPage();
+    const page = await ctx.newPage();
+    await ensureHumanized(page, this.humanizeOpts());
+    return page;
   }
 
   private startLoops() {
@@ -104,6 +404,12 @@ export class Rig {
     }
     if (!this.loginTimer) {
       this.loginTimer = setInterval(() => void this.detectLogin(), 5000);
+    }
+    // Idle drift: a parked, perfectly still session is a bot tell. Small
+    // ambient cursor motion + the occasional micro-scroll keep the account
+    // looking lived-in between deck commands.
+    if (!this.idleTimer && stealth.idleDrift) {
+      this.idleTimer = setInterval(() => void this.idleDrift(), 60_000);
     }
   }
 
@@ -116,16 +422,71 @@ export class Rig {
       clearInterval(this.loginTimer);
       this.loginTimer = null;
     }
+    if (this.idleTimer) {
+      clearInterval(this.idleTimer);
+      this.idleTimer = null;
+    }
   }
 
+  private async idleDrift() {
+    const page = this.control;
+    if (!page || page.isClosed() || this.idleBusy || this.detectBusy) return;
+    if (this.pendingCmds > 0) return; // never drift while commands are in flight
+    if (Date.now() - this.lastInputAt < 45_000) return;
+    this.idleBusy = true;
+    try {
+      const hp = asHumanPage(page);
+      // Ambient motion never clicks and never scrolls — pure pointer entropy.
+      await hp.ambientMotion?.(Math.round(jitter(700, 1600)));
+      if (Math.random() < 0.3) {
+        // A tiny, human-scaled scroll — like a thumb resting on the feed.
+        const dy = Math.round(jitter(50, 140)) * (Math.random() < 0.2 ? -1 : 1);
+        await page.mouse.wheel(0, dy);
+        await sleep(jitter(200, 700));
+      }
+    } catch {
+      /* best-effort ambient behavior */
+    } finally {
+      this.idleBusy = false;
+    }
+  }
+
+  /**
+   * One frame to every client. Uses a raw CDP `Page.captureScreenshot`
+   * instead of Playwright's `page.screenshot()`: the latter serialises through
+   * a task queue and waits for fonts, animations and a stable layout — on a
+   * heavy, still-loading TikTok/YouTube page that can block for minutes, and
+   * a timer that keeps stacking blocked screenshots never delivers anything.
+   * The CDP call returns whatever is on screen right now, in ~20-60 ms.
+   */
   private async pushFrame() {
     const page = this.control;
-    if (this.clients.size === 0 || !page || page.isClosed()) return;
+    if (this.clients.size === 0 || !page || page.isClosed() || this.shotBusy) return;
+    this.shotBusy = true;
     try {
-      const shot = await page.screenshot({ type: "jpeg", quality: 52 });
-      this.broadcast({ type: "frame", data: shot.toString("base64"), at: Date.now() });
-    } catch {
-      /* page navigating — skip this frame */
+      if (!this.shotSession) {
+        this.shotSession = await page.context().newCDPSession(page);
+        await this.shotSession.send("Page.enable").catch(() => undefined);
+      }
+      const { data } = await this.shotSession.send("Page.captureScreenshot", {
+        format: "jpeg",
+        quality: 52,
+        fromSurface: true,
+        optimizeForSpeed: true,
+      });
+      this.broadcast({ type: "frame", data, at: Date.now() });
+      this.frameFailures = 0;
+      if (this.framesSent++ === 0) console.log(`[${this.platform}] first frame streamed to the deck`);
+    } catch (e) {
+      // Navigation in flight / target swapped: drop the session and rebuild
+      // it next tick. Keep the noise out of the log unless it persists.
+      this.shotSession = null;
+      this.frameFailures += 1;
+      if (this.frameFailures === 5 || this.frameFailures % 50 === 0) {
+        console.warn(`[${this.platform}] ${this.frameFailures} consecutive frame captures failed: ${(e as Error).message}`);
+      }
+    } finally {
+      this.shotBusy = false;
     }
   }
 
@@ -192,9 +553,53 @@ export class Rig {
     }
   }
 
-  async exec(cmd: RemoteCmd): Promise<void> {
+  /**
+   * All deck commands (tap/scroll/type/key/navigate) run strictly one at a
+   * time. The humanized cursor is a single shared resource: two concurrent
+   * glides interleave native mouse moves and presses land in the wrong place.
+   * Consecutive scrolls are coalesced (a drag sends dozens of tiny deltas) so
+   * drag-scrolling stays fluid without breaking the one-at-a-time guarantee.
+   */
+  exec(cmd: RemoteCmd): Promise<void> {
+    const last = this.cmdQueue[this.cmdQueue.length - 1];
+    if (cmd.t === "scroll" && last && last.cmd.t === "scroll") {
+      last.cmd.dy += cmd.dy; // merge into the queued scroll
+      return Promise.resolve();
+    }
+    this.pendingCmds += 1;
+    return new Promise<void>((resolve, reject) => {
+      this.cmdQueue.push({ cmd, resolve, reject });
+      void this.drain();
+    }).finally(() => {
+      this.pendingCmds -= 1;
+    });
+  }
+
+  private async drain(): Promise<void> {
+    if (this.draining) return;
+    this.draining = true;
+    try {
+      while (this.cmdQueue.length > 0) {
+        const item = this.cmdQueue.shift()!;
+        try {
+          await this.execInner(item.cmd);
+          item.resolve();
+        } catch (err) {
+          item.reject(err);
+        }
+      }
+    } finally {
+      this.draining = false;
+    }
+  }
+
+  private async execInner(cmd: RemoteCmd): Promise<void> {
+    // A crashed tab is being replaced: hold the command briefly instead of
+    // failing it with "Target crashed".
+    for (let i = 0; i < 40 && (this.recovering || (!this.control && this.context)); i++) await sleep(250);
     const page = this.control;
     if (!page || page.isClosed()) throw new Error("Control page not open");
+    this.lastInputAt = Date.now();
     switch (cmd.t) {
       case "ping":
         return;
@@ -211,37 +616,66 @@ export class Rig {
         await page.goto(START_URLS[this.platform], { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
         return;
       case "navigate":
+        await thinkingPause(300, 900);
         await page.goto(cmd.url, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
         return;
       case "tap": {
-        const vp = page.viewportSize() ?? { width: 1280, height: 900 };
-        await page.mouse.click(cmd.x * vp.width, cmd.y * vp.height);
-        // If the tap landed in a text field, tell the deck so it can pop the
-        // user's own device keyboard and route keystrokes to that field.
-        const onField = await page
-          .evaluate(() => {
-            const el = document.activeElement as HTMLElement | null;
-            if (!el) return false;
-            const tag = el.tagName;
-            return (
-              tag === "INPUT" ||
-              tag === "TEXTAREA" ||
-              el.isContentEditable ||
-              el.getAttribute("contenteditable") === "true" ||
-              el.getAttribute("role") === "textbox"
-            );
-          })
-          .catch(() => false);
-        if (onField) this.broadcast({ type: "input-focused" });
+        // Real window size in CSS px (the SDK's own convention: with
+        // viewport:null on a headed window, viewportSize() is null for life).
+        const vp = await page
+          .evaluate(() => [window.innerWidth, window.innerHeight])
+          .catch(() => undefined);
+        const width = vp?.[0] || page.viewportSize()?.width || 1280;
+        const height = vp?.[1] || page.viewportSize()?.height || 900;
+        const x = cmd.x * width;
+        const y = cmd.y * height;
+        if (!isHumanized(page)) await ensureHumanized(page, this.humanizeOpts());
+        // Humanized single-glide press: the SDK moves the cursor there as
+        // native trusted events (min-jerk path, tremor), then we press and
+        // release with a human hold — see humanTap().
+        await humanTap(page, x, y);
+        // What did the tap hit? Used for the device-keyboard hint AND logged,
+        // so "I clicked X and nothing happened" is diagnosable from the deploy
+        // log: the element under the point, and whether it took focus.
+        const hit = await page
+          .evaluate(
+            ([px, py]) => {
+              const at = document.elementFromPoint(px, py) as HTMLElement | null;
+              const el = document.activeElement as HTMLElement | null;
+              const isField = (n: HTMLElement | null) =>
+                !!n &&
+                (n.tagName === "INPUT" ||
+                  n.tagName === "TEXTAREA" ||
+                  n.isContentEditable ||
+                  n.getAttribute("contenteditable") === "true" ||
+                  n.getAttribute("role") === "textbox");
+              const desc = (n: HTMLElement | null) =>
+                n
+                  ? `${n.tagName.toLowerCase()}${n.id ? "#" + n.id : ""}${n.getAttribute("role") ? "[role=" + n.getAttribute("role") + "]" : ""} "${(n.innerText || n.getAttribute("aria-label") || n.getAttribute("placeholder") || "").trim().slice(0, 40)}"`
+                  : "nothing";
+              return { under: desc(at), focused: desc(el), onField: isField(el) || isField(at) };
+            },
+            [x, y] as [number, number]
+          )
+          .catch(() => ({ under: "?", focused: "?", onField: false }));
+        console.log(`[${this.platform}] tap @ (${Math.round(x)},${Math.round(y)}) → ${hit.under}; focus: ${hit.focused}${isHumanized(page) ? "" : " [PLAIN input]"}`);
+        if (hit.onField) this.broadcast({ type: "input-focused" });
         return;
       }
       case "scroll":
+        // Direct wheel — the SDK's humanize wrapper eases it into native
+        // wheel deltas with mid-scroll pauses itself. No extra chunking so a
+        // drag-scroll feels immediate and never backs up the command queue.
         await page.mouse.wheel(0, cmd.dy);
         return;
       case "type":
-        await page.keyboard.type(cmd.text, { delay: 18 });
+        // User-routed keystrokes: human inter-key timing, NO typos (the SDK
+        // humanize wrapper still adds the per-key hold dwell, so these stay
+        // native trusted key events).
+        await humanType(page, cmd.text);
         return;
       case "key":
+        await sleep(jitter(40, 160));
         await page.keyboard.press(cmd.key);
         return;
     }
@@ -250,13 +684,14 @@ export class Rig {
   async close() {
     this.stopLoops();
     this.clients.clear();
+    const ctx = this.context;
+    this.teardown();
+    this.lastFatal = null;
     try {
-      await this.context?.close();
+      await ctx?.close();
     } catch {
       /* already closed */
     }
-    this.context = null;
-    this.control = null;
   }
 }
 
@@ -301,7 +736,14 @@ export async function scrapeCandidates(
         ? "https://www.instagram.com/reels/"
         : page.url();
   await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
-  await page.waitForTimeout(4000);
+  await sleep(4000);
+
+  // A human watches the feed before harvesting it: a few small scrolls with
+  // reading pauses so the account's feed behavior matches a real viewer.
+  await page.mouse.wheel(0, Math.round(jitter(300, 700)));
+  await readingPause(500, 1600);
+  await page.mouse.wheel(0, Math.round(jitter(400, 900)));
+  await readingPause(700, 2200);
 
   const items = await page.evaluate(() => {
     const out: { url: string; label: string }[] = [];
@@ -353,9 +795,9 @@ async function scrapeYouTubeCandidates(
     await page
       .goto(`https://www.youtube.com/results?search_query=${q}`, { waitUntil: "domcontentloaded", timeout: 45_000 })
       .catch(() => undefined);
-    await page.waitForTimeout(3500);
+    await sleep(3500);
     await page.evaluate(() => window.scrollBy(0, 2200)).catch(() => undefined);
-    await page.waitForTimeout(1800);
+    await readingPause(1200, 2600);
     hrefs = await page.evaluate(() => {
       const out: string[] = [];
       const seen = new Set<string>();
@@ -376,7 +818,7 @@ async function scrapeYouTubeCandidates(
     if (candidates.length >= 8) break;
     try {
       await page.goto(href, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => undefined);
-      await page.waitForTimeout(2400);
+      await sleep(2400);
       const s = await page.evaluate(() => {
         const cnt = (raw: string | null | undefined): number | null => {
           if (!raw) return null;
@@ -420,7 +862,7 @@ export async function scrapeCommentSample(page: Page, url: string): Promise<stri
   try {
     if (url.includes("youtube.com")) return ""; // Shorts comments need interaction; judged on stats.
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => undefined);
-    await page.waitForTimeout(2000);
+    await sleep(2000);
     return await page.evaluate(() => {
       const sels = [
         '[data-e2e="comment-item"] [data-e2e="comment-text"]',
@@ -449,7 +891,7 @@ export interface VideoStats {
 export async function readVideoStats(page: Page, url: string): Promise<VideoStats> {
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => undefined);
-    await page.waitForTimeout(1500);
+    await sleep(1500);
   } catch {
     return { views: null, likes: null, comments: null };
   }
@@ -537,4 +979,3 @@ export async function readVideoStats(page: Page, url: string): Promise<VideoStat
     return { views: null, likes: null, comments: null };
   }
 }
-

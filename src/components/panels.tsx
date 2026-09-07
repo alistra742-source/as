@@ -418,7 +418,7 @@ export function WorkerCard({ room }: { room: Room }) {
       <PanelHeader
         icon={<span className="text-base leading-none">🛰</span>}
         title="Browser worker"
-        sub={live.connected ? "Connected — real browser sessions available" : "Optional — empty = auto-connect to this app's backend"}
+        sub={live.connected ? "Connected — Clearcote stealth browser sessions available" : "Optional — empty = auto-connect to this app's backend"}
         right={
           live.connected ? (
             <Chip tone="green">● online</Chip>
@@ -455,7 +455,9 @@ export function WorkerCard({ room }: { room: Room }) {
         </div>
         <p className="text-[11px] leading-snug text-muted">
           Deployed as one service, the app serves its own browser backend — leave both fields empty and live
-          mode just works. Set a custom URL/token only when pointing at a separate worker.
+          mode just works. Set a custom URL/token only when pointing at a separate worker. The worker drives
+          the open-source <span className="text-slate-300">Clearcote</span> anti-fingerprint browser the
+          nodriver way: raw CDP, no WebDriver layer, every click/keypress sent as trusted humanized input.
         </p>
       </div>
     </Panel>

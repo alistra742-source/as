@@ -2,6 +2,18 @@
  * Mirrors src/lib/protocol.ts in the frontend. Keep the two in sync.
  */
 
+/** What drives the browser on the worker side (shown as a badge in the deck). */
+export interface DriverInfo {
+  engine: "clearcote";
+  /** nodriver-style driving: raw CDP, no WebDriver layer, trusted human input. */
+  drive: "nodriver-cdp";
+  humanize: boolean;
+  lightStealth: boolean;
+  platform: string;
+  headless: boolean;
+  timezone: string;
+}
+
 export type RemoteCmd =
   | { t: "navigate"; url: string }
   | { t: "back" }
@@ -48,7 +60,7 @@ export interface EngineSnapshot {
 }
 
 export type ServerMsg =
-  | { type: "ready"; sessionId: string; url: string }
+  | { type: "ready"; sessionId: string; url: string; driver?: DriverInfo }
   | { type: "frame"; data: string; at: number }
   | { type: "nav"; url: string; title: string }
   | { type: "login"; loggedIn: boolean }

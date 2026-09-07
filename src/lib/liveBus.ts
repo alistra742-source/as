@@ -1,5 +1,5 @@
 import type { Platform } from "./types";
-import type { ClientMsg, RemoteCmd, ServerMsg } from "./protocol";
+import type { ClientMsg, DriverInfo, RemoteCmd, ServerMsg } from "./protocol";
 import { WS_PING_INTERVAL_MS } from "./protocol";
 
 export interface LiveBusHandlers {
@@ -9,7 +9,7 @@ export interface LiveBusHandlers {
   onLog: (level: string, text: string) => void;
   onEngine: (state: import("./protocol").EngineSnapshot) => void;
   onPostOk: (postId: string, postedAt: number, url: string) => void;
-  onReady: (url: string) => void;
+  onReady: (url: string, driver?: DriverInfo) => void;
   onInputFocus: () => void;
   onError: (message: string) => void;
   onStateChange: (connected: boolean) => void;
@@ -55,7 +55,7 @@ export function connectLive(
       const msg = JSON.parse(String(ev.data)) as ServerMsg;
       switch (msg.type) {
         case "ready":
-          handlers.onReady(msg.url);
+          handlers.onReady(msg.url, msg.driver);
           break;
         case "frame":
           handlers.onFrame(msg.data);
