@@ -33,6 +33,7 @@ export interface CookieRecord {
   sameSite: "Strict" | "Lax" | "None";
 }
 
+/** @see `planSessionCookies` — records are what Playwright's `addCookies` takes. */
 export interface CookiePlan {
   ok: boolean;
   /** The name the platform's login actually hangs on (`sessionid`, `SID`). */
@@ -360,9 +361,11 @@ export function planSessionCookies(platform: PlatformKey, raw: string, nowMs = D
       path: "/",
       expires: c.expires && c.expires * 1000 > nowMs ? c.expires : expiresSec,
       httpOnly: c.httpOnly ?? spec.strict.includes(key),
-      // "None" is what these sites ship their session with, and a SameSite=None
-      // cookie the browser will only store over HTTPS — the profile is HTTPS-only.
-      secure: c.secure ?? true,
+      // "None" is what these sites ship their session with, and the profile is
+      // HTTPS-only. An export that says `secure: false` alongside SameSite=None
+      // would be rejected outright by Chromium, so the pair is forced together:
+      // a dropped cookie is a failed login, a slightly-overstated flag is not.
+      secure: sameSite === "None" ? true : (c.secure ?? true),
       sameSite,
     });
   }

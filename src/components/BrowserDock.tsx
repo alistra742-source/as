@@ -175,7 +175,7 @@ function LiveViewport({ platform }: { platform: Platform }) {
   const addLog = useDeck((s) => s.addLog);
   const applyLiveEngine = useDeck((s) => s.applyLiveEngine);
   const applyLivePostOk = useDeck((s) => s.applyLivePostOk);
-  const setComposer = useDeck((s) => s.setComposer);
+  const applyLivePostFailed = useDeck((s) => s.applyLivePostFailed);
   const [frame, setFrame] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
   // What the worker is doing while there is no frame yet (launch progress /
@@ -249,7 +249,7 @@ function LiveViewport({ platform }: { platform: Platform }) {
       onPostOk: (_id, _at, url) => applyLivePostOk(platform, url),
       // A publish that died mid-grab used to be only a log line, three panels
       // away from the button that started it. Put it back on the button.
-      onPostFailed: (message) => setComposer(platform, { busy: false, error: message }),
+      onPostFailed: (message) => applyLivePostFailed(platform, message),
       onReady: (url, driver, proto) => {
         setSession(platform, { url, state: "open", driver: driver ?? null });
         // Tap-for-me and auto-tap are worker-side. A worker that predates them

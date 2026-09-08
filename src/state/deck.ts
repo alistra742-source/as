@@ -140,6 +140,8 @@ interface DeckState {
   setLive: (p: Platform, patch: Partial<Room["live"]>) => void;
   applyLiveEngine: (p: Platform, snap: EngineSnapshot) => void;
   applyLivePostOk: (p: Platform, url: string) => void;
+  /** Undo the optimistic post record and put the reason on the composer. */
+  applyLivePostFailed: (p: Platform, message: string) => void;
   // ---- logs / misc ----
   addLog: (p: Platform, entries: LogEntry[]) => void;
   tick: (now: number) => void;
@@ -314,7 +316,7 @@ export const useDeck = create<DeckState>()(
             get().setComposer(p, { error: "Worker socket not open yet — try again in a second." });
             return;
           }
-          get().setComposer(p, { busy: true, error: null });
+          get().setComposer(p, { busy: true, error: null, lastPostedId: optimistic.id });
           set((s) => ({
             rooms: {
               ...s.rooms,
@@ -577,6 +579,21 @@ export const useDeck = create<DeckState>()(
             },
           };
         });
+      },
+
+      applyLivePostFailed: (p, message) => {
+        const c = get().rooms[p].composer;
+        if (c.lastPostedId) {
+          // The placeholder `postNow` inserted has to go back out: a history entry
+          // for a video that was never published is worse than no feedback at all,
+          // and it would be measured for metrics forever.
+          const id = c.lastPostedId;
+          set((s) => {
+            const room = s.rooms[p];
+            return { rooms: { ...s.rooms, [p]: { ...room, posts: room.posts.filter((x) => x.id !== id) } } };
+          });
+        }
+        get().setComposer(p, { busy: false, error: message, lastPostedId: null });
       },
 
       applyLivePostOk: (p, url) => {
