@@ -50,6 +50,12 @@ export class GrowthEngine {
     this.rig.broadcast({ type: "log", level, text, at });
   }
 
+  /** A one-line answer where the user clicked. Only for things they asked for by
+   * hand — the hourly engine cycle runs unattended and must not toast. */
+  private toast(text: string, tone: "info" | "ok" | "warn" | "err") {
+    this.rig.broadcast({ type: "toast", text, tone });
+  }
+
   snapshot(): EngineSnapshot {
     const e = this.store.engine(this.platform);
     const posts = this.store.posts(this.platform);
@@ -358,6 +364,7 @@ export class GrowthEngine {
       this.hitNiche = null;
       this.store.save();
       this.rig.broadcast({ type: "post-ok", postId: post.id, postedAt: post.postedAt, url: post.url });
+      this.toast("Posted — check the live browser for the live link.", "ok");
       this.log(result.ok ? "ok" : "warn", result.ok ? `📤 Auto-posted (${this.audienceLabel()}). Verdict stored — first read in ~1h.` : `Auto-post result: ${result.message}`);
       this.pushEngine();
     } finally {
@@ -371,11 +378,18 @@ export class GrowthEngine {
     const e = this.store.engine(this.platform);
     if (this.manualBusy) {
       this.log("warn", "A publish is already in progress — one at a time.");
+      this.toast("A publish is already running — one at a time.", "warn");
       return false;
     }
     if (!this.store.rig(this.platform).loggedIn) {
       this.log("warn", "Manual post blocked — sign in to the platform in the live browser first.");
+      this.toast("Not signed in on this profile — sign in (or paste a session cookie) first.", "warn");
       this.pushEngine();
+      return false;
+    }
+    if (!/^https?:\/\//i.test((url || "").trim())) {
+      this.log("warn", `Manual post needs a real link — got “${String(url).slice(0, 40)}”.`);
+      this.toast("The source link has to be a full http(s) URL.", "warn");
       return false;
     }
     this.manualBusy = true;
@@ -385,8 +399,18 @@ export class GrowthEngine {
     this.store.save();
     this.pushEngine();
     const page = await this.rig.newEnginePage();
+    // The publish runs in a second tab of the same profile — the dock keeps
+    // showing the user's own tab — so the composer has to narrate it. Each stage
+    // lands in `message`, which the deck renders under the Post button.
+    const stage = (text: string) => {
+      e.message = text;
+      this.store.save();
+      this.pushEngine();
+    };
     try {
+      stage("Fetching the video from that link…");
       const video = await downloadVideo(page, this.rig.context!, url, (t) => this.log("info", t));
+      stage(`Uploading ${(video.buffer.length / 1_048_576).toFixed(1)} MB to ${this.platform}…`);
       const result = await uploadToPlatform(
         this.platform,
         page,
@@ -420,7 +444,13 @@ export class GrowthEngine {
       this.pushEngine();
       return result.ok;
     } catch (err) {
-      this.log("err", `Manual publish failed: ${(err as Error).message}`);
+      const message = (err as Error).message;
+      this.log("err", `Manual publish failed: ${message}`);
+      // The deck's Post button waits for one of these two answers; without this it
+      // spins for its own timeout and the user is left deciding whether anything
+      // ever ran. The failure says which stage died so the fix is actionable.
+      this.rig.broadcast({ type: "post-failed", message });
+      this.toast(`Publish failed: ${message}`, "err");
       e.phase = prevPhase === "paused" ? "paused" : "idle";
       this.store.save();
       this.pushEngine();

@@ -96,8 +96,10 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 6. **The login wall will not cooperate?** A tap on a 60 px row, through a resized JPEG, on a phone, is the
    hardest click in this product — so there is a door that needs none. Paste your **`sessionid`** into
    **Session cookie** under the browser: copy it from any browser where you are already signed in (DevTools
-   → Application → Cookies → `www.tiktok.com`), or paste a whole `Cookie:` request header, or the bare
-   value — all three are read. **Apply & sign in** writes it into the profile's own cookie jar and reloads
+   → Application → Cookies → `www.tiktok.com`), **or** a whole `Cookie:` request header, **or** the bare
+   value, **or** a cookie-editor JSON export (`EditThisCookie` / `Cookie-Editor`), **or** a `cookies.txt`
+   file from `curl -b`. All five are read; anything from another site in the export (`.doubleclick.net`,
+   analytics) is dropped rather than written into the profile. **Apply & sign in** writes it into the profile's own cookie jar and reloads
    the site so it notices. That jar is the persistent profile the manual tab and every engine run already
    share, so one paste covers all of it and survives a restart. **Nothing starts posting:** a signed-in
    profile only enables **Start**, and the engine arms on that press alone (and refuses a session swap while
@@ -158,13 +160,41 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 > (`Tapped "Email" — the pointer press was ignored, the DOM click worked`), because "it worked, but not the
 > way you asked" is the answer a remote control owes you.
 >
-> **Protocol version.** `PROTOCOL_VERSION` (5: cookie login; 4: label taps and the DOM escalation) travels
+> **Protocol version.** `PROTOCOL_VERSION` (6: a failed publish answers; 5: cookie login; 4: label taps and
+> the DOM escalation) travels
 > on `auth` and comes back on `ready`, so a deck newer than the worker warns on connect and an unknown
 > command fails loudly — `This worker does not understand "click-label" (protocol v5) — redeploy it` —
 > instead of a button that does nothing. `src/lib/protocol.ts` and `worker/src/protocol.ts` are mirrors: bump
 > both.
 >
-> Both sides of the geometry, and the cookie parser, are unit-tested with no browser: `npm test`.
+> **Publishing: any source, one destination.** The composer's link field takes a **TikTok, Instagram or
+> YouTube** URL — the room's platform is only where it is *posted*. The old grab looked at
+> `document.querySelector("video").src`, which is a `blob:` on TikTok and YouTube (MSE), so the publish died
+> with "could not resolve a downloadable mp4" and nothing else was said. `worker/src/sourceGrab.ts` now reads
+> the page's own embedded state instead — `__UNIVERSAL_DATA_FOR_REHYDRATION__` / `__SIGI_STATE__` for TikTok,
+> `video_versions` + `og:video` for Instagram, `ytInitialPlayerResponse.streamingData.formats[]` for YouTube —
+> with a tolerant URL scan rather than a schema assumption, plus every response the player actually fetched
+> while the page loaded. Candidates are ranked (own CDN + real mp4 + 480–1440p first; manifests, posters and
+> DRM-tagged formats last) and tried in order, and an attempt counts as a success only when the bytes begin
+> with `ftyp`/`moov`/EBML — an S3 `AccessDenied` XML page and a bot-wall login screen are both HTTP 200, and
+> uploading one of those as if it were footage is how you get a publish that "succeeded" and shows a black
+> video. Failures name the platform, how many candidates were tried and what the page showed instead
+> (`TikTok: fetched 3 candidate URLs and none of them gave a playable video (a login wall) — open the link
+> once in the live browser…`), and they arrive as a toast **and** on the Post button — a publish that cannot
+> run is no longer allowed to look like nothing happened. YouTube answers a datacenter IP with
+> `LOGIN_REQUIRED` ("Sign in to confirm you're not a browser") more often than not; that is now reported as
+> the site's verdict, not as a broken deck. A publish runs in a second tab of the same profile so your own tab
+> stays yours, and the composer shows the current stage while it runs.
+>
+> **Signed-in state has hysteresis.** "The avatar is gone" is weak evidence — it is gone during hydration, on
+> a watch page and on a tab that just restarted — so a negative must survive three consecutive looks (≈15 s)
+> before the worker will call the session dead, disarm the engine and grey out Start; only a URL that *is*
+> the login wall flips it immediately. When a session installed from a pasted cookie dies within half an hour,
+> the log says the real reason (the site ended it because this browser doesn't match the one it came from)
+> instead of blaming the user for being logged out.
+>
+> Both sides of the geometry, the cookie parser and the source grab are unit-tested with no browser:
+> `npm test`.
 
 > **Login identity warning:** the Clearcote persona is fixed per platform and derived from
 > your `WORKER_TOKEN` (`STEALTH_FINGERPRINT` overrides it). Changing either **changes the

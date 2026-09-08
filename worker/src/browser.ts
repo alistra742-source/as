@@ -270,6 +270,8 @@ export class Rig {
    * account when nobody is watching).
    */
   private autoVerify = { on: false, label: "Email", sig: "", pressed: false, tries: 0 };
+  /** How many looks in a row said "signed out" — see `detectLogin`. */
+  private signedOutStreak = 0;
   /** The screen signature we last acted on, so one modal = at most a few presses. */
 
   constructor(platform: PlatformKey, store: Store) {
@@ -533,6 +535,10 @@ export class Rig {
       sessionId: `rig-${this.platform}`,
       url: START_URLS[this.platform],
       driver: driverInfo(),
+      // `proto` again, because this second `ready` overwrites the first in the
+      // deck: leave it out and a current worker is reported as "older than this
+      // deck" the moment its tab opens.
+      proto: PROTOCOL_VERSION,
     });
     // Frames FIRST — the deck must see the tab (even blank) while the site
     // loads; a slow/blocked TikTok load used to look identical to a dead worker.
@@ -750,6 +756,13 @@ export class Rig {
     this.detectBusy = true;
     try {
       let logged = false;
+      // "The avatar is missing" is weak evidence — it is missing while a page
+      // hydrates, on a watch page, and on a tab that just restarted. A URL that is
+      // the login wall is not. So the negative has to survive a few consecutive
+      // looks before it is allowed to disarm the engine (see the streak below).
+      const atLoginWall = await page
+        .evaluate(() => /login|passport|\/accounts\/|ServiceLogin|signin|challenge/i.test(location.href))
+        .catch(() => false);
       if (this.platform === "tiktok") {
         logged = await page.evaluate(() => {
           const u = location.href;
@@ -787,16 +800,41 @@ export class Rig {
           );
         });
       }
-      const prev = this.store.rig(this.platform).loggedIn;
-      if (logged !== prev) {
-        this.store.setLoggedIn(this.platform, logged);
-        this.broadcast({ type: "login", loggedIn: logged });
-        this.broadcast({
-          type: "log",
-          level: logged ? "ok" : "warn",
-          text: logged ? `✅ Signed in detected on ${this.platform} — the engine may act.` : `Signed-out state on ${this.platform} — log in to arm the engine.`,
-          at: Date.now(),
-        });
+      const rig = this.store.rig(this.platform);
+      const prev = rig.loggedIn;
+      if (logged) {
+        this.signedOutStreak = 0;
+        if (!prev) {
+          this.store.setLoggedIn(this.platform, true);
+          this.broadcast({ type: "login", loggedIn: true });
+          this.broadcast({ type: "log", level: "ok", text: `✅ Signed in detected on ${this.platform} — the engine may act.`, at: Date.now() });
+        }
+      } else if (atLoginWall || this.signedOutStreak >= 2) {
+        this.signedOutStreak = 0;
+        if (prev) {
+          this.store.setLoggedIn(this.platform, false);
+          this.broadcast({ type: "login", loggedIn: false });
+          // A pasted session that dies within minutes of being installed is almost
+          // never "the user logged out": the site ended it because the browser it
+          // arrived in does not look like the browser it left. Say that, because
+          // the alternative reading is "your cookie is wrong" and it is not.
+          const freshCookie = rig.cookieAt && Date.now() - rig.cookieAt < 30 * 60_000;
+          const text = freshCookie
+            ? `⚠️ ${this.platform} ended the pasted session after it saw this browser. Re-paste it from a signed-in tab, or log in by hand once in this tab — a fresh login here is the profile the site already trusts.`
+            : `Signed-out state on ${this.platform} — log in to arm the engine.`;
+          this.broadcast({ type: "log", level: "warn", text, at: Date.now() });
+          if (freshCookie) this.broadcast({ type: "toast", text: "The site ended the pasted session — paste it again or log in by hand", tone: "warn" });
+        }
+      } else {
+        this.signedOutStreak += 1;
+        if (prev) {
+          this.broadcast({
+            type: "log",
+            level: "info",
+            text: `Signed-in state uncertain on ${this.platform} (look ${this.signedOutStreak + 1}/3) — holding the engine until it is confirmed.`,
+            at: Date.now(),
+          });
+        }
       }
       return logged;
     } catch {

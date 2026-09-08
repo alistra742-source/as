@@ -328,7 +328,19 @@ export const useDeck = create<DeckState>()(
               },
             },
           }));
-          window.setTimeout(() => get().setComposer(p, { busy: false }), 2500);
+          // Busy stays on until the worker answers (post-ok / post-failed) — a real
+          // grab + studio upload runs for tens of seconds, and a spinner that stops
+          // on its own timer is what makes a working publish look like nothing
+          // happened. This timer only exists so a dead socket cannot lock the panel
+          // forever.
+          window.setTimeout(() => {
+            if (get().rooms[p].composer.busy) {
+              get().setComposer(p, {
+                busy: false,
+                error: "The worker has not answered in 4 minutes — the browser may be stuck on a challenge. Check the activity log.",
+              });
+            }
+          }, 240_000);
           return;
         }
 
@@ -568,6 +580,7 @@ export const useDeck = create<DeckState>()(
       },
 
       applyLivePostOk: (p, url) => {
+        get().setComposer(p, { busy: false, error: null });
         get().addLog(p, [
           logEntry("ok", `✅ Live publish confirmed${url ? ` — ${url.slice(0, 72)}` : ""} · audience Everyone.`),
         ]);

@@ -175,6 +175,7 @@ function LiveViewport({ platform }: { platform: Platform }) {
   const addLog = useDeck((s) => s.addLog);
   const applyLiveEngine = useDeck((s) => s.applyLiveEngine);
   const applyLivePostOk = useDeck((s) => s.applyLivePostOk);
+  const setComposer = useDeck((s) => s.setComposer);
   const [frame, setFrame] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
   // What the worker is doing while there is no frame yet (launch progress /
@@ -246,13 +247,19 @@ function LiveViewport({ platform }: { platform: Platform }) {
       },
       onEngine: (state) => applyLiveEngine(platform, state),
       onPostOk: (_id, _at, url) => applyLivePostOk(platform, url),
+      // A publish that died mid-grab used to be only a log line, three panels
+      // away from the button that started it. Put it back on the button.
+      onPostFailed: (message) => setComposer(platform, { busy: false, error: message }),
       onReady: (url, driver, proto) => {
         setSession(platform, { url, state: "open", driver: driver ?? null });
         // Tap-for-me and auto-tap are worker-side. A worker that predates them
         // answers those commands with an error; better to say so on connect than
         // to have the user press Email and watch nothing happen.
         if (proto === undefined || proto < PROTOCOL_VERSION) {
-          const text = `Worker is ${proto === undefined ? "older than this deck (no Tap for me)" : `on protocol v${proto}, deck needs v${PROTOCOL_VERSION}`} — redeploy the worker service`;
+          const text =
+            proto === undefined
+              ? `Worker predates protocol v${PROTOCOL_VERSION} (no version was reported) — redeploy the worker service`
+              : `Worker is on protocol v${proto}, this deck needs v${PROTOCOL_VERSION} — redeploy the worker service`;
           setToast({ text, tone: "warn" });
           addLog(platform, [{ id: `p-${Date.now()}`, at: Date.now(), level: "warn", text }]);
         }

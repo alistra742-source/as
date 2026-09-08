@@ -238,25 +238,24 @@ export function ComposerPanel({ room }: { room: Room }) {
       <div className="space-y-3 p-4">
         <label className="block">
           <span className="mb-1 block text-[11px] font-semibold text-muted uppercase tracking-wider">
-            {room.platform === "tiktok"
-              ? "TikTok video link"
-              : room.platform === "youtube"
-                ? "YouTube video / Shorts link"
-                : "Reel / IG video link"}
+            Source video link — TikTok, Instagram or YouTube
           </span>
           <input
             value={c.url}
             onChange={(e) => setComposer(room.platform, { url: e.target.value })}
-            placeholder={
-              room.platform === "tiktok"
-                ? "https://www.tiktok.com/@user/video/…"
-                : room.platform === "youtube"
-                  ? "https://www.youtube.com/watch?v=… or /shorts/…"
-                  : "https://www.instagram.com/reel/…"
-            }
+            placeholder="https://www.tiktok.com/@user/video/… · /reel/… · watch?v=…"
             spellCheck={false}
+            autoComplete="off"
+            autoCapitalize="off"
             className="h-10 w-full rounded-xl border border-line bg-ink-900 px-3 font-mono text-xs text-slate-200 outline-none transition-colors placeholder:text-faint focus:border-amber-400/60"
           />
+          <span className="mt-1 block text-[11px] leading-snug text-muted">
+            The link is where the video is *taken from* — any of the three sites works, and it is published to{" "}
+            <span className="text-slate-300">{room.platform === "tiktok" ? "TikTok" : room.platform === "youtube" ? "YouTube" : "Instagram"}</span>.
+            The worker pulls the file the source page itself plays (its own mp4, not a screenshot), so
+            cross-posting a Reel to TikTok is the normal case. If a site refuses this server, the log says
+            which stage refused it.
+          </span>
         </label>
         <label className="block">
           <span className="mb-1 block text-[11px] font-semibold text-muted uppercase tracking-wider">Caption</span>
@@ -272,14 +271,25 @@ export function ComposerPanel({ room }: { room: Room }) {
             className="w-full resize-none rounded-xl border border-line bg-ink-900 px-3 py-2.5 text-sm text-slate-200 outline-none transition-colors placeholder:text-faint focus:border-amber-400/60"
           />
         </label>
+        {c.busy && room.engine.message && (
+          <p className="flex items-start gap-1.5 text-xs text-amber-300">
+            <Timer className="mt-0.5 size-3.5 shrink-0 animate-pulse" /> {room.engine.message}
+          </p>
+        )}
         {c.error && (
           <p className="flex items-start gap-1.5 text-xs text-danger-400">
             <CircleAlert className="mt-0.5 size-3.5 shrink-0" /> {c.error}
           </p>
         )}
         <div className="flex flex-wrap items-center gap-2">
-          <Button size="md" loading={c.busy} disabled={!loggedIn} onClick={() => postNow(room.platform)}>
-            {c.url.trim() ? "Post video" : <Sparkles className="size-4" />}
+          <Button
+            size="md"
+            loading={c.busy}
+            disabled={!loggedIn}
+            title={!loggedIn ? "Sign in in the browser (or paste a session cookie) first" : ""}
+            onClick={() => postNow(room.platform)}
+          >
+            {c.url.trim() ? (c.busy ? "Grabbing video + publishing…" : "Post video") : <Sparkles className="size-4" />}
             {c.url.trim() ? "" : "Find & post with AI"}
           </Button>
           {!c.url.trim() && (

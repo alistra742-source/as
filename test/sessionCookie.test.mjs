@@ -140,10 +140,79 @@ test("a long paste is capped instead of bloating the profile", () => {
   assert.ok(byName(huge, "sessionid").value.length <= 8192);
 });
 
-test("describePlan is a one-liner with names and a date", () => {
-  const plan = planSessionCookies("tiktok", `sessionid=${SECRET}; ttwid=abc123def456`, NOW);
+test("describePlan leads with the session cookie, not the first name in the paste", () => {
+  const plan = planSessionCookies("tiktok", `delay_guest_mode_vid=aaaaaaaaaaaaaaaa; sessionid=${SECRET}; ttwid=abc123def456`, NOW);
   const text = describePlan(plan);
-  assert.match(text, /sessionid/);
+  assert.ok(text.startsWith("sessionid,"), text);
   assert.match(text, /more/);
-  assert.match(text, /valid to /);
+  assert.match(text, /valid to .*\d{4}/, "a date without a year is ambiguous");
+});
+
+/* --------------------------- the shapes people paste --------------------------- */
+
+test("a cookie-editor JSON export is understood, expiry and flags included", () => {
+  const future = Math.floor(NOW / 1000) + 12 * DAY;
+  const json = JSON.stringify([
+    { id: "c1", name: "sessionid", value: SECRET, domain: ".tiktok.com", hostOnly: false, path: "/", httpOnly: true, secure: true, expirationDate: future, sameSite: "no_restriction" },
+    { id: "c2", name: "ttwid", value: "abc123def456ghi789", domain: ".tiktok.com", hostOnly: false, path: "/", httpOnly: false, secure: true, session: true },
+  ]);
+  const plan = planSessionCookies("tiktok", json, NOW);
+  assert.equal(plan.ok, true, plan.detail);
+  assert.equal(byName(plan, "sessionid").expires, future, "the export's own expiry should win over the default");
+  assert.match(plan.detail, /cookie export/);
+  assert.match(plan.detail, /lifetime from the paste/);
+  assert.ok(byName(plan, "ttwid").expires >= future, "a session-only entry gets the fallback lease, never a shorter one");
+  assert.ok(!plan.detail.includes(SECRET), "a JSON paste must not echo the value either");
+});
+
+test("a { cookies: [...] } wrapper is understood too", () => {
+  const plan = planSessionCookies("tiktok", JSON.stringify({ cookies: [{ name: "sessionid", value: SECRET }] }), NOW);
+  assert.equal(plan.ok, true, plan.detail);
+  assert.equal(plan.names.includes("sessionid_ss"), true, "the twin is minted for exports as well");
+});
+
+test("an export from another site is dropped, and says so", () => {
+  const json = [
+    { name: "sessionid", value: SECRET, domain: ".tiktok.com" },
+    { name: "IDE", value: "AyTxmHn0XmpBaQ", domain: ".doubleclick.net" },
+    { name: "_ga", value: "GA1.2.999.1700000000", domain: ".myblog.com" },
+  ];
+  const plan = planSessionCookies("tiktok", JSON.stringify(json), NOW);
+  assert.equal(plan.ok, true, plan.detail);
+  assert.deepEqual(plan.names.sort(), ["sessionid", "sessionid_ss"]);
+  assert.match(plan.detail, /2 entries from other sites skipped/);
+});
+
+test("YouTube keeps its Google-side cookies, TikTok does not borrow them", () => {
+  const rows = [
+    { name: "SID", value: SECRET, domain: ".youtube.com" },
+    { name: "__Secure-1PSID", value: SECRET, domain: ".youtube.com" },
+    { name: "NID", value: "abc0123456789def", domain: ".google.com" },
+  ];
+  const yt = planSessionCookies("youtube", JSON.stringify(rows), NOW);
+  assert.deepEqual(yt.names, ["SID", "__Secure-1PSID", "NID"], yt.detail);
+  assert.equal(byName(yt, "NID").domain, ".google.com");
+  const tt = planSessionCookies("tiktok", JSON.stringify(rows), NOW);
+  assert.equal(tt.ok, false, "a Google cookie must not be installed as a TikTok session");
+});
+
+test("cookies.txt from curl or a downloader parses", () => {
+  const future = Math.floor(NOW / 1000) + 20 * DAY;
+  const lines = [
+    "# Netscape HTTP Cookie File",
+    "# https://curl.se/docs/http-cookies.html",
+    ".tiktok.com\tTRUE\t/\t" + future + "\tsessionid\t" + SECRET,
+    "#HttpOnly_.tiktok.com\tTRUE\t/\t0\tttwid\tabc123def456ghi789",
+  ].join("\n");
+  const plan = planSessionCookies("tiktok", lines, NOW);
+  assert.equal(plan.ok, true, plan.detail);
+  assert.match(plan.detail, /cookies\.txt/);
+  assert.equal(byName(plan, "sessionid").expires, future);
+  assert.ok(byName(plan, "ttwid").httpOnly, "#HttpOnly_ prefix is a real flag");
+});
+
+test("malformed JSON says so instead of misreading it as pairs", () => {
+  const plan = planSessionCookies("tiktok", `[{"name": "sessionid", value": "${SECRET}"}]`, NOW);
+  assert.equal(plan.ok, false);
+  assert.match(plan.detail, /looks like JSON but is not/);
 });

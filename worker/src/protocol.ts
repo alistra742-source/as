@@ -35,7 +35,7 @@ export type RemoteCmd =
    * message is added: the deck then tells the user the worker is behind instead
    * of pressing a button whose command the old worker swallows in silence.
    */
-export const PROTOCOL_VERSION = 5;
+export const PROTOCOL_VERSION = 6;
 
 export type ClientMsg =
   | { type: "auth"; token: string; proto?: number }
@@ -88,6 +88,12 @@ export type ServerMsg =
   | { type: "log"; level: string; text: string; at: number }
   | { type: "engine"; state: EngineSnapshot }
   | { type: "post-ok"; postId: string; postedAt: number; url: string }
+  /**
+   * A publish the user asked for and that did not happen, with the reason. The
+   * deck's Post button otherwise has to guess when nothing arrived, which is how
+   * a blocked video grab reads as "I clicked and nothing happened".
+   */
+  | { type: "post-failed"; message: string }
   | { type: "toast"; text: string; tone?: "info" | "ok" | "warn" | "err" } // a one-line result the deck should show, not just log
   | { type: "input-focused" } // a tap landed on a text field — open the device keyboard
   /** Whether a pasted session cookie is installed in this profile, so the panel

@@ -9,6 +9,8 @@ export interface LiveBusHandlers {
   onLog: (level: string, text: string) => void;
   onEngine: (state: import("./protocol").EngineSnapshot) => void;
   onPostOk: (postId: string, postedAt: number, url: string) => void;
+  /** The worker tried to publish and could not; the reason is for the composer. */
+  onPostFailed?: (message: string) => void;
   onReady: (url: string, driver?: DriverInfo, proto?: number) => void;
   onInputFocus: () => void;
   /** A one-line result worth showing over the stream (a tap that landed or missed). */
@@ -78,6 +80,9 @@ export function connectLive(
           break;
         case "post-ok":
           handlers.onPostOk(msg.postId, msg.postedAt, msg.url);
+          break;
+        case "post-failed":
+          handlers.onPostFailed?.(msg.message);
           break;
         case "toast":
           handlers.onToast?.(msg.text, msg.tone ?? "info");
