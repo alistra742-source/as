@@ -17,7 +17,10 @@ import {
   harvestMediaUrls,
   looksLikeMediaUrl,
   looksLikeVideoBytes,
+  mediaHostOk,
   rankCandidates,
+  sizeFloorNote,
+  splitByMediaHost,
   sizeRejection,
   sourcePlatformOf,
   youtubePlayability,
@@ -201,4 +204,68 @@ test("YouTube's own verdict is read before we blame our grab", () => {
 test("a full-length video is refused before it is downloaded", () => {
   assert.equal(sizeRejection(5_000_000), null);
   assert.match(sizeRejection(400 * 1024 * 1024), /over the 180 MB cap/);
+});
+
+/* --------------------- the page's furniture is not the post --------------------- */
+
+// What actually happened once on a real account: the source page was TikTok's
+// login wall, its background loop is a genuine fetchable mp4, and that is what got
+// uploaded — 0.2 MB of decorative video into a studio that then never opened.
+const TIKTOK_WALL_HTML = `<html><body>
+<p>Log in to TikTok</p>
+<script src="https://sf16-website-login.neutral.ttwstatic.com/obj/tiktok_web_login_static/lib.js"></script>
+<pic lang="text"><a href="https://sf16-website-login.neutral.ttwstatic.com/obj/tiktok_web_login_static/tiktok/privo/mixdown.mp4">bg</a></pic>
+</body></html>`;
+
+test("a login wall's own background video is refused, and the reason says so", () => {
+  const found = harvestMediaUrls(TIKTOK_WALL_HTML);
+  assert.equal(found.length, 1, "the asset should still be found — the host is what rejects it");
+  const { kept, dropped } = splitByMediaHost(found.map((url) => ({ url, from: "page-json", score: 0 })), "tiktok");
+  assert.equal(kept.length, 0);
+  assert.equal(dropped.length, 1);
+  const err = describeGrabFailure("tiktok", kept, null, dropped.length);
+  assert.match(err, /static\/login host/);
+  assert.match(err, /not signed in/);
+  assert.ok(!/0\.2 MB/.test(err), "the message stays secret-free and actionable");
+});
+
+test("real content hosts pass, asset hosts do not", () => {
+  const keep = [
+    ["https://v16-webapp.tiktok.com/02abc/o08.mp4?a=1988&line=0", "tiktok"],
+    ["https://v16m.tiktokcdn-us.com/9f2/o700.mp4X", "tiktok"],
+    ["https://www.tiktok.com/aweme/v1/play/?video_id=v0d00fg&ratio=1080p", "tiktok"],
+    ["https://api16-normal-c-useast1a.tiktokv.com/aweme/v1/play/", "tiktok"],
+    ["https://scontent-lga3-2.cdninstagram.com/v/t50.2886-16/1_2_3.mp4?oe=65", "instagram"],
+    ["https://rr5---sn-npoe7ns6.googlevideo.com/videoplayback?itag=18&mime=video%2Fmp4", "youtube"],
+  ];
+  const drop = [
+    ["https://sf16-website-login.neutral.ttwstatic.com/obj/tiktok_web_login_static/bg.mp4", "tiktok"],
+    ["https://sf16-gecko.bytecdn.com/obj/sfx-ttwstatic/challenge.mp4", "tiktok"],
+    ["https://static.cdninstagram.com/rsrc.php/y1/r/anim.mp4", "instagram"],
+    ["https://i.ytimg.com/vi/dQw4w9WgXcQ/hq720.mp4", "youtube"],
+    ["https://mssdk.tiktokv.com/webapp/static/probe.mp4", "tiktok"],
+  ];
+  for (const [url, platform] of keep) assert.equal(mediaHostOk(url, platform), true, `should keep ${url}`);
+  for (const [url, platform] of drop) assert.equal(mediaHostOk(url, platform), false, `should drop ${url}`);
+});
+
+test("an unknown source host keeps whatever looks like video", () => {
+  const url = "https://media.example.org/clips/a.mp4";
+  assert.equal(sourcePlatformOf(url), "other");
+  assert.equal(mediaHostOk(url, "other"), true);
+});
+
+test("a file too small to be a clip is refused by size too", () => {
+  assert.equal(sizeFloorNote(1_500_000), null);
+  const note = sizeFloorNote(204_800);
+  assert.match(note, /200 KB is not a clip/);
+  assert.match(note, /page asset/);
+});
+
+test("downloadVideo's guards agree with the grab layer", async () => {
+  // A 0.2 MB mp4 from the wall host: rejected by host AND by the floor, so a
+  // future refactor cannot silently re-admit it by relaxing one of the two.
+  const url = "https://sf16-website-login.neutral.ttwstatic.com/obj/tiktok_web_login_static/bg.mp4";
+  assert.equal(mediaHostOk(url, "tiktok"), false);
+  assert.ok(sizeFloorNote(204_800));
 });

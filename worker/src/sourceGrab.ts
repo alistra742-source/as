@@ -207,6 +207,67 @@ export function looksLikeVideoBytes(head: Uint8Array | Buffer): boolean {
 }
 
 /**
+ * Which hosts actually serve the *content*, per site. This exists because a
+ * login/challenge wall is full of real, fetchable mp4 files — the animations and
+ * background loops of the "Log in to TikTok" screen. Those pass every byte-level
+ * check (they are genuine mp4s) and produce exactly the failure mode you get when
+ * you only look at the wire: a 0.2 MB "video" that is a wall's decoration,
+ * uploaded as if it were the post. So the host has to be a media host, and asset /
+ * security / login infrastructure is vetoed even when it looks like video.
+ */
+const MEDIA_HOST: Record<SourcePlatform, RegExp> = {
+  tiktok:
+    /(^|\.)(v\d{2,3}m?-|api\d{2}-normal-c\.|v\d+-[a-z0-9-]+\.|)(tiktok\.com|tiktokcdn[^.]*\.com|tiktokv\.com|snssdk\.com|bytecdn[^.]*\.com|ixgny[0-9]?\.com)$/i,
+  instagram: /(^|\.)(cdninstagram\.com|instagram\.com|scontent[^.]*\.cdnfbcdn\.net|cdnfbcdn\.net|fbcdn\.net|fburl\.com)$/i,
+  youtube: /(^|\.)googlevideo\.com$/i,
+  other: /$^/,
+};
+
+/** Never a video's origin, whatever it claims. */
+const ASSET_HOST = /(webapp-static|website-login|static\.|sf\d+-gecko|sfx-ttw|mon\.ib|security|log\.snssdk|mssdk|analytics|unpkg|jsdelivr)/i;
+
+/** True when this URL could plausibly be the content the page is about. */
+export function mediaHostOk(url: string, platform: SourcePlatform): boolean {
+  let host = "";
+  try {
+    host = new URL(url).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (ASSET_HOST.test(host) || ASSET_HOST.test(url)) return false;
+  // An extensionless tiktok `play` endpoint is content even though the host is the
+  // site itself (`www.tiktok.com/aweme/v1/play/?video_id=…`).
+  if (platform === "tiktok" && /\/aweme\/v\d\/play/i.test(url)) return true;
+  if (platform === "other") return true; // an unknown host keeps whatever looks like video
+  return MEDIA_HOST[platform].test(host);
+}
+
+/**
+ * Split candidates into "this is the video" and "this is the page's furniture".
+ * The dropped half is reported, because *"TikTok offered 4 mp4s, all of them from
+ * its static-asset host"* is the sentence that tells you the session was looking
+ * at a login wall the whole time.
+ */
+export function splitByMediaHost(list: MediaCandidate[], platform: SourcePlatform): { kept: MediaCandidate[]; dropped: MediaCandidate[] } {
+  const kept: MediaCandidate[] = [];
+  const dropped: MediaCandidate[] = [];
+  for (const c of list) (mediaHostOk(c.url, platform) ? kept : dropped).push(c);
+  // `other` (an unknown host) keeps whatever looks like video.
+  if (platform === "other") return { kept: list, dropped: [] };
+  return { kept, dropped };
+}
+
+/** Below this, it is a poster, a loop, or a wall's background — not a post. */
+export const MIN_VIDEO_BYTES = 300_000;
+
+export function sizeFloorNote(bytes: number): string | null {
+  if (bytes < MIN_VIDEO_BYTES) {
+    return `${(bytes / 1024).toFixed(0)} KB is not a clip — that is a page asset (a login/challenge wall serves exactly these). Floor is ${(MIN_VIDEO_BYTES / 1024).toFixed(0)} KB.`;
+  }
+  return null;
+}
+
+/**
  * Hard cap on what we will pull into memory for an upload: the worker runs
  * alongside a 600–900 MB Chromium renderer and a full-length 4K YouTube file is
  * how you get an OOM kill instead of a post.
@@ -224,11 +285,27 @@ export function sizeRejection(bytes: number): string | null {
  * The message a failed grab should print. Naming the platform and the sources we
  * consulted turns "nothing happened" into something a user can act on.
  */
-export function describeGrabFailure(platform: SourcePlatform, tried: MediaCandidate[], note: string | null): string {
+export function describeGrabFailure(
+  platform: SourcePlatform,
+  tried: MediaCandidate[],
+  note: string | null,
+  assetOnly = 0
+): string {
   const where = platform === "tiktok" ? "TikTok" : platform === "instagram" ? "Instagram" : platform === "youtube" ? "YouTube" : "that page";
   const n = tried.length;
-  const base = n
-    ? `${where}: fetched ${n} candidate URL${n === 1 ? "" : "s"} and none of them gave a playable video`
-    : `${where}: no direct video URL in the page at all`;
-  return `${base}${note ? ` (${note})` : ""} — open the link once in the live browser to see what that site shows this session`;
+  let base: string;
+  if (assetOnly && !n) {
+    base =
+      `${where}: the page offered ${assetOnly} video URL${assetOnly === 1 ? "" : "s"}, all of them from its static/login ` +
+      `host — that is what a login or challenge wall looks like from here, not a broken link`;
+  } else if (n) {
+    base = `${where}: fetched ${n} candidate URL${n === 1 ? "" : "s"} and none of them gave a playable video`;
+  } else {
+    base = `${where}: no direct video URL in the page at all`;
+  }
+  const fix =
+    assetOnly && !n
+      ? "this session is not signed in on that site — paste the session cookie again (or log in once in the live browser) and post again"
+      : "open the link once in the live browser to see what that site shows this session";
+  return `${base}${note ? ` (${note})` : ""} — ${fix}`;
 }

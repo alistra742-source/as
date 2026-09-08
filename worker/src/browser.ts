@@ -272,6 +272,13 @@ export class Rig {
   private autoVerify = { on: false, label: "Email", sig: "", pressed: false, tries: 0 };
   /** How many looks in a row said "signed out" — see `detectLogin`. */
   private signedOutStreak = 0;
+  /**
+   * Set while the worker drives the *visible* tab itself (a manual publish). The
+   * ambient loops stand down and login detection pauses for the duration: a page
+   * mid-navigation has no avatar bar, and reading that as "signed out" is how a
+   * publish disarmed its own engine.
+   */
+  private driving = false;
   /** The screen signature we last acted on, so one modal = at most a few presses. */
 
   constructor(platform: PlatformKey, store: Store) {
@@ -627,6 +634,7 @@ export class Rig {
   private async idleDrift() {
     const page = this.control;
     if (!page || page.isClosed() || this.idleBusy || this.detectBusy) return;
+    if (this.driving) return; // the worker is driving this tab; a stray wheel could cost a publish
     if (this.pendingCmds > 0) return; // never drift while commands are in flight
     if (Date.now() - this.lastInputAt < 45_000) return;
     this.idleBusy = true;
@@ -753,6 +761,9 @@ export class Rig {
   async detectLogin(): Promise<boolean> {
     const page = this.control;
     if (!page || page.isClosed() || this.detectBusy) return this.store.rig(this.platform).loggedIn;
+    // A publish navigating the visible tab to /upload is not evidence about the
+    // session. Hold the last answer until the tab is ours again.
+    if (this.driving) return this.store.rig(this.platform).loggedIn;
     this.detectBusy = true;
     try {
       let logged = false;
@@ -841,6 +852,29 @@ export class Rig {
       return this.store.rig(this.platform).loggedIn;
     } finally {
       this.detectBusy = false;
+    }
+  }
+
+  /**
+   * Run `fn` on the tab the deck is streaming, holding the input lock so the
+   * user's own clicks queue politely behind it, and returning false when there is
+   * no such tab (the caller then uses its own hidden one).
+   *
+   * This exists because a manual publish used to run in an invisible second tab:
+   * the deck kept showing the For You page, the studio never appeared on screen,
+   * and "I pressed Post and nothing happened" was a completely fair reading of
+   * what the user could see. Watching it open the source, hand the file to the
+   * studio and hit Post is both the reassurance and the debugging tool.
+   */
+  async withVisibleTab<T>(fn: (page: Page) => Promise<T>): Promise<{ ran: boolean; value?: T }> {
+    const page = this.control;
+    if (!page || page.isClosed() || this.driving || this.recovering) return { ran: false };
+    this.driving = true;
+    try {
+      const value = await this.withInput(() => fn(page));
+      return { ran: true, value };
+    } finally {
+      this.driving = false;
     }
   }
 

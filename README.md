@@ -181,10 +181,31 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 > video. Failures name the platform, how many candidates were tried and what the page showed instead
 > (`TikTok: fetched 3 candidate URLs and none of them gave a playable video (a login wall) — open the link
 > once in the live browser…`), and they arrive as a toast **and** on the Post button — a publish that cannot
-> run is no longer allowed to look like nothing happened. YouTube answers a datacenter IP with
+> run is no longer allowed to look like nothing happened.
+>
+> **A host check, because a login wall is full of real mp4s.** The first run of the new grab "succeeded" and
+> uploaded 0.2 MB of `sf16-website-login.neutral.ttwstatic.com/.../bg.mp4` — TikTok's *login screen* background
+> loop, then the studio never opened. Byte checks cannot catch that (it is a valid mp4), so `mediaHostOk`
+> requires a **media** host (`v16-webapp.tiktok.com`, `tiktokcdn*`, `.../aweme/v1/play/`, `cdninstagram`,
+> `googlevideo`) and vetoes asset/telemetry infrastructure (`ttwstatic`, `sf16-gecko`, `static.`, `mssdk`,
+> `mon.snssdk`), with a 300 KB floor on top; when every candidate is an asset the log says *"the page offered N
+> video URLs, all from its static/login host — that is what a login or challenge wall looks like from here"*
+> instead of blaming your link. YouTube answers a datacenter IP with
 > `LOGIN_REQUIRED` ("Sign in to confirm you're not a browser") more often than not; that is now reported as
-> the site's verdict, not as a broken deck. A publish runs in a second tab of the same profile so your own tab
-> stays yours, and the composer shows the current stage while it runs.
+> the site's verdict, not as a broken deck.
+>
+> **A manual publish runs in the tab you are watching.** It used to run in a hidden second tab, which made a
+> working 60-second publish indistinguishable from a hung one — the dock sat on the For You page while a page
+> nobody could see did everything. Now Post drives the streamed tab (input lock held, ambient cursor and login
+> polling parked so a publish cannot be misread as "signed out"), you watch the source page open, the file hand
+> to the studio and Post get pressed, and the tab stays on the live video afterwards as the receipt. With no
+> browser tab open it falls back to its own hidden one. The hourly engine cycle still uses a hidden tab: it must
+> not steal the feed you are browsing.
+>
+> **Studio reachability.** TikTok's upload page has lived at two URLs, so `uploadTikTok` tries `/upload` then
+> `/tiktokstudio/upload`, clicks the "Upload video" trigger if the `<input type=file>` is mounted lazily, and
+> distinguishes "bounced to a login wall" (re-paste the session cookie) from "no file input at all" (the studio
+> changed layout) — those two need opposite fixes and one vague error message used to cover both.
 >
 > **Signed-in state has hysteresis.** "The avatar is gone" is weak evidence — it is gone during hydration, on
 > a watch page and on a tab that just restarted — so a negative must survive three consecutive looks (≈15 s)

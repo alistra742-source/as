@@ -2,6 +2,7 @@ import { HOUR_MS, stealth, type PlatformKey } from "./config.js";
 import type { EngineSnapshot, LastPostSnapshot, ServerMsg } from "./protocol.js";
 import { now } from "./protocol.js";
 import { Store, type WorkerPost } from "./store.js";
+import type { Page } from "playwright-core";
 import { Rig, readVideoStats, scrapeCandidates, scrapeCommentSample } from "./browser.js";
 import { downloadVideo, uploadToPlatform } from "./uploads.js";
 import { groqAvailable, interpretMetrics, judgeCandidate, writeCaption } from "./groq.js";
@@ -398,26 +399,36 @@ export class GrowthEngine {
     e.message = `Publishing your link + caption (${this.audienceLabel()})…`;
     this.store.save();
     this.pushEngine();
-    const page = await this.rig.newEnginePage();
-    // The publish runs in a second tab of the same profile — the dock keeps
-    // showing the user's own tab — so the composer has to narrate it. Each stage
-    // lands in `message`, which the deck renders under the Post button.
+    // Each stage lands in `message`, which the deck renders under the Post button.
     const stage = (text: string) => {
       e.message = text;
       this.store.save();
       this.pushEngine();
     };
-    try {
+    // A *manual* publish runs in the tab the deck is streaming, so the user watches
+    // the source page open, the file hand off to the studio and Post get pressed.
+    // The hourly cycle keeps its own hidden tab — nobody is watching it, and it
+    // must not steal the feed the user is browsing.
+    const publish = async (page: Page) => {
       stage("Fetching the video from that link…");
       const video = await downloadVideo(page, this.rig.context!, url, (t) => this.log("info", t));
       stage(`Uploading ${(video.buffer.length / 1_048_576).toFixed(1)} MB to ${this.platform}…`);
-      const result = await uploadToPlatform(
-        this.platform,
-        page,
-        video,
-        caption || "Posted via ViralDeck",
-        (t) => this.log("info", t)
-      );
+      return uploadToPlatform(this.platform, page, video, caption || "Posted via ViralDeck", (t) => this.log("info", t));
+    };
+    try {
+      // Prefer the streamed tab; fall back to a tab of our own when there is none
+      // (or one already holds it). Either way the whole run is inside this try, so
+      // a throw on the way in still answers the deck instead of hanging the button.
+      const result =
+        (await this.rig.withVisibleTab(publish)).value ??
+        (await (async () => {
+          const own = await this.rig.newEnginePage();
+          try {
+            return await publish(own);
+          } finally {
+            await own.close().catch(() => undefined);
+          }
+        })());
       const post: WorkerPost = {
         id: uid(),
         url,
@@ -457,7 +468,8 @@ export class GrowthEngine {
       return false;
     } finally {
       this.manualBusy = false;
-      await page.close().catch(() => undefined);
+      // The user's tab is deliberately left where the publish put it: landing on
+      // the live video page is the confirmation that it worked.
     }
   }
 }

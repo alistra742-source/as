@@ -2,6 +2,8 @@ import type { BrowserContext, Page, Response } from "playwright-core";
 import { readingPause, sleep, thinkingPause } from "./human.js";
 import {
   candidateFromResponse,
+  sizeFloorNote,
+  splitByMediaHost,
   describeGrabFailure,
   harvestMediaUrls,
   looksLikeVideoBytes,
@@ -98,13 +100,20 @@ export async function downloadVideo(
       ...(await playerHints(page)),
       ...sniffed,
     ];
-    const ranked = rankCandidates(candidates, platform);
+    // The host decides, not the file type: a login wall serves real mp4s (its own
+    // background loop), and those download beautifully and upload as garbage.
+    const { kept, dropped } = splitByMediaHost(candidates, platform);
+    if (!kept.length && dropped.length) {
+      throw new Error(describeGrabFailure(platform, [], describePage(html), dropped.length));
+    }
+    const ranked = rankCandidates(kept, platform);
     log(
       ranked.length
-        ? `${ranked.length} candidate video URL${ranked.length === 1 ? "" : "s"} for this ${platform === "other" ? "page" : platform} link — fetching the best one…`
+        ? `${ranked.length} candidate video URL${ranked.length === 1 ? "" : "s"} for this ${platform === "other" ? "page" : platform} link` +
+          `${dropped.length ? ` (${dropped.length} more ignored as page assets)` : ""} — fetching the best one…`
         : `No video URL in the page or on the wire — inspecting what the site actually returned…`
     );
-    if (!ranked.length) throw new Error(describeGrabFailure(platform, [], describePage(html)));
+    if (!ranked.length) throw new Error(describeGrabFailure(platform, [], describePage(html), dropped.length));
 
     const ua = await page.evaluate(() => navigator.userAgent).catch(() => "");
     let lastNote = describePage(html);
@@ -141,6 +150,12 @@ export async function downloadVideo(
       const body = await resp.body().catch(() => null);
       if (!body || body.length < 60_000) {
         lastNote = `${host} returned ${body ? body.length : 0} bytes — not a video`;
+        continue;
+      }
+      const floor = sizeFloorNote(body.length);
+      if (floor) {
+        lastNote = `${host}: ${floor}`;
+        log(`  · candidate ${i + 1}/${ranked.length} ${host} → ${floor}`);
         continue;
       }
       if (!looksLikeVideoBytes(body)) {
@@ -207,19 +222,64 @@ function hostOf(url: string): string {
 
 /* --------------------------------- TikTok --------------------------------- */
 
-export async function uploadTikTok(page: Page, video: VideoFile, caption: string, log: StepLog) {
-  log("Opening TikTok upload studio…");
-  await page.goto("https://www.tiktok.com/upload", { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
-  await sleep(2500);
-  await readingPause(600, 1800);
+/** TikTok's studio has answered at both of these; which one renders depends on
+ * the account and the day, so try each until a file input shows up. */
+const TIKTOK_STUDIO_URLS = ["https://www.tiktok.com/upload", "https://www.tiktok.com/tiktokstudio/upload"];
 
-  const fileInput = page.locator('input[type="file"]').first();
-  try {
-    await fileInput.waitFor({ state: "attached", timeout: 40_000 });
-    await fileInput.setInputFiles({ name: video.name, mimeType: video.mime, buffer: video.buffer });
-  } catch {
-    throw new Error("Upload studio didn't expose a file input (TikTok may be challenging this session).");
+/**
+ * Get to a usable file input on the current page: notice a login wall, wait for
+ * the input, and press the button that mounts it when the studio keeps the input
+ * hidden inside "Upload video" until it is clicked.
+ */
+async function revealTiktokInput(page: Page, log: StepLog): Promise<"found" | "wall" | "missing"> {
+  const wall = await page
+    .evaluate(() => {
+      const u = location.href;
+      const text = (document.body?.innerText || "").slice(0, 1500);
+      const login = /\/login|passport|\/accounts\//i.test(u) || /log in to continue|phone or email|sign up to continue/i.test(text);
+      return { url: u, login, hasInput: !!document.querySelector('input[type="file"]') };
+    })
+    .catch(() => null);
+  if (wall?.login && !wall.hasInput) {
+    log(`TikTok redirected to a login wall at ${wall.url.slice(0, 60)}`);
+    return "wall";
   }
+  const input = page.locator('input[type="file"]').first();
+  if ((await input.count()) > 0) return "found";
+  await input.waitFor({ state: "attached", timeout: 12_000 }).then(() => "found").catch(() => "none");
+  if ((await input.count()) > 0) return "found";
+  const trigger = page.locator('button:has-text("Upload video"), [data-e2e="upload-btn"], div:has-text("Select file")').last();
+  if ((await trigger.count()) > 0) {
+    await trigger.click({ timeout: 6000 }).catch(() => undefined);
+    await sleep(1800);
+    if ((await page.locator('input[type="file"]').count()) > 0) return "found";
+  }
+  return "missing";
+}
+
+export async function uploadTikTok(page: Page, video: VideoFile, caption: string, log: StepLog) {
+  let state: "found" | "wall" | "missing" = "missing";
+  let lastUrl = "";
+  for (const studio of TIKTOK_STUDIO_URLS) {
+    lastUrl = studio;
+    log(`Opening TikTok upload studio… (${studio.replace("https://www.tiktok.com", "")})`);
+    await page.goto(studio, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
+    await sleep(2500);
+    await readingPause(600, 1800);
+    state = await revealTiktokInput(page, log);
+    if (state === "found") break;
+  }
+  if (state !== "found") {
+    throw new Error(
+      state === "wall"
+        ? `TikTok bounced the upload to a login wall (${lastUrl}) — this browser's session is not accepted any more. ` +
+          `Re-paste the session cookie in the deck, or log in once in the live browser, then post again.`
+        : `TikTok's studio never showed a file input at ${lastUrl.replace("https://www.tiktok.com", "")} — the page is ` +
+          `either challenging this session or its layout changed. Open the studio in the live browser to see which, ` +
+          `then post again (the video is already downloaded).`
+    );
+  }
+  await page.locator('input[type="file"]').first().setInputFiles({ name: video.name, mimeType: video.mime, buffer: video.buffer });
   log("Video processing in studio…");
   await sleep(4000);
 
