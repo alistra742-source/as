@@ -31,31 +31,78 @@ import {
  * into Chromium's C++), and every input goes out as native trusted events with
  * a human motor persona (`humanize`). No vanilla Chromium is ever launched.
  */
-const BASE_LAUNCH_ARGS = [
-  // Container runtime needs (the sandbox/uid sandbox and /dev/shm are absent in Docker).
-  "--no-sandbox",
-  "--disable-dev-shm-usage",
-  // ---- Memory diet. A TikTok tab is 600-900 MB in one renderer; on a small
-  // container the kernel OOM-kills that renderer => "Target crashed" and the
-  // dock goes dark. None of these change anything a page can observe.
-  // One renderer per site-instance, not per iframe-origin (TikTok embeds
-  // dozens of third-party frames; each would be its own ~50 MB process).
-  "--disable-features=IsolateOrigins,site-per-process,ProcessPerSiteUpToMainFrameThreshold",
-  "--renderer-process-limit=3",
-  // Cap on V8's heap per renderer — see `v8HeapMb()`. Too low and a heavy page
-  // aborts its own renderer ("Target crashed", no kernel OOM); too high and the
-  // kernel does the same thing more quietly. Scaled to the container at launch.
-  // No GPU process on Xvfb (llvmpipe is CPU anyway): saves ~80-120 MB and
-  // one more process that can be OOM-killed. Software compositing stays.
-  "--disable-gpu",
-  // Chrome's own OOM intervention: pause/kill bloated ad frames before the
-  // kernel kills the whole tab. Merged with the SDK's own feature list.
-  "--enable-features=OomIntervention,MemoryPurgeOnFreeze",
-];
+/**
+ * Every flag here is a trade between memory and *stability*, and which side is
+ * right depends on how big the container actually is.
+ *
+ * The diet flags (`--renderer-process-limit`, site-isolation off) were written for
+ * 512 MB–1 GB boxes, where one renderer per site-instance is the difference between
+ * a working session and an OOM loop. On a box with room they are a liability: hit a
+ * hard renderer ceiling and Chromium **discards a renderer to stay under the
+ * limit**, which reaches the deck as "Target crashed" with 7 GB free and no kernel
+ * OOM — precisely the "site keeps crashing" report. A DCHECK-enabled build with
+ * site isolation switched off also has more ways to end a frame than a release
+ * build does. So: diet only when the box is actually small.
+ */
+function launchArgs(profile: string): string[] {
+  const { limit } = cgroupMemoryMb();
+  const small = limit !== null && limit < 3000;
+  const args = [
+    // Container runtime needs (the sandbox/uid sandbox and /dev/shm are absent in Docker).
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    // No GPU process on Xvfb (llvmpipe is CPU anyway): saves ~80-120 MB and one
+    // more process that can be killed. Software compositing stays.
+    "--disable-gpu",
+    // V8's heap ceiling per renderer — see `v8HeapMb()`. Too low and a heavy page
+    // aborts its own renderer; too high and the kernel does it more quietly.
+    `--js-flags=--max-old-space-size=${v8HeapMb()}`,
+    // Chrome's own OOM intervention: pause/kill bloated frames before the kernel
+    // kills the whole tab. Merged with the SDK's own feature list.
+    "--enable-features=OomIntervention,MemoryPurgeOnFreeze",
+    // Chromium's own log, so a renderer death can be *quoted* instead of guessed
+    // at (`chromeLogTail`). Not observable from page JS, so no fingerprint cost.
+    "--enable-logging=file",
+    // Absolute: a bare name would resolve against the process cwd, and then the
+    // reader below (which looks in the profile) would find nothing.
+    `--log-file=${path.join(profile, CHROME_LOG)}`,
+    "--log-level=0",
+  ];
+  // An explicit choice beats the heuristic: `true` = never disable isolation,
+  // `false` = always run the diet (a big box that wants to spend less memory).
+  const iso = (process.env.STEALTH_SITE_ISOLATION || "").toLowerCase();
+  const diet = iso === "true" ? false : iso === "false" ? true : small;
+  if (diet) {
+    args.push(
+      // One renderer per site-instance instead of per iframe-origin: TikTok embeds
+      // dozens of third-party frames, and each would be its own ~50 MB process.
+      "--disable-features=IsolateOrigins,site-per-process,ProcessPerSiteUpToMainFrameThreshold",
+      "--renderer-process-limit=3"
+    );
+  }
+  return args;
+}
 
-/** The memory-diet args, sized to the container this launch happens in. */
-function launchArgs(): string[] {
-  return [...BASE_LAUNCH_ARGS, `--js-flags=--max-old-space-size=${v8HeapMb()}`];
+/** Inside the profile dir, which is on the persistent volume and per-platform. */
+const CHROME_LOG = "chrome-self.log";
+
+/**
+ * The last few lines of Chromium's own log that matter: a renderer death, a
+ * crash-handler signal, an OOM note. Rendered into the deck's log so "the browser
+ * keeps crashing" stops being a guess — the box either says `Received signal
+ * 11` or it says `Out of memory`, and those need different fixes.
+ */
+function chromeLogTail(profile: string): string {
+  try {
+    const text = fs.readFileSync(path.join(profile, CHROME_LOG), "utf8");
+    const hits = text
+      .split(/\r?\n/)
+      .filter((l) => /ERROR:|FATAL:|Received signal|Out of memory|oom|killed|crashed|discarded/i.test(l));
+    if (!hits.length) return "";
+    return hits.slice(-3).join(" | ").replace(/^\[[^\]]*\]\s*/, "").slice(0, 420);
+  } catch {
+    return "";
+  }
 }
 
 export interface RigClient {
@@ -101,13 +148,36 @@ export function memoryReport(): { text: string; oomKills: number | null; tight: 
  * RAM vs a bigger `--max-old-space-size` — so the log says which one the cgroup
  * counters support instead of guessing "out-of-memory" every time.
  */
-function crashVerdict(mem: { text: string; oomKills: number | null; tight: boolean }): string {
-  if (mem.oomKills && mem.oomKills > 0) return `the kernel OOM-killed it (${mem.text})`;
-  if (mem.tight) return `memory is nearly exhausted — the kernel will kill the next big allocation (${mem.text})`;
+function crashVerdict(mem: { text: string; oomKills: number | null; tight: boolean }, quoted = ""): string {
+  const quote = quoted ? ` — chromium said: ${quoted}` : "";
+  if (mem.oomKills && mem.oomKills > 0) return `the kernel OOM-killed it (${mem.text})${quote}`;
+  if (mem.tight) return `memory is nearly exhausted, so the next big allocation dies (${mem.text})${quote}`;
+  // A renderer cannot exhaust a 2.4 GB V8 heap inside a container using 400 MB.
+  // Say so, and name what actually ends a renderer at 5% memory: Chromium's own
+  // process limit (discarding a renderer to stay under `--renderer-process-limit`)
+  // or a SIGSEGV in this build — both fixable without touching the box's size.
+  const { used } = cgroupMemoryMb();
+  if (used !== null && used < v8HeapMb() * 0.8) {
+    return (
+      `NOT memory (${mem.text || "no cgroup limit"}) — the browser ended this renderer on purpose: with ` +
+      `${used} MB used it cannot have reached the ${v8HeapMb()} MB V8 cap, so the suspects are the renderer ` +
+      `process limit, a SIGSEGV in this build, or the site's own anti-debug trap${
+        stealthDietOn() ? " — set STEALTH_SITE_ISOLATION=true to drop the renderer ceiling" : ""
+      }` +
+      quote
+    );
+  }
   return (
-    `NOT a kernel OOM (${mem.text || "no cgroup limit"}) — the renderer ended itself, which on a heavy page ` +
-    `means V8's ${v8HeapMb()} MB heap cap; raise STEALTH_V8_HEAP_MB or give the box more memory`
+    `NOT a kernel OOM (${mem.text}) — the renderer hit its own ceiling; V8's cap is ${v8HeapMb()} MB, raise ` +
+    `STEALTH_V8_HEAP_MB if the page legitimately needs more` +
+    quote
   );
+}
+
+/** Whether the small-container diet is in effect for this launch. */
+function stealthDietOn(): boolean {
+  const { limit } = cgroupMemoryMb();
+  return limit !== null && limit < 3000;
 }
 
 /**
@@ -374,6 +444,12 @@ export class Rig {
 
   private async launchContext(): Promise<BrowserContext> {
     const profile = this.profileDir();
+    // A fresh run's log only — otherwise the next crash quotes the last one.
+    try {
+      fs.writeFileSync(path.join(profile, CHROME_LOG), "");
+    } catch {
+      /* a read-only volume costs us the diagnostic, nothing else */
+    }
     const strays = this.reapStrayBrowsers(profile);
     if (strays) {
       this.status(`Reaping ${strays} orphaned browser process(es) still holding this profile…`);
@@ -398,7 +474,7 @@ export class Rig {
         ...(stealth.headless ? { viewport: { width: 1280, height: 900 } } : {}),
         locale: "en-US",
         timezoneId: stealth.timezone,
-        args: launchArgs(),
+        args: launchArgs(profile),
         // Clearcote persona: one coherent, seed-stable machine identity per platform.
         fingerprint: stealth.seed(this.platform),
         platform: stealth.platform,
@@ -426,7 +502,8 @@ export class Rig {
       const mem = memoryReport();
       this.status(
         `Browser up in ${Math.round((Date.now() - t0) / 100) / 10}s — opening ${START_URLS[this.platform]} ` +
-          `(V8 heap ${v8HeapMb()} MB per renderer${mem.text ? `, ${mem.text}` : ""})`
+          `(V8 heap ${v8HeapMb()} MB/renderer${stealthDietOn() ? ", renderer limit 3 + site isolation off" : ""}` +
+          `${mem.text ? `, ${mem.text}` : ""})`
       );
       // If the browser dies later (OOM kill, crash), drop everything so the
       // next connect relaunches instead of screenshotting a corpse forever.
@@ -536,9 +613,26 @@ export class Rig {
       await dead.close().catch(() => undefined);
       const ctx = this.context;
       if (!ctx) return;
-      // Back off a little if it keeps dying: the 3rd crash in a row on the
-      // same page is not a fluke, and hammering it just thrashes memory.
-      if (this.crashes >= 3) await sleep(4000);
+      // Back off harder as the streak grows: the 3rd crash on the same page is not
+      // a fluke, and relaunching a 600 MB renderer every few seconds is how a
+      // recoverable problem becomes a crash loop the user watches for an hour.
+      if (this.crashes >= 6) {
+        if (this.crashes === 6) {
+          this.broadcast({
+            type: "log",
+            level: "warn",
+            text:
+              `⚠️ ${this.crashes} tab deaths in a row — slowing relaunches to one every 20s. Memory is not the ` +
+              `limit (the numbers are in the line above), so this is the browser's own renderer policy or the ` +
+              `site's anti-automation trap. Chromium's log tail is quoted there; the deck's browser tab is being ` +
+              `kept open so you can act by hand if you want.`,
+            at: Date.now(),
+          });
+        }
+        await sleep(20_000);
+      } else if (this.crashes >= 3) {
+        await sleep(4000);
+      }
       const page = await ctx.newPage();
       await ensureHumanized(page, this.humanizeOpts());
       this.wireControlPage(page);
@@ -643,12 +737,15 @@ export class Rig {
     page.on("crash", () => {
       const url = this.lastUrl || START_URLS[this.platform];
       const mem = memoryReport();
-      const why = crashVerdict(mem);
+      const quoted = chromeLogTail(this.profileDir());
+      const why = crashVerdict(mem, quoted);
       console.error(`[${this.platform}] TAB CRASHED (renderer killed) at ${url} — ${why}`);
       this.broadcast({
         type: "log",
         level: "warn",
-        text: `⚠️ The ${this.platform} tab crashed at ${url.replace(/^https:\/\//, "").slice(0, 48)} — ${why}. Reopening it…`,
+        text: `⚠️ The ${this.platform} tab crashed at ${url.replace(/^https:\/\//, "").slice(0, 48)} — ${why}${
+          stealthDietOn() ? " (memory-diet flags are on: renderer limit 3 + site isolation off)" : ""
+        }. Reopening it…`,
         at: Date.now(),
       });
       this.crashes += 1;
@@ -1188,6 +1285,8 @@ export class Rig {
         return;
       }
       case "auto-verify": {
+        const was = this.autoVerify.on;
+        const wasLabel = this.autoVerify.label;
         this.autoVerify.on = !!cmd.on;
         const label = (cmd.label || "").trim();
         if (label) this.autoVerify.label = label;
@@ -1196,11 +1295,17 @@ export class Rig {
           this.autoVerify.pressed = false;
           this.autoVerify.tries = 0;
         }
-        this.status(
-          this.autoVerify.on
-            ? `Auto-tap armed — I will press "${this.autoVerify.label}" myself when a verification screen is up.`
-            : "Auto-tap disarmed — the deck is back to taps only."
-        );
+        // The deck re-pushes its auto-tap preference on every connect, and while the
+        // browser is crash-looping that is a reconnect every few seconds — an
+        // "armed" line each time, drowning the lines that matter. Say it on a
+        // change, not on a repeat.
+        if (this.autoVerify.on !== was || (this.autoVerify.on && this.autoVerify.label !== wasLabel)) {
+          this.status(
+            this.autoVerify.on
+              ? `Auto-tap armed — I will press "${this.autoVerify.label}" myself when a verification screen is up.`
+              : "Auto-tap disarmed — the deck is back to taps only."
+          );
+        }
         // Not inside this command: pressLabel needs the input lock this very case
         // is holding. A beat later the queue is drained and it is free to act.
         if (this.autoVerify.on) setTimeout(() => void this.maybeAutoVerify(), 700);

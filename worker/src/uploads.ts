@@ -98,6 +98,13 @@ export async function downloadVideo(
     await sleep(2200);
 
     const html = await page.content().catch(() => "");
+    // A renderer that died mid-navigation used to surface as "no video URL in the
+    // page", which reads like a bad link and is not retryable. It is the browser,
+    // the video is still to be had, and the reopen is already under way — so name
+    // it in the words `isTabGone` recognises and let the publish try again.
+    if (!html && (page.isClosed() || !(await page.evaluate(() => true).then(() => true).catch(() => false)))) {
+      throw new Error("The tab has been closed while the source page was opening (it crashed) — waiting for the reopen");
+    }
     const verdict = platform === "youtube" ? youtubePlayability(html) : null;
     if (verdict && verdict.status !== "OK") {
       log(

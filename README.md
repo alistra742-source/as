@@ -226,6 +226,14 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 > kills)"* vs *"NOT a kernel OOM (…4 GB free) — the renderer ended itself, which means V8's 1024 MB heap cap"*.
 > A wrong diagnosis here costs an afternoon of resizing boxes that were never the problem.
 >
+> And the diet itself was a suspect: with `--renderer-process-limit=3`, Chromium
+> **discards** a renderer to stay under the ceiling — "Target crashed" at 399 MB used of an 8000 MB box. So the
+> diet (renderer limit + site isolation off) now applies **only under 3 GB**, and `STEALTH_SITE_ISOLATION=true`
+> overrides either way. Every launch prints which mode it is in, every crash line quotes the tail of Chromium's
+> own log (`--enable-logging=file` → `<profile>/chrome-self.log`), and a verdict that the numbers refute is not
+> printed at all: "NOT memory (7601 MB free) — the browser ended this renderer on purpose". After 6 deaths in a
+> row the reopen backs off to one every 20 s instead of thrashing, and says why once.
+>
 > **A crash cannot leave a second browser alive.** Crash recovery used to *forget* the context
 > (`teardown()`), and the next launch deleted the profile's `SingletonLock` and started **another** Chromium on
 > the same profile dir — memory doubling (321 MB → 601 → 1277 in one log), the two trees fighting over the
