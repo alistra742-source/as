@@ -171,6 +171,13 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 > the box back to confirm text is actually in it. The log says what it chose
 > (`Caption → DIV "Description" (536x120)`), and a miss prints the boxes it *did* see, so the
 > next redesign shows up as a readable line instead of a captionless post.
+>
+> **TikTok's editing-tour popup:** after a file is accepted, Studio sometimes covers the whole
+> editor with **“New editing features added” → “Got it”**. The uploader now finds that exact button
+> inside that exact card and auto-clicks it before caption, audience, and Post. It starts with a
+> normal trusted Playwright click, re-finds the button if React replaces it, verifies the card is
+> gone, and stops with a readable error instead of silently posting behind an overlay if TikTok
+> ignores all bounded attempts.
 
 > **Tap-path note (why a tap on a small row used to do nothing):** a tap travels from a pixel in the
 > deck to a coordinate in a remote page, and three separate things were breaking it. (1) **The

@@ -22,6 +22,7 @@ import {
   type MediaCandidate,
   type SourcePlatform,
 } from "./sourceGrab.js";
+import { TIKTOK_EDITING_TIP_ATTR, markTikTokEditingTipButton } from "./tiktokPrompt.js";
 
 export interface VideoFile {
   name: string;
@@ -256,6 +257,63 @@ function hostOf(url: string): string {
 const TIKTOK_STUDIO_URLS = ["https://www.tiktok.com/upload", "https://www.tiktok.com/tiktokstudio/upload"];
 
 /**
+ * Close the one-time "New editing features added" card that TikTok lays over the
+ * completed upload editor. This is not cosmetic: its backdrop intercepts the
+ * Description, audience and Post presses. The finder in `tiktokPrompt.ts`
+ * requires the local title + exact "Got it" label, so an unrelated acknowledgement
+ * elsewhere in Studio cannot be pressed.
+ *
+ * Start with Playwright's normal trusted pointer click. A React re-render can
+ * replace the marked button between finding and pressing, so each retry finds it
+ * afresh; force and DOM activation are bounded last resorts for this harmless
+ * product-tour acknowledgement. We only report success after the card is no
+ * longer found, and stop the publish rather than blindly posting behind it if all
+ * three paths are ignored.
+ */
+async function dismissTikTokEditingTip(page: Page, log: StepLog): Promise<boolean> {
+  const find = () =>
+    page
+      .evaluate(markTikTokEditingTipButton, [TIKTOK_EDITING_TIP_ATTR] as [string])
+      .catch(() => null);
+
+  let tip = await find();
+  if (!tip) return false;
+  log(`TikTok showed “New editing features added” — auto-clicking “Got it”…`);
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const button = page.locator(`[${TIKTOK_EDITING_TIP_ATTR}="1"]`).first();
+    if (attempt === 0) {
+      await button.scrollIntoViewIfNeeded().catch(() => undefined);
+      await button.click({ timeout: 5000 }).catch(() => undefined);
+    } else if (attempt === 1) {
+      // Still a real trusted mouse event; `force` only skips Playwright's
+      // actionability gate if the fading backdrop confuses its hit test.
+      await button.click({ timeout: 3000, force: true }).catch(() => undefined);
+    } else {
+      // The tour card carries no account action. A direct click is safer than
+      // letting the upload continue with every meaningful control covered.
+      await button.evaluate((el: Element) => (el as HTMLElement).click()).catch(() => undefined);
+    }
+    await sleep(attempt === 0 ? 450 : 650);
+    tip = await find();
+    if (!tip) {
+      log(`✅ Auto-clicked “Got it” — TikTok’s editing-features popup is closed.`);
+      return true;
+    }
+  }
+
+  await page
+    .evaluate((attr) => {
+      for (const el of Array.from(document.querySelectorAll(`[${attr}]`))) el.removeAttribute(attr);
+    }, TIKTOK_EDITING_TIP_ATTR)
+    .catch(() => undefined);
+  throw new Error(
+    `TikTok's “New editing features added” popup stayed open after three “Got it” click attempts — ` +
+      `close it in the live browser, then post again.`
+  );
+}
+
+/**
  * Get to a usable file input on the current page: notice a login wall, wait for
  * the input, and press the button that mounts it when the studio keeps the input
  * hidden inside "Upload video" until it is clicked.
@@ -315,12 +373,16 @@ export async function uploadTikTok(page: Page, video: VideoFile, caption: string
   await page.locator('input[type="file"]').first().setInputFiles({ name: video.name, mimeType: video.mime, buffer: video.buffer });
   log("Video processing in studio…");
   await sleep(4000); // floor: the editor's DOM does not exist until the upload is accepted
+  // The tour card can arrive before the editor beneath it finishes mounting.
+  await dismissTikTokEditingTip(page, log);
   // …then wait for the editor itself. A short clip is ready in under a second and
   // used to sit at this 4 s mark; a long one used to blow past it and have the
   // caption typed into a page that was still showing a progress bar.
   await page
     .waitForFunction(() => !!document.querySelector('div[contenteditable="true"], textarea'), null, { timeout: 40_000 })
     .catch(() => undefined);
+  // It can also be mounted by the same render that adds the Description field.
+  await dismissTikTokEditingTip(page, log);
 
   // The caption is the part that silently vanishes when this is wrong, so it does
   // not get a list of yesterday's selectors: score every editable box on the page
@@ -328,7 +390,16 @@ export async function uploadTikTok(page: Page, video: VideoFile, caption: string
   // redesigns move the box; "the wide contenteditable near the word Description"
   // has survived all of them, and it beats the search input and the comment box
   // (the two decoys) by construction rather than by luck.
-  await typeIntoCaptionEditor(page, caption, log);
+  const captionFilled = await typeIntoCaptionEditor(page, caption, log);
+  if (!captionFilled && (await dismissTikTokEditingTip(page, log))) {
+    // Covers the narrow race where the tip appeared between the pre-caption check
+    // and the click into Description. The first attempt did not land, so fill it
+    // again now that the backdrop is gone instead of publishing captionless.
+    log("Retrying the caption now that TikTok’s popup is out of the way…");
+    await typeIntoCaptionEditor(page, caption, log);
+  }
+  // Close a tip that raced the caption readback before touching audience controls.
+  await dismissTikTokEditingTip(page, log);
 
   // Audience must be “Everyone”. It is TikTok's default; enforce it when the control exists.
   const whoCanView = page.getByText("Who can view this video", { exact: false });
@@ -341,14 +412,25 @@ export async function uploadTikTok(page: Page, video: VideoFile, caption: string
 
   log("Publishing to Everyone…");
   await readingPause(800, 2200); // a human checks the draft before hitting Post
+  // Last-moment guard: if TikTok delayed the tour until the preview/settings
+  // panel hydrated, remove it before the actual Post press as well.
+  await dismissTikTokEditingTip(page, log);
   const postBtn = page.locator('button[data-e2e="post_button"], button:has-text("Post")').last();
-  await postBtn.click({ timeout: 15_000 }).catch(() => undefined);
+  let postPressed = await postBtn.click({ timeout: 15_000 }).then(() => true).catch(() => false);
+  if (!postPressed && (await dismissTikTokEditingTip(page, log))) {
+    postPressed = await postBtn.click({ timeout: 15_000 }).then(() => true).catch(() => false);
+  }
   try {
+    // Check the live URL even after an ambiguous click error: navigation can
+    // detach the button quickly enough for Playwright to reject a click that did
+    // in fact publish.
     await page.waitForURL(/\/video\//, { timeout: 40_000 });
     log("✅ TikTok publish confirmed — video is live, audience Everyone.");
     return { ok: true as const, message: "Published on TikTok" };
   } catch {
-    return { ok: false as const, message: "Posted but confirmation redirect wasn't observed — verify in the browser." };
+    return postPressed
+      ? { ok: false as const, message: "Posted but confirmation redirect wasn't observed — verify in the browser." }
+      : { ok: false as const, message: "TikTok's Post button did not accept the click — check the live studio for a disabled button or another prompt." };
   }
 }
 
