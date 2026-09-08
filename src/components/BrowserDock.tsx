@@ -7,9 +7,11 @@ import {
   Keyboard,
   Loader2,
   Lock,
+  Mail,
   MousePointer2,
   RefreshCw,
   RotateCcw,
+  Sparkles,
   WifiOff,
   X,
 } from "lucide-react";
@@ -26,6 +28,8 @@ import { DemoBrowser } from "./DemoBrowser";
 const TAP_SLOP_PX = 12;
 /** How far it must travel before the deck starts scrolling (CSS px). */
 const SCROLL_START_PX = 5;
+/** The verification method auto-tap picks when the code screen appears. */
+const AUTO_TAP_LABEL = "Email";
 
 export function BrowserDock({ platform }: { platform: Platform }) {
   const session = useDeck((s) => s.rooms[platform].session);
@@ -177,7 +181,7 @@ function LiveViewport({ platform }: { platform: Platform }) {
   // the exact failure) — the deck must never sit on a silent placeholder.
   const [boot, setBoot] = useState<{ text: string; error: boolean } | null>(null);
   const [waitedSec, setWaitedSec] = useState(0);
-  const [toast, setToast] = useState<string | null>(null);
+  const [toast, setToast] = useState<{ text: string; tone: "ok" | "warn" } | null>(null);
 
   useEffect(() => {
     if (!toast) return;
@@ -198,6 +202,13 @@ function LiveViewport({ platform }: { platform: Platform }) {
   /** The screenshot's real pixel size — the box adopts its aspect ratio. */
   const [frameSize, setFrameSize] = useState<{ w: number; h: number } | null>(null);
   const [tapMark, setTapMark] = useState<{ x: number; y: number; at: number } | null>(null);
+  /**
+   * "Tap the verification method for me." When this is on, the worker watches the
+   * page for a "verify it's really you" screen and presses the Email row itself —
+   * by its text, not by a coordinate — so the code screen clears without you
+   * having to land a pixel-accurate tap on a 62 px row through a JPEG.
+   */
+  const [autoTap, setAutoTap] = useState(true);
 
   // The "here is where your press landed" marker is a check, not a decoration —
   // fade it once it has served its purpose.
@@ -239,13 +250,14 @@ function LiveViewport({ platform }: { platform: Platform }) {
         setSession(platform, { url, state: "open", driver: driver ?? null });
       },
       onInputFocus: () => setKbOpen(true),
+      onToast: (text, tone) => setToast({ text, tone }),
       onError: (message) => {
         setLive(platform, { lastError: message });
         // Only browser-level failures replace the picture. A single failed
         // command (e.g. a scroll that hit a crashing tab) is shown as a toast
         // over the stream, which keeps flowing.
         if (/^Command failed/.test(message)) {
-          setToast(message.replace(/^Command failed:\s*/, ""));
+          setToast({ text: message.replace(/^Command failed:\s*/, ""), tone: "warn" });
         } else {
           setBoot({ text: message, error: true });
         }
@@ -268,6 +280,14 @@ function LiveViewport({ platform }: { platform: Platform }) {
   }, [platform, wsUrl, token, attempt]);
 
   useEffect(() => setLive(platform, { connected }), [connected, platform, setLive]);
+
+  // Arm / disarm the worker's auto-tap. Re-sent on every (re)connect because the
+  // deck, not the worker, is what the user is looking at — and nothing should tap
+  // an account while nobody is watching it.
+  useEffect(() => {
+    if (!connected) return;
+    sendBusCmd(platform, { t: "auto-verify", on: autoTap, label: AUTO_TAP_LABEL });
+  }, [connected, autoTap, platform]);
 
   // Seconds spent without a frame — a wall clock beats a spinner that never ends.
   useEffect(() => {
@@ -328,7 +348,7 @@ function LiveViewport({ platform }: { platform: Platform }) {
     const natural = imgRef.current ? { w: imgRef.current.naturalWidth, h: imgRef.current.naturalHeight } : null;
     const frac = pointToPageFraction(box, natural, e.clientX, e.clientY);
     if (!frac) {
-      setToast("That tap landed on the black bar, not on the page");
+      setToast({ text: "That tap landed on the black bar, not on the page — use the buttons above", tone: "warn" });
       return;
     }
     send({ t: "tap", x: frac.x, y: frac.y });
@@ -369,6 +389,44 @@ function LiveViewport({ platform }: { platform: Platform }) {
             <Loader2 className="size-6 animate-spin text-amber-400" />
             <p className="text-sm text-muted">Connecting to your Railway browser worker…</p>
             {room.live.lastError && <p className="max-w-sm px-4 text-xs text-danger-400">{room.live.lastError}</p>}
+          </div>
+        )}
+
+        {connected && (
+          <div className="flex flex-wrap items-center gap-1.5 px-3 pb-1.5 pt-1.5">
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-faint">Tap for me</span>
+            {(["Email", "Password"] as const).map((label) => (
+              <button
+                key={label}
+                disabled={!frame}
+                onClick={() => send({ t: "click-label", label })}
+                title={`Find the "${label}" option on the page and press it — located by its text, not by pixel, so it cannot miss by a few rows.`}
+                className="flex h-6 items-center gap-1 rounded-md border border-line bg-ink-800 px-2 text-[11px] font-semibold text-slate-200 hover:bg-ink-700 active:scale-[0.98] disabled:opacity-40 disabled:hover:bg-ink-800"
+              >
+                {label === "Email" ? <Mail className="size-3 text-amber-300" /> : <Lock className="size-3 text-amber-300" />}
+                {label}
+              </button>
+            ))}
+            <button
+              onClick={() => setAutoTap((v) => !v)}
+              title={
+                autoTap
+                  ? "Watching for a \"verify it's really you\" screen and tapping the Email row itself. Off: nothing is ever tapped for you."
+                  : "Turn this on and the worker taps the Email row itself when a verification screen appears."
+              }
+              className={cn(
+                "flex h-6 items-center gap-1 rounded-md border px-2 text-[11px] font-semibold transition-colors",
+                autoTap ? "border-amber-500/50 bg-amber-400/15 text-amber-300" : "border-line bg-ink-800 text-slate-300 hover:bg-ink-700"
+              )}
+            >
+              <Sparkles className="size-3" />
+              Auto-tap {autoTap ? AUTO_TAP_LABEL : "off"}
+            </button>
+            {frameSize && (
+              <span className="ml-auto font-mono text-[10px] text-faint" title="The page the worker is showing, and the ratio the taps are mapped onto">
+                {frameSize.w}×{frameSize.h}
+              </span>
+            )}
           </div>
         )}
 
@@ -429,8 +487,14 @@ function LiveViewport({ platform }: { platform: Platform }) {
               )}
               {toast && (
                 <div className="pointer-events-none absolute inset-x-0 top-0 flex justify-center pt-2">
-                  <div className="max-w-[90%] truncate rounded-full border border-danger-400/40 bg-ink-950/90 px-3 py-1 text-[11px] text-danger-400">
-                    {toast}
+                  <div
+                    className={cn(
+                      "max-w-[92%] truncate rounded-full border bg-ink-950/90 px-3 py-1 text-[11px]",
+                      toast.tone === "ok" ? "border-signal-400/40 text-signal-300" : "border-danger-400/40 text-danger-400"
+                    )}
+                  >
+                    {toast.tone === "ok" ? "✅ " : "⚠️ "}
+                    {toast.text}
                   </div>
                 </div>
               )}

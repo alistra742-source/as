@@ -12,7 +12,7 @@
 import test from "node:test";
 import vm from "node:vm";
 import assert from "node:assert/strict";
-import { CONTAINER_VIEWPORT_RATIO, INTERACTIVE_SEL, MAX_NUDGE_PX, tapAim, tapProbe } from "../worker/src/tapAim.ts";
+import { CONTAINER_VIEWPORT_RATIO, INTERACTIVE_SEL, MAX_NUDGE_PX, findLabelTarget, tapAim, tapProbe } from "../worker/src/tapAim.ts";
 
 const VIEWPORT = { w: 1280, h: 900 };
 
@@ -31,6 +31,11 @@ function el(tag, rect, { cursor = "auto", attrs = {}, text = "", id = "" } = {})
     __attrs: attrs,
     getBoundingClientRect: () => box,
     getAttribute: (n) => (n in attrs ? attrs[n] : null),
+    setAttribute: (n, v) => {
+      attrs[n] = v;
+    },
+    getClientRects: () => (box.width >= 1 && box.height >= 1 ? [box] : []),
+    scrollIntoView: () => {},
     getRootNode: () => ({}),
     matches(sel) {
       return sel
@@ -65,6 +70,8 @@ function domFor(nodes, { activeElement = null, scrollY = 0 } = {}) {
       elementFromPoint: hit,
       activeElement,
       documentElement: { clientWidth: VIEWPORT.w, clientHeight: VIEWPORT.h },
+      // findLabelTarget walks the DOM the way a person scans a screen.
+      body: { querySelectorAll: () => nodes },
     },
     window: {
       getComputedStyle: (n) => ({ cursor: n?.__cursor ?? "auto" }),
@@ -107,7 +114,7 @@ function verifyModal() {
   title.parentElement = card;
   card.parentElement = backdrop;
   backdrop.parentElement = null;
-  return { backdrop, card, email, password, pwLabel, hairline, next, all: [backdrop, card, title, email, emailIcon, password, pwLabel, hairline, next] };
+  return { backdrop, card, title, email, emailIcon, password, pwLabel, hairline, next, all: [backdrop, card, title, email, emailIcon, password, pwLabel, hairline, next] };
 }
 
 /* --------------------------------- tests --------------------------------- */
@@ -241,4 +248,105 @@ test("the serialized source is self-contained: it runs in a bare realm", () => {
   const report = vm.runInNewContext(`(${tapProbe.toString()})(${JSON.stringify([400, 360, INTERACTIVE_SEL])})`, ctx);
   assert.equal(report.interactive, true, "the report works from its serialized form");
   assert.throws(() => vm.runInNewContext(`(${tapAim.toString()})(${args})`, { window: dom.window }), "…and really does need only document + window");
+});
+
+/* ------------------------- find-by-label (auto-tap) ------------------------ */
+
+// The point of the label path is that no coordinate ever leaves the deck: the
+// page is asked where "Email" is and the press goes to the middle of its answer.
+test("the Email row is found by its text, and the press targets the whole row", () => {
+  const m = verifyModal();
+  const off = withDom(m.all);
+  try {
+    const t = findLabelTarget(["Email", INTERACTIVE_SEL, CONTAINER_VIEWPORT_RATIO]);
+    assert.ok(t, "the modal's first row says 'Email a***2@gmail.com'");
+    assert.ok(t.clickable, "it climbed from the label onto the row that owns the handler");
+    // The Email row is 220..680 x 260..322 in the fixture.
+    assert.deepEqual([t.x, t.y, t.w, t.h], [450, 291, 460, 62]);
+    assert.match(t.label, /email/);
+  } finally { off(); }
+});
+
+test("the Password row is found too, and the two never collide", () => {
+  const m = verifyModal();
+  const off = withDom(m.all);
+  try {
+    const t = findLabelTarget(["Password", INTERACTIVE_SEL, CONTAINER_VIEWPORT_RATIO]);
+    assert.ok(t);
+    assert.equal(t.y, 361, "the Password row's centre, not Email's");
+    assert.equal(t.x, 450);
+  } finally { off(); }
+});
+
+test("a match is only ever the smallest element that says it", () => {
+  // <body> "contains" every label on the page; pressing the middle of the body
+  // would be worse than not pressing at all.
+  const m = verifyModal();
+  const off = withDom(m.all);
+  try {
+    // The <h2> heading (230..500 x 180..215): matched by its own text, and NOT
+    // climbed onto the card around it — the card's centre is nowhere near it.
+    const t = findLabelTarget(["Verify it's really you", INTERACTIVE_SEL, CONTAINER_VIEWPORT_RATIO]);
+    assert.deepEqual([t.x, t.y], [365, 197.5]);
+    assert.equal(findLabelTarget(["totally absent option", INTERACTIVE_SEL, CONTAINER_VIEWPORT_RATIO]), null);
+  } finally { off(); }
+});
+
+test("icon-only controls are matched by their accessible name", () => {
+  const card = el("div", { left: 100, top: 100, right: 700, bottom: 700 });
+  const close = el("svg", { left: 640, top: 120, right: 672, bottom: 152 }, { attrs: { "aria-label": "Close" } });
+  close.setAttribute?.("aria-label", "Close");
+  close.parentElement = card;
+  const off = withDom([card, close]);
+  try {
+    const t = findLabelTarget(["Close", INTERACTIVE_SEL, CONTAINER_VIEWPORT_RATIO]);
+    assert.ok(t, "a control with no text still has a name, and the deck offers Close-style taps too");
+    assert.deepEqual([t.x, t.y], [656, 136]);
+  } finally { off(); }
+});
+
+test("it will not climb into a viewport-filling container", () => {
+  const backdrop = el("div", { left: 0, top: 0, right: VIEWPORT.w, bottom: VIEWPORT.h }, { attrs: { onclick: "dismiss()" } });
+  const text = el("p", { left: 200, top: 200, right: 300, bottom: 224 }, { text: "Email" });
+  text.parentElement = backdrop;
+  const off = withDom([backdrop, text]);
+  try {
+    const t = findLabelTarget(["Email", INTERACTIVE_SEL, CONTAINER_VIEWPORT_RATIO]);
+    assert.ok(t);
+    assert.equal(t.clickable, false, "stays on the label: the backdrop is the page, not the button");
+    assert.deepEqual([t.x, t.y], [250, 212]);
+  } finally { off(); }
+});
+
+test("it scrolls the control into view before answering", () => {
+  const m = verifyModal();
+  let scrolled = 0;
+  m.password.scrollIntoView = () => {
+    scrolled += 1;
+  };
+  const off = withDom(m.all);
+  try {
+    findLabelTarget(["Password", INTERACTIVE_SEL, CONTAINER_VIEWPORT_RATIO]);
+    assert.equal(scrolled, 1, "a row below the fold is useless until it is on screen");
+  } finally { off(); }
+});
+
+test("hidden and zero-size matches are skipped", () => {
+  const hidden = el("div", { left: 0, top: 0, right: 400, bottom: 40 }, { cursor: "pointer", text: "Email" });
+  hidden.getClientRects = () => []; // display:none
+  const off = withDom([hidden]);
+  try {
+    assert.equal(findLabelTarget(["Email", INTERACTIVE_SEL, CONTAINER_VIEWPORT_RATIO]), null);
+  } finally { off(); }
+});
+
+test("the label path is self-contained too — it is stringified into the page", () => {
+  const m = verifyModal();
+  const dom = domFor(m.all);
+  const args = JSON.stringify(["Email", INTERACTIVE_SEL, CONTAINER_VIEWPORT_RATIO]);
+  const out = vm.runInNewContext(`(${findLabelTarget.toString()})(${args})`, {
+    document: dom.document,
+    window: { ...dom.window, innerWidth: VIEWPORT.w, innerHeight: VIEWPORT.h },
+  });
+  assert.ok(out && out.y === 291, "runs with only document + window in scope, exactly as Playwright sends it");
 });

@@ -7,7 +7,7 @@ import type { RemoteCmd, ServerMsg } from "./protocol.js";
 import { Store } from "./store.js";
 import { asHumanPage, humanTap, humanType, jitter, readingPause, sleep, thinkingPause } from "./human.js";
 import { ensureHumanized, humanizeContext, isHumanized } from "./humanizeAttach.js";
-import { CONTAINER_VIEWPORT_RATIO, INTERACTIVE_SEL, MAX_NUDGE_PX, tapAim, tapProbe, type AimResult, type TapReport } from "./tapAim.js";
+import { CONTAINER_VIEWPORT_RATIO, INTERACTIVE_SEL, MAX_NUDGE_PX, findLabelTarget, tapAim, tapProbe, type AimResult, type TapReport } from "./tapAim.js";
 
 /**
  * The rig drives the **Clearcote** browser the **nodriver** way: the binary is
@@ -129,6 +129,60 @@ async function resolveTapPoint(page: Page, x: number, y: number): Promise<AimRes
     .catch(() => null);
 }
 
+/**
+ * Press the visible control that shows `label`, searching every frame of the
+ * page. This is the coordinate-free path: the deck never says "x%, y%", the page
+ * itself returns the box, so the letterbox, the window size, the pixel ratio and
+ * any page zoom simply cannot get in the way. It is also the only path that works
+ * when the control lives inside an iframe (the login/verify screens TikTok and IG
+ * sometimes put in one), because the box is offset by the frame's own position.
+ *
+ * Returns a human-readable verdict: this is a thing the user is told, not a log
+ * line they never see.
+ */
+async function pressLabel(page: Page, rawLabel: string): Promise<{ ok: boolean; detail: string; toast: string; tone: "ok" | "warn" }> {
+  const label = rawLabel.trim();
+  if (!label) return { ok: false, detail: "no label given", toast: "Nothing to tap — no label given", tone: "warn" };
+  const args = [label, INTERACTIVE_SEL, CONTAINER_VIEWPORT_RATIO] as [string, string, number];
+  for (const frame of page.frames()) {
+    // First pass locates it and scrolls it into view; the page settles; the
+    // second pass reads the box that is actually on screen when we press.
+    const first = await frame.evaluate(findLabelTarget, args).catch(() => null);
+    if (!first) continue;
+    await sleep(jitter(120, 260));
+    const t = (await frame.evaluate(findLabelTarget, args).catch(() => null)) ?? first;
+    let ox = 0;
+    let oy = 0;
+    if (frame !== page.mainFrame()) {
+      // A frame detached between the two passes (SPA re-render) is not an error,
+      // it is just not the frame we press: skip it and keep looking.
+      const box = await frame
+        .frameElement()
+        .then((h) => h.boundingBox())
+        .catch(() => null);
+      if (!box) continue;
+      ox = Math.round(box.x);
+      oy = Math.round(box.y);
+    }
+    const x = Math.round(t.x + ox);
+    const y = Math.round(t.y + oy);
+    await humanTap(page, x, y);
+    const where = `${t.w}x${t.h}px box at (${x},${y})${frame === page.mainFrame() ? "" : " via iframe"}`;
+    return {
+      ok: true,
+      detail: `pressed "${label}" — ${t.clickable ? "its own control" : "the label text (the handler above it takes the bubbled click)"} · ${where} · "${t.label}"`,
+      toast: `Tapped "${label}" (${where})`,
+      tone: "ok",
+    };
+  }
+  return {
+    ok: false,
+    detail: `no visible control says "${label}"`,
+    toast: `Nothing on this page says "${label}" — is that screen open?`,
+    tone: "warn",
+  };
+}
+
 export class Rig {
   platform: PlatformKey;
   store: Store;
@@ -162,6 +216,16 @@ export class Rig {
   private lastUrl = "";
   private crashes = 0;
   private recovering = false;
+  /**
+   * "Tap the verification method for me." The code/identity screen is the one
+   * place a login stalls forever when a press does not land — a list of bare
+   * <div> rows, each 62px tall, on a phone. So the deck can hand that screen
+   * over entirely: the worker finds the row by its label and presses it, once
+   * per screen, and only while a socket is connected (nothing taps the user's
+   * account when nobody is watching).
+   */
+  private autoVerify = { on: false, label: "Email", sig: "", pressed: false, tries: 0 };
+  /** The screen signature we last acted on, so one modal = at most a few presses. */
 
   constructor(platform: PlatformKey, store: Store) {
     this.platform = platform;
@@ -484,7 +548,7 @@ export class Rig {
       this.frameTimer = setInterval(() => void this.pushFrame(), Math.max(400, env.frameIntervalMs));
     }
     if (!this.loginTimer) {
-      this.loginTimer = setInterval(() => void this.detectLogin(), 5000);
+      this.loginTimer = setInterval(() => void this.tick(), 5000);
     }
     // Idle drift: a parked, perfectly still session is a bot tell. Small
     // ambient cursor motion + the occasional micro-scroll keep the account
@@ -576,6 +640,62 @@ export class Rig {
     } finally {
       this.shotBusy = false;
     }
+  }
+
+  /** 5 s heartbeat: has the login state changed, and is a verification screen up? */
+  private async tick() {
+    await this.detectLogin();
+    await this.maybeAutoVerify();
+  }
+
+  /**
+   * If the deck armed auto-tap and a "verify it's really you" / choose-a-method
+   * screen is on screen, press the requested method. Deliberately bounded: three
+   * presses per screen then silence, because a modal that ignores three presses
+   * is not an aiming problem, and hammering a login endpoint is how accounts get
+   * flagged.
+   */
+  private async maybeAutoVerify(): Promise<void> {
+    const page = this.control;
+    if (!this.autoVerify.on || !page || page.isClosed() || this.recovering || this.detectBusy) return;
+    if (this.clients.size === 0) return; // never act on an account nobody is watching
+    if (this.pendingCmds > 0) return; // a deck command outranks automation, always
+    const sig = await page
+      .evaluate(() => {
+        const t = (document.body?.innerText || "").replace(/\s+/g, " ");
+        const head = /verify it'?s really you|verify your identity|choose a(?: verification)? method|how should we verify/i.exec(t);
+        if (!head) return "";
+        const low = t.toLowerCase();
+        const methods = ["email", "password", "sms", "text message", "passkey", "security key", "qr code"].filter((k) => low.includes(k));
+        return `${head[0].toLowerCase()}|${methods.join(",")}`;
+      })
+      .catch(() => "");
+    if (!sig) {
+      this.autoVerify.sig = "";
+      this.autoVerify.pressed = false;
+      this.autoVerify.tries = 0; // screen gone — re-arm for the next one
+      return;
+    }
+    if (this.autoVerify.sig !== sig) {
+      this.autoVerify.sig = sig; // a different modal (or the methods changed): fresh budget
+      this.autoVerify.pressed = false;
+      this.autoVerify.tries = 0;
+    }
+    // One press per screen. A second press on the same row is not a retry, it is
+    // a "resend the code" — which rate-limits the endpoint and, on TikTok, can
+    // push the account into another challenge. Only a screen where the row was
+    // never found gets looked at again.
+    if (this.autoVerify.pressed || this.autoVerify.tries >= 3) return;
+    this.autoVerify.tries += 1;
+    const label = this.autoVerify.label;
+    // Same input lock as a deck command: two glides on one page would overwrite
+    // each other's tracked cursor position and the press would land elsewhere.
+    const r = await this.withInput(() => pressLabel(page, label));
+    if (r.ok) this.autoVerify.pressed = true;
+    const n = this.autoVerify.tries;
+    console.log(`[${this.platform}] auto-tap #${n}: ${r.detail}`);
+    this.broadcast({ type: "log", level: r.ok ? "ok" : "warn", text: `${r.ok ? "✅" : "⚠️"} Auto-tap ${label}: ${r.detail}`, at: Date.now() });
+    this.broadcast({ type: "toast", text: r.ok ? `Auto-tapped "${label}" — take it from here` : r.toast, tone: r.tone });
   }
 
   /** Best-effort "am I signed in" detection. Engines pause until this is true. */
@@ -729,6 +849,34 @@ export class Rig {
         await thinkingPause(300, 900);
         await page.goto(cmd.url, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
         return;
+      case "click-label": {
+        // The deck's "tap the Email option" button: locate by visible text, press
+        // its centre. No fraction, no letterbox, no pixel ratio, no zoom.
+        const r = await pressLabel(page, cmd.label);
+        console.log(`[${this.platform}] click-label ${JSON.stringify(cmd.label)} → ${r.detail}`);
+        this.broadcast({ type: "log", level: r.ok ? "ok" : "warn", text: `${r.ok ? "✅" : "⚠️"} ${r.detail}`, at: Date.now() });
+        this.broadcast({ type: "toast", text: r.ok ? `Tapped "${cmd.label.trim()}"` : r.toast, tone: r.tone });
+        return;
+      }
+      case "auto-verify": {
+        this.autoVerify.on = !!cmd.on;
+        const label = (cmd.label || "").trim();
+        if (label) this.autoVerify.label = label;
+        if (!cmd.on) {
+          this.autoVerify.sig = "";
+          this.autoVerify.pressed = false;
+          this.autoVerify.tries = 0;
+        }
+        this.status(
+          this.autoVerify.on
+            ? `Auto-tap armed — I will press "${this.autoVerify.label}" myself when a verification screen is up.`
+            : "Auto-tap disarmed — the deck is back to taps only."
+        );
+        // Not inside this command: pressLabel needs the input lock this very case
+        // is holding. A beat later the queue is drained and it is free to act.
+        if (this.autoVerify.on) setTimeout(() => void this.maybeAutoVerify(), 700);
+        return;
+      }
       case "tap": {
         if (!Number.isFinite(cmd.x) || !Number.isFinite(cmd.y)) throw new Error("A tap needs numeric x/y fractions");
         // Convert the deck's fraction to CSS px through the page's own live

@@ -23,7 +23,11 @@ export type RemoteCmd =
   | { t: "forward" }
   | { t: "reload" }
   | { t: "home" }
-  | { t: "tap"; x: number; y: number } // fraction of viewport 0..1
+  /** Press the visible control showing this text — no coordinates involved. */
+  | { t: "click-label"; label: string }
+  /** Deck-driven: tap the verification method itself when that screen appears. */
+  | { t: "auto-verify"; on: boolean; label?: string }
+  | { t: "tap"; x: number; y: number } // fraction of the displayed frame 0..1
   | { t: "scroll"; dy: number } // px, positive = down
   | { t: "type"; text: string }
   | { t: "key"; key: "Backspace" | "Enter" | "Tab" | "Escape" }
@@ -70,6 +74,7 @@ export type ServerMsg =
   | { type: "log"; level: string; text: string; at: number }
   | { type: "engine"; state: EngineSnapshot }
   | { type: "post-ok"; postId: string; postedAt: number; url: string }
+  | { type: "toast"; text: string; tone: "ok" | "warn" } // a one-line result the deck should show, not just log
   | { type: "input-focused" } // a tap landed on a text field — open the device keyboard
   | { type: "error"; message: string };
 

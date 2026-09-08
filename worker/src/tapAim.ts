@@ -27,6 +27,17 @@ export const CONTAINER_VIEWPORT_RATIO = 0.6;
 
 export type AimResult = { x: number; y: number; label: string; dx: number; dy: number } | null;
 
+/** Where a labelled control is, in this frame's CSS px. */
+export interface LabelTarget {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  label: string;
+  /** False when only the text node was matched — the press relies on bubbling. */
+  clickable: boolean;
+}
+
 /**
  * Where should the press ACTUALLY go?
  *
@@ -153,5 +164,88 @@ export function tapProbe([px, py, sel]: [number, number, string]): TapReport {
     onField: isField(document.activeElement) || isField(at),
     interactive,
     scrollY: window.scrollY,
+  };
+}
+
+/**
+ * Find a control by the TEXT it shows, and say where its centre is — the way a
+ * person finds it, with no pixel maths anywhere in between.
+ *
+ * This exists because a coordinate tap has to survive the letterbox, the window
+ * size, the device pixel ratio and page zoom before it can even reach the right
+ * row. When the deck instead says "press the thing labelled Email", the page
+ * itself answers with the box, and the press cannot miss by construction. It is
+ * also the only path that works when the control is inside an iframe: the caller
+ * runs this per frame and offsets the result by the frame's own box.
+ *
+ * The element is matched by the *smallest* node whose text starts with the label
+ * (so "Email" finds the row's label, not the <body> that contains the word),
+ * then climbed up to the nearest real click target — unless that target is a
+ * viewport-filling container, in which case the label itself is pressed, since
+ * click handlers bubble and React listeners live above it anyway.
+ *
+ * Same rule as `tapAim`: it is stringified into the page, so it closes over
+ * nothing and takes everything (including the container ratio) as arguments.
+ */
+export function findLabelTarget([text, sel, containerRatio]: [string, string, number]): LabelTarget | null {
+  const norm = (s: string | null | undefined) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
+  const want = norm(text);
+  if (!want || !document.body) return null;
+  const vw = window.innerWidth || document.documentElement?.clientWidth || 1280;
+  const vh = window.innerHeight || document.documentElement?.clientHeight || 900;
+  const maxArea = vw * vh * containerRatio;
+  const clickable = (el: Element) => {
+    try {
+      return el.matches(sel) || window.getComputedStyle(el as HTMLElement).cursor === "pointer";
+    } catch {
+      return false;
+    }
+  };
+  let best: HTMLElement | null = null;
+  let bestLen = Infinity;
+  for (const el of Array.from(document.body.querySelectorAll("*"))) {
+    // aria-label / title first: an icon-only control ("Close", "Back") has no
+    // text of its own at all, and those are exactly the deck's other buttons.
+    const t = norm(el.getAttribute("aria-label") || el.getAttribute("title") || el.textContent);
+    // Only ever accept a tighter (shorter-text) match than what we have.
+    if (!t || t.length >= bestLen) continue;
+    // The label at the start, or a short string that contains it. The length cap
+    // is the point: without it <body> "matches" everything and a "find the Email
+    // row" press becomes a press in the middle of the page.
+    if (!t.startsWith(want) && !(t.length <= want.length + 48 && t.includes(want))) continue;
+    if (!el.getClientRects().length) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < 8 || r.height < 8) continue; // hidden, collapsed, or an icon
+    best = el as HTMLElement;
+    bestLen = t.length;
+  }
+  if (!best) return null;
+  // Climb onto the row or button that owns the handler — but only into a parent
+  // that is still recognisably "the thing holding this label". The card around
+  // it and the page behind it are not: their centre is nowhere near the label,
+  // and a press there is a press on the backdrop. If nothing clickable turns up,
+  // the label itself is pressed; a React handler above it still gets the event,
+  // because clicks bubble.
+  let target: HTMLElement = best;
+  let found = clickable(best);
+  for (let hops = 0; !found && hops < 4; hops++) {
+    const parent = target.parentElement;
+    if (!parent) break;
+    const pr = parent.getBoundingClientRect();
+    const cr = target.getBoundingClientRect();
+    if (pr.width > cr.width * 3 || pr.height > cr.height * 3 || pr.width * pr.height > maxArea) break;
+    target = parent;
+    found = clickable(parent);
+  }
+  target.scrollIntoView({ block: "center", inline: "center" });
+  const r = target.getBoundingClientRect();
+  if (r.width < 4 || r.height < 4) return null;
+  return {
+    x: r.left + r.width / 2,
+    y: r.top + r.height / 2,
+    w: Math.round(r.width),
+    h: Math.round(r.height),
+    label: norm(target.getAttribute("aria-label") || target.textContent) || want,
+    clickable: found,
   };
 }

@@ -88,6 +88,11 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 4. Open the app, hit **＋ Live browser** in any room — it auto-connects to the same domain
    and streams the *real* platform in your dock. Click, drag to scroll, tap **Keyboard** to
    type with your phone's keyboard, log in, then hit **Start**.
+5. Stuck on a **"Verify it's really you"** / choose-a-method screen? Use **Tap for me** above
+   the stream: **Email** / **Password** find that row by the text it shows and press its centre
+   (no coordinates at all), and **Auto-tap Email** — on by default while a deck is connected —
+   watches for that screen and clears it by itself. It presses at most three times per screen and
+   never acts with nobody watching; toggle it off in the same row.
 
 > **Input note (why clicks now land):** the Clearcote SDK installs its humanize wrapper via
 > `context.browser()`, which Playwright returns as `null` for persistent contexts — the exact
@@ -116,8 +121,18 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 > clamped never centred, viewport-filling containers ignored so tapping a backdrop to dismiss a modal
 > stays a tap on the backdrop) and logs `tap nudged to "Password" (+0px, 6px)`. Every tap also logs
 > what it hit and whether the page moved under the glide (`tap @ (430,421) → div "Password" … · page
-> moved 240px mid-press`), so a "click did nothing" report is a diagnosable sentence. Both sides of
-> the geometry are unit-tested with no browser: `npm test`.
+> moved 240px mid-press`), so a "click did nothing" report is a diagnosable sentence.
+>
+> And the pixel path is no longer required at all: **Tap for me → Email / Password** and
+> **Auto-tap Email** (`{ t: "click-label" }` / `{ t: "auto-verify" }`, `findLabelTarget` in
+> `worker/src/tapAim.ts`) ask the *page* where the control is and press the middle of the answer —
+> matching the smallest element that says it, climbing to the row that owns the handler, searching
+> every frame so a login screen rendered inside an iframe is found too, and scrolling the row into
+> view before pressing. A tap that has to survive a letterbox, a resized window and a pinch-zoom can
+> miss; a tap that says "press the thing labelled Email" cannot. Auto-tap presses at most three times
+> per screen and only while a deck socket is connected, so nothing ever taps your account unwatched.
+>
+> Both sides of the geometry are unit-tested with no browser: `npm test`.
 
 > **Login identity warning:** the Clearcote persona is fixed per platform and derived from
 > your `WORKER_TOKEN` (`STEALTH_FINGERPRINT` overrides it). Changing either **changes the

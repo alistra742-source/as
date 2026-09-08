@@ -11,6 +11,8 @@ export interface LiveBusHandlers {
   onPostOk: (postId: string, postedAt: number, url: string) => void;
   onReady: (url: string, driver?: DriverInfo) => void;
   onInputFocus: () => void;
+  /** A one-line result worth showing over the stream (a tap that landed or missed). */
+  onToast?: (text: string, tone: "ok" | "warn") => void;
   onError: (message: string) => void;
   onStateChange: (connected: boolean) => void;
 }
@@ -74,6 +76,9 @@ export function connectLive(
           break;
         case "post-ok":
           handlers.onPostOk(msg.postId, msg.postedAt, msg.url);
+          break;
+        case "toast":
+          handlers.onToast?.(msg.text, msg.tone);
           break;
         case "input-focused":
           handlers.onInputFocus();
