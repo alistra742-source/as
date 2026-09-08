@@ -206,6 +206,9 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 > `/tiktokstudio/upload`, clicks the "Upload video" trigger if the `<input type=file>` is mounted lazily, and
 > distinguishes "bounced to a login wall" (re-paste the session cookie) from "no file input at all" (the studio
 > changed layout) — those two need opposite fixes and one vague error message used to cover both.
+> The Session cookie panel has a **Can it post?** button for exactly this: it opens the studio in the streamed
+> tab and reports whether a file input appeared, so "this session cannot write" is a ten-second answer instead
+> of a 40-second publish that ends in a log line.
 >
 > **Signed-in state has hysteresis.** "The avatar is gone" is weak evidence — it is gone during hydration, on
 > a watch page and on a tab that just restarted — so a negative must survive three consecutive looks (≈15 s)

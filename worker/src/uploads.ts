@@ -231,7 +231,7 @@ const TIKTOK_STUDIO_URLS = ["https://www.tiktok.com/upload", "https://www.tiktok
  * the input, and press the button that mounts it when the studio keeps the input
  * hidden inside "Upload video" until it is clicked.
  */
-async function revealTiktokInput(page: Page, log: StepLog): Promise<"found" | "wall" | "missing"> {
+export async function revealTiktokInput(page: Page, log: StepLog): Promise<"found" | "wall" | "missing"> {
   const wall = await page
     .evaluate(() => {
       const u = location.href;
@@ -326,6 +326,53 @@ export async function uploadTikTok(page: Page, video: VideoFile, caption: string
   } catch {
     return { ok: false as const, message: "Posted but confirmation redirect wasn't observed — verify in the browser." };
   }
+}
+
+/**
+ * "May this session post at all?" — the same probe the uploader runs, without the
+ * 40 seconds of downloading first. A publish that dies on the site's own terms
+ * (login wall, checkpoint) is a *session* problem, and the user should find that
+ * out in ten seconds from a button rather than by reading a log line after a
+ * download they did not need.
+ */
+export async function checkUploadAccess(
+  platform: UploadPlatform,
+  page: Page,
+  log: StepLog
+): Promise<{ ok: boolean; verdict: string }> {
+  if (platform === "tiktok") {
+    let wall = false;
+    for (const studio of TIKTOK_STUDIO_URLS) {
+      log(`Checking ${studio.replace("https://www.tiktok.com", "")}…`);
+      await page.goto(studio, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
+      await sleep(2200);
+      const state = await revealTiktokInput(page, log);
+      if (state === "found") return { ok: true, verdict: "the upload studio is open and has a file input — this session can post" };
+      if (state === "wall") wall = true;
+    }
+    return wall
+      ? { ok: false, verdict: "TikTok redirected to a login wall — this session is not signed in for writes; re-paste the cookie or log in once in this tab" }
+      : { ok: false, verdict: "the studio loaded but never mounted a file input — a checkpoint or a layout change is in the way" };
+  }
+
+  const studio = platform === "instagram" ? "https://www.instagram.com/create/select/" : "https://www.youtube.com/upload";
+  log(`Checking ${studio.replace(/^https:\/\/(www\.)?/, "")}…`);
+  await page.goto(studio, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
+  await sleep(2600);
+  const probe = await page
+    .evaluate(() => {
+      const u = location.href;
+      const text = (document.body?.innerText || "").slice(0, 2000);
+      const input = !!document.querySelector('input[type="file"]');
+      const wall = /\/accounts\/login|accounts\.google\.com|\/login|ServiceLogin/i.test(u) || /log in|sign in|enter your password/i.test(text.slice(0, 400));
+      return { url: u, input, wall };
+    })
+    .catch(() => null);
+  if (!probe) return { ok: false, verdict: "the page did not answer" };
+  if (probe.input) return { ok: true, verdict: "the create page has a file input — this session can post" };
+  return probe.wall
+    ? { ok: false, verdict: `bounced to a login page (${probe.url.slice(0, 60)}) — this session is not signed in for writes` }
+    : { ok: false, verdict: `no file input at ${probe.url.slice(0, 60)} — the site is showing a check or its layout changed` };
 }
 
 /* -------------------------------- Instagram -------------------------------- */

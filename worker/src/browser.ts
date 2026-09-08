@@ -5,6 +5,7 @@ import type { BrowserContext, Page } from "playwright-core";
 import { env, stealth, driverInfo, START_URLS, type PlatformKey } from "./config.js";
 import { PROTOCOL_VERSION, type RemoteCmd, type ServerMsg } from "./protocol.js";
 import { Store } from "./store.js";
+import { checkUploadAccess } from "./uploads.js";
 import { asHumanPage, humanTap, humanType, jitter, readingPause, sleep, thinkingPause } from "./human.js";
 import { describePlan, planSessionCookies } from "./sessionCookie.js";
 import { ensureHumanized, humanizeContext, isHumanized } from "./humanizeAttach.js";
@@ -1073,6 +1074,25 @@ export class Rig {
         await thinkingPause(300, 900);
         await page.goto(cmd.url, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
         return;
+      case "check-upload": {
+        // Ten seconds of truth instead of a 40-second publish that ends in a log
+        // line: does the site let this session upload at all?
+        const r = await checkUploadAccess(this.platform, page, (t) => this.status(t));
+        this.broadcast({
+          type: "log",
+          level: r.ok ? "ok" : "warn",
+          text: `${r.ok ? "✅" : "⚠️"} Upload access: ${r.verdict}`,
+          at: Date.now(),
+        });
+        this.broadcast({
+          type: "toast",
+          text: r.ok
+            ? "This session can post — the studio opened and took the file picker"
+            : "TikTok/site is not letting this session post — see the log",
+          tone: r.ok ? "ok" : "warn",
+        });
+        return;
+      }
       case "click-label": {
         // The deck's "tap the Email option" button: locate by visible text, press
         // its centre. No fraction, no letterbox, no pixel ratio, no zoom.

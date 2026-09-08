@@ -24,6 +24,11 @@ export type RemoteCmd =
   | { t: "click-label"; label: string }
   /** Deck-driven: tap the verification method itself when that screen appears. */
   | { t: "auto-verify"; on: boolean; label?: string }
+  /**
+   * Ask the site's upload page whether this session may post at all, and report
+   * that instead of making the user wait through a full publish to find out.
+   */
+  | { t: "check-upload" }
   | { t: "tap"; x: number; y: number }
   | { t: "scroll"; dy: number }
   | { t: "type"; text: string }
@@ -35,7 +40,7 @@ export type RemoteCmd =
    * message is added: the deck then tells the user the worker is behind instead
    * of pressing a button whose command the old worker swallows in silence.
    */
-export const PROTOCOL_VERSION = 6;
+export const PROTOCOL_VERSION = 7;
 
 export type ClientMsg =
   | { type: "auth"; token: string; proto?: number }

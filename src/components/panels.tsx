@@ -6,6 +6,7 @@ import {
   CircleAlert,
   KeyRound,
   Paperclip,
+  ShieldCheck,
   Play,
   Pause,
   Send,
@@ -18,7 +19,7 @@ import { NICHES, NICHE_LABEL } from "../lib/types";
 import { clockTime, compactNumber, countdownLabel, timeAgo } from "../lib/format";
 import { useDeck } from "../state/deck";
 import { Button, Chip, NumberField, Panel, PanelHeader, StatusDot, cn } from "./ui";
-import { sendBusCookie } from "../lib/liveBus";
+import { sendBusCmd, sendBusCookie } from "../lib/liveBus";
 
 /* ------------------------------- Engine panel ------------------------------ */
 
@@ -606,6 +607,27 @@ export function SessionCookiePanel({ room }: { room: Room }) {
             title={live.connected ? "Empty this profile's cookie jar" : "Open the live browser first"}
           >
             Clear
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => {
+              if (!sendBusCmd(p, { t: "check-upload" })) {
+                log("warn", "No worker socket open — there is no browser to check.");
+                return;
+              }
+              log("info", "Asking the upload studio whether this session may post… (it opens in the browser tab)");
+            }}
+            disabled={!live.connected || !loggedIn}
+            title={
+              !live.connected
+                ? "Open the live browser first"
+                : !loggedIn
+                  ? "Sign in first — the studio has to be reached as you"
+                  : "Open the upload page and report whether it lets this session pick a file"
+            }
+          >
+            <ShieldCheck className="size-3.5" /> Can it post?
           </Button>
           <span className="ml-auto whitespace-nowrap font-mono text-[10px] text-faint">
             {installed
