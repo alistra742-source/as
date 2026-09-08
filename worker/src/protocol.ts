@@ -4,9 +4,10 @@
 
 /** What drives the browser on the worker side (shown as a badge in the deck). */
 export interface DriverInfo {
-  engine: "clearcote";
-  /** nodriver-style driving: raw CDP, no WebDriver layer, trusted human input. */
-  drive: "nodriver-cdp";
+  /** Which browser was launched. `playwright` is the default: stock Chromium. */
+  engine: "clearcote" | "playwright";
+  /** How input is sent. Both are raw CDP — no WebDriver layer in either engine. */
+  drive: "nodriver-cdp" | "playwright-cdp";
   humanize: boolean;
   lightStealth: boolean;
   platform: string;
@@ -40,7 +41,7 @@ export type RemoteCmd =
    * message is added: the deck then tells the user the worker is behind instead
    * of pressing a button whose command the old worker swallows in silence.
    */
-export const PROTOCOL_VERSION = 7;
+export const PROTOCOL_VERSION = 8;
 
 export type ClientMsg =
   | { type: "auth"; token: string; proto?: number }

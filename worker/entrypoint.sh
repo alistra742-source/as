@@ -1,7 +1,8 @@
 #!/bin/sh
 # ViralDeck worker entrypoint.
 #
-# Headed-by-default: the Clearcote browser runs under Xvfb (a real X display),
+# Headed-by-default: the browser (stock Chromium via Playwright, or the
+# Clearcote build when BROWSER_ENGINE=clearcote) runs under Xvfb (a real X display),
 # because headed Chrome avoids headless-mode tells. Set STEALTH_HEADLESS=true
 # to run headless and skip Xvfb entirely. (The worker also starts Xvfb itself
 # if it ever finds headed mode without a DISPLAY — this is the primary path.)
@@ -22,7 +23,7 @@ else
   trap 'kill "${XVFB_PID}" 2>/dev/null || true' EXIT
 
   export DISPLAY=":${DISPLAY_NUM}"
-  echo "[viraldeck] headed Clearcote on Xvfb ${DISPLAY} (${SCREEN})"
+  echo "[viraldeck] headed Chromium (${BROWSER_ENGINE:-playwright}) on Xvfb ${DISPLAY} (${SCREEN})"
 fi
 
 # setpriority shim: containers lack CAP_SYS_NICE and the Clearcote DCHECK build

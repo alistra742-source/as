@@ -114,6 +114,10 @@ export function tapAim([px, py, sel, limit, containerRatio]: [number, number, st
 }
 
 export interface TapReport {
+  /** The press resolved to the document itself — the page background, no control. */
+  rootish?: boolean;
+  /** The control found by climbing is a viewport-sized container (a backdrop). */
+  container?: boolean;
   under: string;
   focused: string;
   onField: boolean;
@@ -134,6 +138,12 @@ export function tapProbe([px, py, sel, markAttr]: [number, number, string, strin
   const desc = (n: Element | null) => {
     if (!n) return "nothing";
     const el = n as HTMLElement;
+    const tag = el.tagName.toLowerCase();
+    // The page background has no label worth printing — and its innerText starts
+    // with whatever inline JSON the site happened to put first, which is how a
+    // real log once read `DOM click on html "{"mssdk":{"js":"https://sf16-…"` and
+    // then "did nothing either". Say what it is instead.
+    if (tag === "html" || tag === "body") return `${tag} (page background)`;
     const text = (el.innerText || el.getAttribute("aria-label") || el.getAttribute("placeholder") || "")
       .trim()
       .replace(/\s+/g, " ")
@@ -153,18 +163,45 @@ export function tapProbe([px, py, sel, markAttr]: [number, number, string, strin
   };
   let node: Element | null = at;
   let interactive = false;
+  let rootish = false;
+  let container = false;
   for (let hops = 0; hops < 8 && node; hops++) {
+    // <html> and <body> are checked *before* the selector, because they match
+    // `cursor: pointer` on plenty of real sites and then get escalated against:
+    // a DOM click on the document element can never answer, which is how a log
+    // once ended with `DOM click on html "{"mssdk":…" did nothing either`.
+    if (node.tagName === "HTML" || node.tagName === "BODY") {
+      rootish = true;
+      node = null;
+      break;
+    }
     if (node.matches?.(sel) || window.getComputedStyle(node as HTMLElement).cursor === "pointer") {
+      // A container that is most of the viewport is not a *button*, but it is
+      // still something that answers a click — that is how these modals get
+      // dismissed — so it stays interactive and stays markable, and the log says
+      // what the press will actually do.
+      const b = (node as HTMLElement).getBoundingClientRect?.();
+      if (b && b.width >= window.innerWidth * 0.85 && b.height >= window.innerHeight * 0.6) container = true;
       interactive = true;
       break;
     }
-    node = node.parentElement ?? (node.getRootNode() as ShadowRoot | null)?.host ?? null;
+    const parent = node.parentElement ?? (node.getRootNode() as ShadowRoot | null)?.host ?? null;
+    if (!parent || parent.tagName === "HTML" || parent.tagName === "BODY") {
+      // The press hit a plain node with nothing clickable above it: a dead tap,
+      // and worth saying out loud — but not worth escalating (see above).
+      rootish = true;
+      node = null;
+      break;
+    }
+    node = parent;
   }
   // Leave the control marked so the caller can activate THIS node from the DOM
   // if it turns out the pointer press was ignored. One attribute, removed by
-  // whichever path consumes it (or by the next locate).
+  // whichever path consumes it (or by the next locate). Only for something that
+  // could plausibly answer: a DOM click on the page background is not a fallback,
+  // it is a second way to do nothing.
   let marked = false;
-  if (node) {
+  if (node && (interactive || container)) {
     try {
       node.setAttribute(markAttr, "1");
       marked = true;
@@ -177,6 +214,8 @@ export function tapProbe([px, py, sel, markAttr]: [number, number, string, strin
     focused: desc(document.activeElement),
     onField: isField(document.activeElement) || isField(at),
     interactive,
+    rootish,
+    container,
     marked,
     scrollY: window.scrollY,
   };

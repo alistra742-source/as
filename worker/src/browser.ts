@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { launchPersistentContext, RELEASE } from "clearcote";
+import { browserEngine, dockSize, installStealthLite, launchPlaywrightContext, playwrightChromiumPath } from "./browserLaunch.js";
 import type { BrowserContext, Page } from "playwright-core";
 import { cgroupMemoryMb, env, stealth, driverInfo, START_URLS, v8HeapMb, type PlatformKey } from "./config.js";
 import { PROTOCOL_VERSION, type RemoteCmd, type ServerMsg } from "./protocol.js";
@@ -25,11 +26,15 @@ import {
 } from "./tapAim.js";
 
 /**
- * The rig drives the **Clearcote** browser the **nodriver** way: the binary is
- * launched directly by the Clearcote SDK (no WebDriver / chromedriver layer,
- * `--enable-automation` stripped, engine-level fingerprint spoofing compiled
- * into Chromium's C++), and every input goes out as native trusted events with
- * a human motor persona (`humanize`). No vanilla Chromium is ever launched.
+ * Two engines, one rig. `BROWSER_ENGINE=playwright` (the default) drives stock
+ * Chromium through Playwright; `BROWSER_ENGINE=clearcote` drives the
+ * anti-fingerprint build the nodriver way (binary launched by the SDK, no
+ * chromedriver layer, spoofing compiled into Chromium's C++).
+ *
+ * In both cases input goes out as native trusted CDP events with the human motor
+ * persona from `human.ts`, the profile directory is the same, and everything
+ * below this comment is engine-independent — the switch is a launch decision in
+ * `launchContext()`, not a different code path.
  */
 /**
  * Every flag here is a trade between memory and *stability*, and which side is
@@ -187,6 +192,13 @@ function stealthDietOn(): boolean {
  * first socket — now the deploy log says so on line 5.
  */
 export function browserPreflight(): { ok: boolean; detail: string } {
+  if (browserEngine() === "playwright") {
+    const found = playwrightChromiumPath();
+    return {
+      ok: !!found.path,
+      detail: `stock Chromium (BROWSER_ENGINE=playwright) — ${found.detail}. Persistent profiles in ${env.dataDir}, so a switch to/from clearcote keeps logins.`,
+    };
+  }
   if (process.env.CLEARCOTE_BINARY) {
     const ok = fs.existsSync(process.env.CLEARCOTE_BINARY);
     return { ok, detail: `CLEARCOTE_BINARY=${process.env.CLEARCOTE_BINARY} (${ok ? "present" : "MISSING"})` };
@@ -394,6 +406,51 @@ export class Rig {
    * another computer" and exits instead of starting. Always clear them: this
    * process is the only user of this profile.
    */
+  /**
+   * Stock Chromium through Playwright, on the same profile dir.
+   *
+   * Everything after the launch is shared with the Clearcote path on purpose —
+   * the frame stream, the crash wiring, the humanizer probe, the memory diet — so
+   * the engine choice is a launch decision and nothing else. Switching to this
+   * engine does not log anything out: the persistent profile is identical.
+   */
+  private async launchStockChromium(profile: string, t0: number): Promise<BrowserContext> {
+    const { width, height } = dockSize();
+    try {
+      this.context = await launchPlaywrightContext({
+        profile,
+        headless: stealth.headless,
+        locale: "en-US",
+        timezoneId: stealth.timezone,
+        width,
+        height,
+        logFile: path.join(profile, CHROME_LOG),
+      });
+      await installStealthLite(this.context);
+      this.control = null;
+      // Same call as the Clearcote path: on stock Chromium the SDK wrapper is not
+      // there, this returns false, and `human.ts` carries the input itself.
+      humanizeContext(this.context, this.humanizeOpts());
+      const mem = memoryReport();
+      this.status(
+        `Chromium up in ${Math.round((Date.now() - t0) / 100) / 10}s (Playwright driver, V8 heap ${v8HeapMb()} MB/renderer` +
+          `${stealthDietOn() ? ", renderer limit 3 + site isolation off" : ""}${mem.text ? `, ${mem.text}` : ""}) — opening ${START_URLS[this.platform]}`
+      );
+      this.context.on("close", () => {
+        console.error(`[${this.platform}] browser closed unexpectedly — will relaunch on next connect`);
+        this.lastFatal = "The browser process exited (crash or out-of-memory). Reconnecting will relaunch it.";
+        this.broadcast({ type: "error", message: `Browser exited: ${this.lastFatal}` });
+        this.teardown();
+      });
+      return this.context;
+    } catch (err) {
+      const raw = (err as Error).message || String(err);
+      console.error(`[${this.platform}] Chromium start failed: ${raw}`);
+      this.lastFatal = raw;
+      throw new Error(`Could not launch Chromium: ${raw}`);
+    }
+  }
+
   private clearStaleLocks(profile: string) {
     for (const name of ["SingletonLock", "SingletonSocket", "SingletonCookie"]) {
       try {
@@ -462,6 +519,10 @@ export class Rig {
       `[${this.platform}] launching Clearcote browser (persona: ${stealth.platform}, humanized input: ${stealth.humanize ? "on" : "off"}, light stealth: ${stealth.lightStealth ? "on" : "off"}, profile: ${profile})`
     );
     const t0 = Date.now();
+    const engine = browserEngine();
+    if (engine === "playwright") {
+      return this.launchStockChromium(profile, t0);
+    }
     try {
       this.context = await launchPersistentContext(profile, {
         headless: stealth.headless,
@@ -1366,7 +1427,9 @@ export class Rig {
           await page.evaluate(activityProbe, ["end"] as [ActivityPhase]).catch(() => undefined);
         } else if (!hit.marked) {
           await page.evaluate(activityProbe, ["end"] as [ActivityPhase]).catch(() => undefined);
-          fallback = " · nothing landed on a control, so no DOM fallback was tried";
+          fallback = hit.rootish
+            ? " · nothing above it is a control, so no DOM click was tried (a press here is the page ignoring the tap, not a miss by us)"
+            : " · nothing landed on a control, so no DOM fallback was tried";
         } else {
           const act = await page.evaluate(activateMarked, [TARGET_ATTR] as [string]).catch(() => null);
           await sleep(jitter(240, 420));
@@ -1386,7 +1449,8 @@ export class Rig {
           }
         }
         const where = `tap @ (${x},${y})${m.scale !== 1 ? ` [zoom ${m.scale.toFixed(2)}×]` : ""}`;
-        const summary = `${where} → ${hit.under}${hit.interactive ? "" : " · NOT on an interactive element"}; focus: ${hit.focused}${shifted}${fallback}${isHumanized(page) ? "" : " [PLAIN input]"}`;
+        const kind = hit.interactive ? (hit.container ? " (full-page container: this press dismisses the overlay)" : "") : " · NOT on an interactive element";
+        const summary = `${where} → ${hit.under}${kind}; focus: ${hit.focused}${shifted}${fallback}${isHumanized(page) ? "" : " [PLAIN input]"}`;
         console.log(`[${this.platform}] ${summary}`);
         if (shifted || fallback || !hit.interactive) this.broadcast({ type: "log", level: fallback.includes("worked") ? "ok" : "warn", text: `${fallback.includes("worked") ? "✅" : "⚠️"} ${summary}`, at: Date.now() });
         if (fallback.includes("ignored")) this.broadcast({ type: "toast", text: fallback.includes("worked") ? "Your tap was ignored by the page — activated it from the DOM instead" : "Your tap landed, but the page ignored it", tone: fallback.includes("worked") ? "ok" : "warn" });

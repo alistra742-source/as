@@ -134,15 +134,24 @@ export const stealth = {
   metricsJitterMin: Math.max(0, Number(process.env.STEALTH_METRICS_JITTER_MIN || 4)),
 } as const;
 
-export const driverInfo = (): DriverInfo => ({
-  engine: "clearcote",
-  drive: "nodriver-cdp",
-  humanize: stealth.humanize,
-  lightStealth: stealth.lightStealth,
-  platform: stealth.platform,
-  headless: stealth.headless,
-  timezone: stealth.timezone,
-});
+/**
+ * What the deck badges, and what the deploy log prints. `engine` is the honest
+ * answer to "which browser am I looking at": stock Chromium (the default) or the
+ * Clearcote anti-fingerprint build. `lightStealth` only exists in the latter, so
+ * it is reported false rather than inherited from a knob that does nothing.
+ */
+export const driverInfo = (): DriverInfo => {
+  const stock = (process.env.BROWSER_ENGINE || "playwright").trim().toLowerCase() !== "clearcote";
+  return {
+    engine: stock ? "playwright" : "clearcote",
+    drive: stock ? "playwright-cdp" : "nodriver-cdp",
+    humanize: stealth.humanize,
+    lightStealth: stock ? false : stealth.lightStealth,
+    platform: stealth.platform,
+    headless: stealth.headless,
+    timezone: stealth.timezone,
+  };
+};
 
 export const START_URLS = {
   tiktok: "https://www.tiktok.com/",

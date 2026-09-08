@@ -3,6 +3,7 @@ import { promises as fsp } from "node:fs";
 import path from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 import { env, driverInfo, PLATFORMS, START_URLS, stealth, type PlatformKey } from "./config.js";
+import { BLOCKED_HOSTS, resolverRules } from "./browserLaunch.js";
 import { PROTOCOL_VERSION, type ClientMsg, type ServerMsg } from "./protocol.js";
 import { Store } from "./store.js";
 import { Rig, browserPreflight } from "./browser.js";
@@ -59,7 +60,14 @@ async function serveFrontend(req: http.IncomingMessage, res: http.ServerResponse
     try {
       const data = await fsp.readFile(filePath);
       const type = MIME[path.extname(filePath).toLowerCase()] ?? "application/octet-stream";
-      res.writeHead(200, { "content-type": type, "cache-control": "no-cache" });
+      // Vite fingerprints everything under /assets/, so those URLs can never go
+      // stale — and they were being refetched on every reload at 300 KB a pop,
+      // which shows up as the deck itself being the slow part of a deploy.
+      const immutable = pathname.startsWith("/assets/") && /-[A-Za-z0-9_]{8,}\.[a-z0-9]+$/i.test(pathname);
+      res.writeHead(200, {
+        "content-type": type,
+        "cache-control": immutable ? "public, max-age=31536000, immutable" : "no-cache",
+      });
       res.end(data);
     } catch {
       res.writeHead(404);
@@ -214,10 +222,25 @@ server.listen(env.port, "0.0.0.0", () => {
   console.log(
     `[viraldeck-worker] mode: ${stealth.headless ? "headless" : `headed (DISPLAY=${process.env.DISPLAY || "unset!"})`}, profiles in ${env.dataDir}, frame every ${Math.max(400, env.frameIntervalMs)} ms`
   );
+  // Printed from driverInfo() — the same object the deck badges — so the deploy
+  // log and the UI can never disagree about which browser is actually in use.
+  const d = driverInfo();
   console.log(
-    `[viraldeck-worker] driver: Clearcote browser (${stealth.platform} persona, light stealth: ${stealth.lightStealth ? "on" : "off"}) ` +
-      `driven nodriver-style (raw CDP, trusted humanized input: ${stealth.humanize ? "on" : "off"})`
+    `[viraldeck-worker] driver: ` +
+      (d.engine === "playwright"
+        ? `stock Chromium via Playwright (stealth-lite: automation flag hidden, nothing else faked; ${d.headless ? "headless" : "headed"})`
+        : `Clearcote browser (${d.platform} persona, light stealth: ${d.lightStealth ? "on" : "off"}) driven nodriver-style`) +
+      ` — raw CDP, trusted humanized input: ${d.humanize ? "on" : "off"}`
   );
+  if (d.engine === "playwright") {
+    console.log(
+      `[viraldeck-worker] page load: ` +
+        (resolverRules()
+          ? `DNS-blocking ${BLOCKED_HOSTS.length} ad/analytics/crash-report hosts, service workers blocked, no background networking/extensions/sync`
+          : `tracker blocklist OFF (BLOCK_TRACKERS) — every third-party request will be fetched`) +
+        `, ${d.timezone} locale en-US`
+    );
+  }
   console.log(
     env.groqKey
       ? `[viraldeck-worker] Groq connected (${env.groqModel})`

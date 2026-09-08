@@ -25,7 +25,7 @@ export interface BrowserSession {
   state: SessionState;
   url: string;
   startedAt: number;
-  /** Live sessions only: what drives the remote browser (Clearcote + nodriver-style input). */
+  /** Live sessions only: what drives the remote browser (which Chromium, and how input is sent). */
   driver?: DriverInfo | null;
 }
 

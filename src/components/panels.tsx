@@ -431,7 +431,7 @@ export function WorkerCard({ room }: { room: Room }) {
       <PanelHeader
         icon={<span className="text-base leading-none">🛰</span>}
         title="Browser worker"
-        sub={live.connected ? "Connected — Clearcote stealth browser sessions available" : "Optional — empty = auto-connect to this app's backend"}
+        sub={live.connected ? "Connected — remote browser sessions ready" : "Optional — empty = auto-connect to this app's backend"}
         right={
           live.connected ? (
             <Chip tone="green">● online</Chip>
@@ -468,9 +468,12 @@ export function WorkerCard({ room }: { room: Room }) {
         </div>
         <p className="text-[11px] leading-snug text-muted">
           Deployed as one service, the app serves its own browser backend — leave both fields empty and live
-          mode just works. Set a custom URL/token only when pointing at a separate worker. The worker drives
-          the open-source <span className="text-slate-300">Clearcote</span> anti-fingerprint browser the
-          nodriver way: raw CDP, no WebDriver layer, every click/keypress sent as trusted humanized input.
+          mode just works. Set a custom URL/token only when pointing at a separate worker. The worker launches
+          <span className="text-slate-300"> stock Chromium through Playwright</span> by default (raw CDP, no
+          WebDriver layer, every click/keypress sent as trusted humanized input), and can switch to the
+          <span className="text-slate-300"> Clearcote</span> anti-fingerprint build with
+          <span className="font-mono"> BROWSER_ENGINE=clearcote</span> — same profile dir, so the switch keeps
+          your logins. The dock badge above shows which one is live.
         </p>
       </div>
     </Panel>

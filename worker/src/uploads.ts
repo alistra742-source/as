@@ -1,6 +1,14 @@
 import type { BrowserContext, Page, Response } from "playwright-core";
 import { readingPause, sleep, thinkingPause } from "./human.js";
 import {
+  CANDIDATE_ATTR,
+  CAPTION_MAX_CHARS,
+  CAPTION_SELECTOR,
+  collectEditableBoxes,
+  pickEditableBox,
+  type EditableBox,
+} from "./captionPick.js";
+import {
   candidateFromResponse,
   sizeFloorNote,
   splitByMediaHost,
@@ -92,10 +100,13 @@ export async function downloadVideo(
     );
     await page.goto(sourceUrl, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
     // The player decides its source late, and only once it trusts the browser.
+    // Wait for the player, not for a stopwatch. The old flat 3.5 s sleep made every
+    // publish pay for the slowest page instead of the one it actually got; 150 ms
+    // after the element exists is all the player needs to pick a source.
     await page
       .waitForFunction(() => !!document.querySelector("video"), null, { timeout: 12_000 })
       .catch(() => undefined);
-    await sleep(2200);
+    await sleep(700);
 
     const html = await page.content().catch(() => "");
     // A renderer that died mid-navigation used to surface as "no video URL in the
@@ -282,8 +293,12 @@ export async function uploadTikTok(page: Page, video: VideoFile, caption: string
     lastUrl = studio;
     log(`Opening TikTok upload studio… (${studio.replace("https://www.tiktok.com", "")})`);
     await page.goto(studio, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
-    await sleep(2500);
-    await readingPause(600, 1800);
+    // The studio is a React app: wait for the input itself rather than a fixed
+    // delay, then keep only the short beat that makes it look read before used.
+    await page
+      .waitForFunction(() => !!document.querySelector('input[type="file"]') || /log in|password/i.test(document.body?.innerText?.slice(0, 400) || ""), null, { timeout: 14_000 })
+      .catch(() => undefined);
+    await readingPause(250, 700);
     state = await revealTiktokInput(page, log);
     if (state === "found") break;
   }
@@ -299,30 +314,21 @@ export async function uploadTikTok(page: Page, video: VideoFile, caption: string
   }
   await page.locator('input[type="file"]').first().setInputFiles({ name: video.name, mimeType: video.mime, buffer: video.buffer });
   log("Video processing in studio…");
-  await sleep(4000);
+  await sleep(4000); // floor: the editor's DOM does not exist until the upload is accepted
+  // …then wait for the editor itself. A short clip is ready in under a second and
+  // used to sit at this 4 s mark; a long one used to blow past it and have the
+  // caption typed into a page that was still showing a progress bar.
+  await page
+    .waitForFunction(() => !!document.querySelector('div[contenteditable="true"], textarea'), null, { timeout: 40_000 })
+    .catch(() => undefined);
 
-  // Caption editor — try several known containers.
-  const captionSel = [
-    '[data-e2e="post_caption_editable"]',
-    'div[contenteditable="true"]',
-    'textarea[id*="caption"], textarea[placeholder*="caption" i]',
-  ];
-  let typed = false;
-  for (const sel of captionSel) {
-    const el = page.locator(sel).first();
-    if ((await el.count()) > 0) {
-      try {
-        await el.click({ timeout: 4000 });
-        await thinkingPause(400, 1400); // compose before typing
-        await page.keyboard.type(caption.slice(0, 2200)); // humanized (trusted events, typos auto-corrected)
-        typed = true;
-        break;
-      } catch {
-        /* try next */
-      }
-    }
-  }
-  if (!typed) log("Caption editor not found — posting without a caption (or paste it manually in the studio).");
+  // The caption is the part that silently vanishes when this is wrong, so it does
+  // not get a list of yesterday's selectors: score every editable box on the page
+  // by what labels it and how big it is, then type into the winner. The studio's
+  // redesigns move the box; "the wide contenteditable near the word Description"
+  // has survived all of them, and it beats the search input and the comment box
+  // (the two decoys) by construction rather than by luck.
+  await typeIntoCaptionEditor(page, caption, log);
 
   // Audience must be “Everyone”. It is TikTok's default; enforce it when the control exists.
   const whoCanView = page.getByText("Who can view this video", { exact: false });
@@ -363,7 +369,7 @@ export async function checkUploadAccess(
     for (const studio of TIKTOK_STUDIO_URLS) {
       log(`Checking ${studio.replace("https://www.tiktok.com", "")}…`);
       await page.goto(studio, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
-      await sleep(2200);
+      await sleep(900);
       const state = await revealTiktokInput(page, log);
       if (state === "found") return { ok: true, verdict: "the upload studio is open and has a file input — this session can post" };
       if (state === "wall") wall = true;
@@ -376,7 +382,7 @@ export async function checkUploadAccess(
   const studio = platform === "instagram" ? "https://www.instagram.com/create/select/" : "https://www.youtube.com/upload";
   log(`Checking ${studio.replace(/^https:\/\/(www\.)?/, "")}…`);
   await page.goto(studio, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
-  await sleep(2600);
+  await sleep(1000);
   const probe = await page
     .evaluate(() => {
       const u = location.href;
@@ -393,13 +399,82 @@ export async function checkUploadAccess(
     : { ok: false, verdict: `no file input at ${probe.url.slice(0, 60)} — the site is showing a check or its layout changed` };
 }
 
+/**
+ * Find and fill the studio's description box (see `captionPick.ts` for the why).
+ *
+ * `insertText` (CDP `Input.insertText`) is tried before `keyboard.type` because a
+ * hashtag typed one character at a time opens TikTok's suggestion popup, which
+ * then swallows the following space and truncates the caption — the classic "my
+ * hashtags disappeared". Inserting the whole string and pressing Escape avoids the
+ * popup; per-character typing stays as the fallback for a box that refuses
+ * programmatic text. Every outcome logs something, because the failure mode we are
+ * guarding against is a publish that *succeeds* with no caption.
+ */
+async function typeIntoCaptionEditor(page: Page, caption: string, log: StepLog): Promise<boolean> {
+  const text = (caption || "").trim();
+  if (!text) return false;
+  const boxes = (
+    await page.evaluate(collectEditableBoxes, [CAPTION_SELECTOR, CANDIDATE_ATTR] as [string, string]).catch((): EditableBox[] => [])
+  ) as EditableBox[];
+  const best = pickEditableBox(boxes);
+  if (!best) {
+    const seen = boxes
+      .slice(0, 5)
+      .map((b) => `${b.tag} "${(b.label || "unlabelled").slice(0, 28)}" ${b.width}x${b.height}${b.enabled ? "" : " (disabled)"}`);
+    log(
+      seen.length
+        ? `No box on the page looks like a caption field — posting without one. Editable boxes found: ${seen.join(" · ")}`
+        : "No editable field on the page at all — posting without a caption (a signed-out studio shows exactly this)."
+    );
+    return false;
+  }
+  log(`Caption → ${best.tag} "${(best.label || "no nearby label").slice(0, 32)}" (${best.width}x${best.height})`);
+
+  const box = page.locator(`[${CANDIDATE_ATTR}="${best.id}"]`).first();
+  // A real focus/click first: React editors install their own selection state on
+  // the event, and typing into a focused-but-never-clicked box is how you get an
+  // empty caption with no error anywhere.
+  // Wrapped in Promise.resolve() on purpose: if a driver's locator lacks one of
+  // these methods, the call throws *synchronously* and a bare .catch() never sees
+  // it — which would turn "the caption box was found" into a failed publish.
+  const safe = (fn: () => unknown) => Promise.resolve().then(fn).catch(() => undefined);
+  await safe(() => box.scrollIntoViewIfNeeded());
+  await safe(() => box.click({ timeout: 5000 }));
+  await thinkingPause(220, 600); // read the draft before writing it
+  const written = await page.keyboard
+    .insertText(text.slice(0, CAPTION_MAX_CHARS))
+    .then(() => true)
+    .catch(async () => {
+      await page.keyboard.type(text.slice(0, CAPTION_MAX_CHARS)).catch(() => undefined);
+      return false;
+    });
+  await sleep(220);
+  // Dismiss the hashtag/mention popup so it cannot eat the next keystroke, and so
+  // the studio's own "Post" button is not behind an open suggestion list.
+  await page.keyboard.press("Escape").catch(() => undefined);
+  await page.evaluate((attr) => {
+    for (const el of Array.from(document.querySelectorAll(`[${attr}]`))) el.removeAttribute(attr);
+  }, CANDIDATE_ATTR).catch(() => undefined);
+
+  const shown = await box
+    .evaluate((el: Element) => ((el as HTMLTextAreaElement).value || (el as HTMLElement).innerText || "").trim())
+    .catch(() => "");
+  if (!shown) {
+    log(written ? "Typed into the caption field but it reads back empty — check the live browser before posting." : "The caption field would not accept text — posting without a caption.");
+    return false;
+  }
+  return true;
+}
+
 /* -------------------------------- Instagram -------------------------------- */
 
 export async function uploadInstagram(page: Page, video: VideoFile, caption: string, log: StepLog) {
   log("Opening Instagram create flow…");
   await page.goto("https://www.instagram.com/create/select/", { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
-  await sleep(2500);
-  await readingPause(600, 1800);
+  await page
+    .waitForFunction(() => !!document.querySelector('input[type="file"]'), null, { timeout: 14_000 })
+    .catch(() => undefined);
+  await readingPause(250, 700);
 
   const fileInput = page.locator('input[type="file"]').first();
   try {
@@ -415,17 +490,23 @@ export async function uploadInstagram(page: Page, video: VideoFile, caption: str
     const next = page.locator('div[role="button"]:has-text("Next"), button:has-text("Next")').last();
     if ((await next.count()) === 0) break;
     await next.click({ timeout: 4000 }).catch(() => undefined);
-    await sleep(1500);
+    await sleep(900);
   }
 
-  const captionBox = page.locator('div[role="textbox"]').first();
-  try {
-    await captionBox.waitFor({ state: "visible", timeout: 20_000 });
-    await captionBox.click();
-    await thinkingPause(400, 1400); // compose before typing
-    await page.keyboard.type(caption.slice(0, 2200)); // humanized (trusted events, typos auto-corrected)
-  } catch {
-    log("Caption box not found — continuing without caption.");
+  // Same ranked picker as TikTok: Instagram's caption step is a contenteditable
+  // that has moved around twice, and "first textbox on the page" is what put the
+  // caption into the alt-text field once already. The old path stays as fallback.
+  const filled = await typeIntoCaptionEditor(page, caption, log).catch(() => false);
+  if (!filled) {
+    const captionBox = page.locator('div[role="textbox"]').first();
+    try {
+      await captionBox.waitFor({ state: "visible", timeout: 20_000 });
+      await captionBox.click();
+      await thinkingPause(400, 1400); // compose before typing
+      await page.keyboard.type(caption.slice(0, CAPTION_MAX_CHARS)); // humanized (trusted events, typos auto-corrected)
+    } catch {
+      log("Caption box not found — continuing without caption.");
+    }
   }
 
   // Uncheck "Also post to Facebook" / similar share toggles if shown.
@@ -471,8 +552,10 @@ export async function uploadToPlatform(
 export async function uploadYouTube(page: Page, video: VideoFile, caption: string, log: StepLog) {
   log("Opening YouTube Studio upload flow…");
   await page.goto("https://www.youtube.com/upload", { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
-  await sleep(2500);
-  await readingPause(600, 1800);
+  await page
+    .waitForFunction(() => !!document.querySelector("ytcp-uploads-dialog, input[type='file'], ytcp-create-dialog"), null, { timeout: 16_000 })
+    .catch(() => undefined);
+  await readingPause(250, 700);
 
   const signedOut = await page.evaluate(() => {
     const u = location.href;

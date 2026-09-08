@@ -89,12 +89,30 @@ RUN npm ci --no-audit --no-fund
 COPY . .
 RUN npm run build
 
+# The browser. The default engine is stock Chromium pulled by Playwright into a
+# shared path (/opt/playwright, outside node_modules so `npm prune` cannot reach
+# it). The Clearcote anti-fingerprint build (~150 MB) is opt-in: pass
+# `--build-arg WITH_CLEARCOTE=true` and set BROWSER_ENGINE=clearcote at runtime.
+# Both engines read the SAME persistent profile dir, so switching engines does not
+# log anything out.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright \
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+RUN mkdir -p /opt/playwright && chown -R node:node /opt/playwright
+# `--no-shell` skips the separate headless-shell build: this container runs headed
+# on Xvfb, and if someone flips STEALTH_HEADLESS=true it is better to reuse the
+# same real binary (--headless=new) than to boot a stripped build whose
+# fingerprint screams CI. The env override undoes the skip flag for this one call.
+RUN PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD= npm_config_playwright_skip_browser_download= \
+      node node_modules/playwright-core/cli.js install --no-shell chromium && \
+    chown -R node:node /opt/playwright
+
 # Pre-download + SHA-256-verify the Clearcote browser so deploys never touch
 # GitHub at runtime. Runtime reads it from the same cache dir
 # (CLEARCOTE_CACHE_DIR). Progress is logged so this step is visible in the
 # build output; any failure fails the build with the underlying error.
 ENV CLEARCOTE_CACHE_DIR=/app/.clearcote-browser
-RUN node worker/download-browser.mjs
+ARG WITH_CLEARCOTE=false
+RUN if [ "$WITH_CLEARCOTE" = "true" ]; then node worker/download-browser.mjs; else echo "skipping the Clearcote build (needed only for BROWSER_ENGINE=clearcote)"; fi
 
 # Drop build-only tooling from the final image.
 RUN npm prune --omit=dev
@@ -104,7 +122,8 @@ RUN npm prune --omit=dev
 COPY --from=shim-builder /nice-shim.so /app/nice-shim.so
 
 # Headed under Xvfb by default (the official Clearcote container does the
-# same: headed Chrome avoids headless-mode tells). Set STEALTH_HEADLESS=true
+# same: headed Chrome avoids headless-mode tells, and stock Chromium wants the
+# same treatment — the dock and the tap mapping assume a real window). Set STEALTH_HEADLESS=true
 # to run headless and skip Xvfb. The entrypoint starts Xvfb; as a belt-and-
 # braces fallback the worker also boots Xvfb itself if it finds headed mode
 # without a DISPLAY.
@@ -112,6 +131,7 @@ COPY --from=shim-builder /nice-shim.so /app/nice-shim.so
 # linux host needs a Windows-captured fingerprint profile (see env.example).
 ENV STORAGE_DIR=/app/data \
     NODE_ENV=production \
+    BROWSER_ENGINE=playwright \
     STEALTH_HEADLESS=false \
     STEALTH_PLATFORM=linux \
     STEALTH_NICE_SHIM=/app/nice-shim.so \

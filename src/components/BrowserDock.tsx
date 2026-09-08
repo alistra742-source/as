@@ -72,9 +72,15 @@ function DockToolbar({ platform }: { platform: Platform }) {
           {room.session?.mode === "live" && <Chip tone="green">live worker</Chip>}
           {room.session?.driver && (
             <span
-              title={`Clearcote anti-fingerprint browser · ${room.session.driver.platform} persona · driven nodriver-style over raw CDP · trusted humanized input ${room.session.driver.humanize ? "on" : "off"} · light stealth ${room.session.driver.lightStealth ? "on" : "off"}`}
+              title={
+                room.session.driver.engine === "playwright"
+                  ? `Stock Chromium via Playwright · raw CDP input, humanized glide ${room.session.driver.humanize ? "on" : "off"} · ${room.session.driver.headless ? "headless" : "headed"} · same persistent profile, so switching to BROWSER_ENGINE=clearcote keeps the login`
+                  : `Clearcote anti-fingerprint browser · ${room.session.driver.platform} persona · driven nodriver-style over raw CDP · trusted humanized input ${room.session.driver.humanize ? "on" : "off"} · light stealth ${room.session.driver.lightStealth ? "on" : "off"}`
+              }
             >
-              <Chip tone="violet">🛡 Clearcote · human</Chip>
+              <Chip tone="violet">
+                {room.session.driver.engine === "playwright" ? "⚡ Chromium · human" : "🛡 Clearcote · human"}
+              </Chip>
             </span>
           )}
           {room.session && (
