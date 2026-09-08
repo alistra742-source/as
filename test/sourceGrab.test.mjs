@@ -203,7 +203,7 @@ test("YouTube's own verdict is read before we blame our grab", () => {
 
 test("a full-length video is refused before it is downloaded", () => {
   assert.equal(sizeRejection(5_000_000), null);
-  assert.match(sizeRejection(400 * 1024 * 1024), /over the 180 MB cap/);
+  assert.match(sizeRejection(400 * 1024 * 1024), /over the 120 MB cap/);
 });
 
 /* --------------------- the page's furniture is not the post --------------------- */

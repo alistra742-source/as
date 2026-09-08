@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { launchPersistentContext, RELEASE } from "clearcote";
 import type { BrowserContext, Page } from "playwright-core";
-import { env, stealth, driverInfo, START_URLS, type PlatformKey } from "./config.js";
+import { cgroupMemoryMb, env, stealth, driverInfo, START_URLS, v8HeapMb, type PlatformKey } from "./config.js";
 import { PROTOCOL_VERSION, type RemoteCmd, type ServerMsg } from "./protocol.js";
 import { Store } from "./store.js";
 import { checkUploadAccess } from "./uploads.js";
@@ -31,7 +31,7 @@ import {
  * into Chromium's C++), and every input goes out as native trusted events with
  * a human motor persona (`humanize`). No vanilla Chromium is ever launched.
  */
-const LAUNCH_ARGS = [
+const BASE_LAUNCH_ARGS = [
   // Container runtime needs (the sandbox/uid sandbox and /dev/shm are absent in Docker).
   "--no-sandbox",
   "--disable-dev-shm-usage",
@@ -42,9 +42,9 @@ const LAUNCH_ARGS = [
   // dozens of third-party frames; each would be its own ~50 MB process).
   "--disable-features=IsolateOrigins,site-per-process,ProcessPerSiteUpToMainFrameThreshold",
   "--renderer-process-limit=3",
-  // Cap V8 heap per renderer (MB). Real Chrome sets this itself on low-RAM
-  // devices; it is a hint to the GC, not a visible flag.
-  "--js-flags=--max-old-space-size=384",
+  // Cap on V8's heap per renderer — see `v8HeapMb()`. Too low and a heavy page
+  // aborts its own renderer ("Target crashed", no kernel OOM); too high and the
+  // kernel does the same thing more quietly. Scaled to the container at launch.
   // No GPU process on Xvfb (llvmpipe is CPU anyway): saves ~80-120 MB and
   // one more process that can be OOM-killed. Software compositing stays.
   "--disable-gpu",
@@ -52,6 +52,11 @@ const LAUNCH_ARGS = [
   // kernel kills the whole tab. Merged with the SDK's own feature list.
   "--enable-features=OomIntervention,MemoryPurgeOnFreeze",
 ];
+
+/** The memory-diet args, sized to the container this launch happens in. */
+function launchArgs(): string[] {
+  return [...BASE_LAUNCH_ARGS, `--js-flags=--max-old-space-size=${v8HeapMb()}`];
+}
 
 export interface RigClient {
   send: (msg: ServerMsg) => void;
@@ -78,31 +83,31 @@ const clamp01 = (v: number) => Math.min(1, Math.max(0, v));
  * a cgroup-limited environment. Printed next to every crash so the deploy log
  * answers "was it memory?" without guessing.
  */
-export function memoryReport(): string {
-  const read = (f: string) => {
-    try {
-      return fs.readFileSync(f, "utf8").trim();
-    } catch {
-      return "";
-    }
-  };
-  const mb = (v: string) => (v && v !== "max" ? `${Math.round(Number(v) / 1e6)} MB` : "no limit");
-  // cgroup v2
-  const cur = read("/sys/fs/cgroup/memory.current");
-  if (cur) {
-    const max = read("/sys/fs/cgroup/memory.max");
-    const events = read("/sys/fs/cgroup/memory.events");
-    const kills = /oom_kill (\d+)/.exec(events)?.[1] ?? "?";
-    return `container memory ${mb(cur)} of ${mb(max)}, ${kills} OOM kill(s) so far`;
-  }
-  // cgroup v1
-  const cur1 = read("/sys/fs/cgroup/memory/memory.usage_in_bytes");
-  if (cur1) {
-    const max1 = read("/sys/fs/cgroup/memory/memory.limit_in_bytes");
-    const kills = /oom_kill (\d+)/.exec(read("/sys/fs/cgroup/memory/memory.oom_control"))?.[1] ?? "?";
-    return `container memory ${mb(cur1)} of ${mb(max1)}, ${kills} OOM kill(s) so far`;
-  }
-  return "";
+export function memoryReport(): { text: string; oomKills: number | null; tight: boolean } {
+  const { limit, used, oomKills } = cgroupMemoryMb();
+  if (!used && !limit) return { text: "", oomKills: null, tight: false };
+  const headroom = limit && used ? limit - used : null;
+  const tight = headroom !== null && headroom < 400;
+  const text =
+    `container memory ${used ?? "?"} MB of ${limit ? `${limit} MB` : "no limit"}` +
+    `, kernel OOM kill(s): ${oomKills ?? "unknown"}` +
+    (headroom !== null ? `, ${headroom} MB free` : "");
+  return { text, oomKills, tight };
+}
+
+/**
+ * What killed a renderer, honestly. A kernel OOM kill and a V8 heap abort look
+ * identical from the outside ("Target crashed") and need opposite fixes — more
+ * RAM vs a bigger `--max-old-space-size` — so the log says which one the cgroup
+ * counters support instead of guessing "out-of-memory" every time.
+ */
+function crashVerdict(mem: { text: string; oomKills: number | null; tight: boolean }): string {
+  if (mem.oomKills && mem.oomKills > 0) return `the kernel OOM-killed it (${mem.text})`;
+  if (mem.tight) return `memory is nearly exhausted — the kernel will kill the next big allocation (${mem.text})`;
+  return (
+    `NOT a kernel OOM (${mem.text || "no cgroup limit"}) — the renderer ended itself, which on a heavy page ` +
+    `means V8's ${v8HeapMb()} MB heap cap; raise STEALTH_V8_HEAP_MB or give the box more memory`
+  );
 }
 
 /**
@@ -329,8 +334,51 @@ export class Rig {
     }
   }
 
+  /**
+   * Chromium processes still holding this profile that are not ours.
+   *
+   * Only ever run with no live context, and matched on the profile path — no
+   * other process on the box has that string in its command line, which is what
+   * makes it safe to SIGKILL from here. Without this, one bad crash recovery can
+   * leave a browser alive while the worker launches another on the same profile,
+   * and the box spends the rest of its life OOMing itself.
+   */
+  private reapStrayBrowsers(profile: string): number {
+    if (this.context || this.launching) return 0;
+    let killed = 0;
+    try {
+      for (const entry of fs.readdirSync("/proc")) {
+        if (!/^\d+$/.test(entry)) continue;
+        const pid = Number(entry);
+        if (pid === process.pid) continue;
+        let cmd = "";
+        try {
+          cmd = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8");
+        } catch {
+          continue; // it exited while we looked
+        }
+        if (!cmd.includes(profile)) continue;
+        if (!/chrome|chromium|clearcote|headless_shell|zygote/i.test(cmd)) continue;
+        try {
+          process.kill(pid, "SIGKILL");
+          killed++;
+        } catch {
+          /* already gone */
+        }
+      }
+    } catch {
+      return 0; // no /proc (a mac dev box): nothing to reap
+    }
+    return killed;
+  }
+
   private async launchContext(): Promise<BrowserContext> {
     const profile = this.profileDir();
+    const strays = this.reapStrayBrowsers(profile);
+    if (strays) {
+      this.status(`Reaping ${strays} orphaned browser process(es) still holding this profile…`);
+      await sleep(600); // let the kernel finish releasing them before the next 600 MB
+    }
     this.clearStaleLocks(profile);
     this.lastFatal = null;
     this.status(`Launching the Clearcote browser (${stealth.headless ? "headless" : "headed on Xvfb"}, ${stealth.platform} persona)…`);
@@ -350,7 +398,7 @@ export class Rig {
         ...(stealth.headless ? { viewport: { width: 1280, height: 900 } } : {}),
         locale: "en-US",
         timezoneId: stealth.timezone,
-        args: LAUNCH_ARGS,
+        args: launchArgs(),
         // Clearcote persona: one coherent, seed-stable machine identity per platform.
         fingerprint: stealth.seed(this.platform),
         platform: stealth.platform,
@@ -375,7 +423,11 @@ export class Rig {
       // (context.browser() is null there) — see humanizeAttach.ts. Attach it
       // ourselves so every page really gets humanized, trusted input.
       humanizeContext(this.context, this.humanizeOpts());
-      this.status(`Browser up in ${Math.round((Date.now() - t0) / 100) / 10}s — opening ${START_URLS[this.platform]}`);
+      const mem = memoryReport();
+      this.status(
+        `Browser up in ${Math.round((Date.now() - t0) / 100) / 10}s — opening ${START_URLS[this.platform]} ` +
+          `(V8 heap ${v8HeapMb()} MB per renderer${mem.text ? `, ${mem.text}` : ""})`
+      );
       // If the browser dies later (OOM kill, crash), drop everything so the
       // next connect relaunches instead of screenshotting a corpse forever.
       this.context.on("close", () => {
@@ -504,12 +556,23 @@ export class Rig {
     }
   }
 
-  /** Forget the dead browser without touching sockets. */
+  /**
+   * Forget the dead browser without touching sockets — and take it down with us.
+   *
+   * Dropping the reference alone is how a "crash" turns into a spiral: the next
+   * `ensureContext()` deletes the profile's SingletonLock and launches a *second*
+   * Chromium on the same profile dir, so memory doubles, the two trees fight over
+   * the profile, and every page starts dying. The close is best-effort and not
+   * waited on — if the process is already gone it throws, and the reaper in
+   * `launchContext` cleans up whatever is left.
+   */
   private teardown() {
     this.stopLoops();
     this.shotSession = null;
+    const orphan = this.context;
     this.context = null;
     this.control = null;
+    if (orphan) void orphan.close({ reason: "worker dropped this browser" }).catch(() => undefined);
   }
 
   /**
@@ -580,11 +643,12 @@ export class Rig {
     page.on("crash", () => {
       const url = this.lastUrl || START_URLS[this.platform];
       const mem = memoryReport();
-      console.error(`[${this.platform}] TAB CRASHED (renderer killed) at ${url}${mem ? ` — ${mem}` : ""}`);
+      const why = crashVerdict(mem);
+      console.error(`[${this.platform}] TAB CRASHED (renderer killed) at ${url} — ${why}`);
       this.broadcast({
         type: "log",
         level: "warn",
-        text: `⚠️ The ${this.platform} tab crashed (its renderer process was killed — almost always out-of-memory${mem ? `; ${mem}` : ""}). Reopening it…`,
+        text: `⚠️ The ${this.platform} tab crashed at ${url.replace(/^https:\/\//, "").slice(0, 48)} — ${why}. Reopening it…`,
         at: Date.now(),
       });
       this.crashes += 1;
@@ -593,6 +657,27 @@ export class Rig {
     page.on("framenavigated", (frame) => {
       if (frame === page.mainFrame()) this.lastUrl = frame.url();
     });
+  }
+
+  /**
+   * Wait for a crashed tab to be replaced (or make one if nothing will). A
+   * publish that lost its page mid-flight is recoverable — the video is already
+   * downloaded — but only if it waits for the reopen instead of failing on the
+   * dead target.
+   */
+  async waitForRecovery(maxMs = 25_000): Promise<boolean> {
+    const t0 = Date.now();
+    while (Date.now() - t0 < maxMs) {
+      if (!this.recovering && this.control && !this.control.isClosed()) return true;
+      await sleep(400);
+    }
+    if (this.control && !this.control.isClosed()) return true;
+    try {
+      await this.openControlSession();
+      return !!this.control && !this.control.isClosed();
+    } catch {
+      return false;
+    }
   }
 
   async newEnginePage(): Promise<Page> {

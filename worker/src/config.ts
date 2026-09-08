@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import type { DriverInfo } from "./protocol.js";
 
@@ -22,6 +23,67 @@ export const env = {
  * timing, tremor, typos, thinking pauses). Vanilla Chromium is never
  * launched.
  */
+/**
+ * The cgroup this process actually lives in. `limit` is null when the container is
+ * unbounded (a dev box) — not when the read failed, which is why the shape
+ * distinguishes them. Read once per call, never cached: Railway resizes boxes
+ * without restarting the process, and a stale limit is worse than none.
+ */
+export function cgroupMemoryMb(): { limit: number | null; used: number | null; oomKills: number | null } {
+  const read = (f: string) => {
+    try {
+      return fs.readFileSync(f, "utf8").trim();
+    } catch {
+      return "";
+    }
+  };
+  const bytesToMb = (v: string) => {
+    const n = v && v !== "max" ? Number(v) : NaN;
+    return Number.isFinite(n) && n > 0 ? Math.round(n / 1e6) : null;
+  };
+  const killsFrom = (text: string) => {
+    const m = /oom_kill\s+(\d+)/.exec(text);
+    return m ? Number(m[1]) : null;
+  };
+
+  // cgroup v2 (Railway, and most images since 2021).
+  const cur2 = read("/sys/fs/cgroup/memory.current");
+  if (cur2) {
+    return {
+      used: bytesToMb(cur2),
+      limit: bytesToMb(read("/sys/fs/cgroup/memory.max")),
+      oomKills: killsFrom(read("/sys/fs/cgroup/memory.events")),
+    };
+  }
+  // cgroup v1: "unlimited" is written as an absurd number, not "max".
+  const cur1 = read("/sys/fs/cgroup/memory/memory.usage_in_bytes");
+  if (cur1) {
+    const limit = bytesToMb(read("/sys/fs/cgroup/memory/memory.limit_in_bytes"));
+    return { used: bytesToMb(cur1), limit: limit && limit < 1e9 ? limit : null, oomKills: killsFrom(read("/sys/fs/cgroup/memory/memory.oom_control")) };
+  }
+  return { limit: null, used: null, oomKills: null };
+}
+
+/**
+ * V8's old-space ceiling per renderer, in MB.
+ *
+ * This is a bigger deal than it looks: when a page's JS heap hits it, V8 aborts
+ * the renderer and the tab dies with "Target crashed" — with *no* kernel OOM kill
+ * and gigabytes of container memory free, which is exactly how it looks when
+ * TikTok's upload studio (a heavy SPA that also decodes the file you just handed
+ * it) takes the tab down. A fixed 384 MB was the right answer for a 512 MB
+ * container and a lie for anything bigger, so it scales with the cgroup and can
+ * be pinned with STEALTH_V8_HEAP_MB.
+ */
+export function v8HeapMb(): number {
+  const pin = Number(process.env.STEALTH_V8_HEAP_MB || 0);
+  if (Number.isFinite(pin) && pin >= 64) return Math.round(pin);
+  const { limit } = cgroupMemoryMb();
+  if (!limit) return 1024; // no cgroup limit: be generous, the host has room
+  // ~30% of the box to renderer heaps, in 64 MB steps, never under 512.
+  return Math.max(512, Math.min(2560, Math.round((limit * 0.3) / 64) * 64));
+}
+
 export const stealth = {
   /** Where the SDK caches the verified Clearcote binary. In Docker this is
    * pre-downloaded at build time; locally it defaults to the SDK cache. */

@@ -26,6 +26,17 @@ type StepLog = (text: string) => void;
 export type UploadPlatform = "tiktok" | "instagram" | "youtube";
 
 /**
+ * "The page went away", as opposed to "the site said no". Playwright reports a
+ * crashed or replaced tab as a closed target on whichever call it was on, so this
+ * matches the whole family. Only this kind of failure is worth retrying: the site
+ * refusing a publish will refuse it again.
+ */
+export function isTabGone(err: unknown): boolean {
+  const m = (err as Error)?.message ?? String(err);
+  return /Target (page, context or browser has been )?closed|Target crashed|has been closed|closed while|Execution context was destroyed|page\.reload: Target/i.test(m);
+}
+
+/**
  * Resolve a public video page — TikTok, Instagram or YouTube — to the file that
  * site serves, and download it.
  *

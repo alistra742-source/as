@@ -217,6 +217,29 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 > the log says the real reason (the site ended it because this browser doesn't match the one it came from)
 > instead of blaming the user for being logged out.
 >
+> **The tab that "keeps crashing" was probably never an OOM.** Two failures look identical — the kernel killing a
+> renderer, and V8 aborting one because the page's JS hit `--max-old-space-size` — and only the first shows up in
+> the cgroup OOM counter. The deck's old 384 MB V8 cap was set for a tiny container, and TikTok's upload studio
+> (a heavy SPA that also decodes the file you just handed it) dies at that ceiling with gigabytes free. So: the
+> cap now **scales with the container** (`cgroupMemoryMb()` → ~30% of its memory, 512–2560 MB, pin with
+> `STEALTH_V8_HEAP_MB`), and every crash line says which one it was — *"the kernel OOM-killed it (used/limit, N
+> kills)"* vs *"NOT a kernel OOM (…4 GB free) — the renderer ended itself, which means V8's 1024 MB heap cap"*.
+> A wrong diagnosis here costs an afternoon of resizing boxes that were never the problem.
+>
+> **A crash cannot leave a second browser alive.** Crash recovery used to *forget* the context
+> (`teardown()`), and the next launch deleted the profile's `SingletonLock` and started **another** Chromium on
+> the same profile dir — memory doubling (321 MB → 601 → 1277 in one log), the two trees fighting over the
+> profile, and a page that dies every few seconds forever. `teardown()` now closes the context it drops, and
+> `launchContext` first **reaps any stray Chromium whose command line holds this profile's path** (only when we
+> have no live context of our own; the profile path is the match, so nothing else on the box can be hit) and
+> logs *"Reaping N orphaned browser process(es) still holding this profile…"*.
+>
+> **A publish that loses its tab retries once.** "Manual publish failed: locator.count: Target page, context or
+> browser has been closed" was a *crash* wearing an error: the video was already downloaded, 20 MB of it, and the
+> run died because the reopened tab wasn't ready. `isTabGone` recognises the closed-target family, waits for the
+> recovery (`waitForRecovery`), and re-tries the studio hand-off once. Refusals from the *site* are never
+> retried — the studio will just say no again.
+>
 > Both sides of the geometry, the cookie parser and the source grab are unit-tested with no browser:
 > `npm test`.
 

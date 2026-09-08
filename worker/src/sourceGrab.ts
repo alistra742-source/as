@@ -267,16 +267,22 @@ export function sizeFloorNote(bytes: number): string | null {
   return null;
 }
 
+/** MB, overridable — see `VD_MAX_VIDEO_MB` in worker/env.example. */
+function maxVideoBytes(): number {
+  const pin = Number(process.env.VD_MAX_VIDEO_MB || 0);
+  return Number.isFinite(pin) && pin >= 5 ? Math.round(pin) * 1024 * 1024 : 120 * 1024 * 1024;
+}
+
 /**
  * Hard cap on what we will pull into memory for an upload: the worker runs
  * alongside a 600–900 MB Chromium renderer and a full-length 4K YouTube file is
  * how you get an OOM kill instead of a post.
  */
-export const MAX_VIDEO_BYTES = 180 * 1024 * 1024;
+export const MAX_VIDEO_BYTES = maxVideoBytes();
 
 export function sizeRejection(bytes: number): string | null {
   if (bytes > MAX_VIDEO_BYTES) {
-    return `source video is ${(bytes / 1_048_576).toFixed(0)} MB — over the ${Math.round(MAX_VIDEO_BYTES / 1_048_576)} MB cap. This deck re-posts clips, not full-length videos.`;
+    return `source video is ${(bytes / 1_048_576).toFixed(0)} MB — over the ${(MAX_VIDEO_BYTES / 1_048_576).toFixed(0)} MB cap. This deck re-posts clips, not full-length videos.`;
   }
   return null;
 }

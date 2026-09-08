@@ -4,7 +4,7 @@ import { now } from "./protocol.js";
 import { Store, type WorkerPost } from "./store.js";
 import type { Page } from "playwright-core";
 import { Rig, readVideoStats, scrapeCandidates, scrapeCommentSample } from "./browser.js";
-import { downloadVideo, uploadToPlatform } from "./uploads.js";
+import { downloadVideo, isTabGone, uploadToPlatform } from "./uploads.js";
 import { groqAvailable, interpretMetrics, judgeCandidate, writeCaption } from "./groq.js";
 import { jitter, readingPause, sleep, thinkingPause } from "./human.js";
 
@@ -419,16 +419,31 @@ export class GrowthEngine {
       // Prefer the streamed tab; fall back to a tab of our own when there is none
       // (or one already holds it). Either way the whole run is inside this try, so
       // a throw on the way in still answers the deck instead of hanging the button.
-      const result =
-        (await this.rig.withVisibleTab(publish)).value ??
-        (await (async () => {
-          const own = await this.rig.newEnginePage();
-          try {
-            return await publish(own);
-          } finally {
-            await own.close().catch(() => undefined);
-          }
-        })());
+      const inOwnTab = async () => {
+        const own = await this.rig.newEnginePage();
+        try {
+          return await publish(own);
+        } finally {
+          await own.close().catch(() => undefined);
+        }
+      };
+      const attempt = async () => (await this.rig.withVisibleTab(publish)).value ?? (await inOwnTab());
+      let result: Awaited<ReturnType<typeof attempt>>;
+      try {
+        result = await attempt();
+      } catch (err) {
+        // The tab died under us (a renderer kill at the studio step is the common
+        // one) — but the video is already in memory, so waiting out the reopen and
+        // trying once is far more likely to post than telling the user to press
+        // again. Anything the *site* objected to is not retried.
+        if (!isTabGone(err)) throw err;
+        stage("The tab died mid-publish — waiting for the browser and retrying once…");
+        this.log("warn", `Publish lost its tab (${(err as Error).message}); waiting for the reopen, then trying once more.`);
+        if (!(await this.rig.waitForRecovery())) throw err;
+        await sleep(1200); // the reopened page needs its own moment before a goto
+        result = await attempt();
+        this.log("ok", "Retry after the tab crash got through.");
+      }
       const post: WorkerPost = {
         id: uid(),
         url,
