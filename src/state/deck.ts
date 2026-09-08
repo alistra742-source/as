@@ -597,7 +597,25 @@ export const useDeck = create<DeckState>()(
       },
 
       applyLivePostOk: (p, url) => {
-        get().setComposer(p, { busy: false, error: null });
+        const optimisticId = get().rooms[p].composer.lastPostedId;
+        if (url && optimisticId) {
+          // The optimistic row starts with the source link. Once the worker has a
+          // destination URL, replace it so history/metrics never call the source
+          // video our live upload.
+          set((s) => {
+            const room = s.rooms[p];
+            return {
+              rooms: {
+                ...s.rooms,
+                [p]: {
+                  ...room,
+                  posts: room.posts.map((post) => (post.id === optimisticId ? { ...post, url } : post)),
+                },
+              },
+            };
+          });
+        }
+        get().setComposer(p, { busy: false, error: null, lastPostedId: null });
         get().addLog(p, [
           logEntry("ok", `✅ Live publish confirmed${url ? ` — ${url.slice(0, 72)}` : ""} · audience Everyone.`),
         ]);

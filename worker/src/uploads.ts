@@ -18,6 +18,7 @@ import {
   rankCandidates,
   sizeRejection,
   sourcePlatformOf,
+  tiktokPostId,
   youtubePlayability,
   type MediaCandidate,
   type SourcePlatform,
@@ -33,6 +34,13 @@ export interface VideoFile {
 type StepLog = (text: string) => void;
 
 export type UploadPlatform = "tiktok" | "instagram" | "youtube";
+
+export interface UploadResult {
+  ok: boolean;
+  message: string;
+  /** Destination post URL, only when the studio exposed one after publishing. */
+  liveUrl?: string;
+}
 
 /**
  * "The page went away", as opposed to "the site said no". Playwright reports a
@@ -72,51 +80,238 @@ export async function downloadVideo(
     /* a malformed link gets the failure it deserves below */
   }
 
-  // Watch the wire while the page loads: what the player fetches is, by
-  // definition, a URL that works for this browser at this moment.
+  // Watch both kinds of evidence while each source surface loads:
+  //   1. the media response itself, and
+  //   2. TikTok's item-detail JSON response, which often owns playAddr even when
+  //      React never mounts <video> on the heavy share page.
+  // The old listener kept only (1), then stopped 700 ms after a bare <video>
+  // element appeared. That is why the exact same link could yield 20.6 MB once
+  // and only a 223 KB tour/login asset on the next press.
   const sniffed: MediaCandidate[] = [];
+  const apiCandidates: MediaCandidate[] = [];
+  const apiReads = new Set<Promise<void>>();
+  let sourceId = platform === "tiktok" ? tiktokPostId(sourceUrl) : null;
   const onResponse = (res: Response) => {
     try {
-      if (sniffed.length >= 60) return;
       const status = res.status();
       if (status !== 200 && status !== 206) return;
       const u = res.url();
-      if (!u || u === sourceUrl) return;
-      const lenH = res.headers()["content-length"];
-      const c = candidateFromResponse(u, res.headers()["content-type"] || "", lenH ? Number(lenH) : undefined);
-      if (c) sniffed.push(c);
+      if (!u) return;
+      const headers = res.headers();
+      const lenH = headers["content-length"];
+      const rangeTotal = /\/([0-9]+)$/.exec(headers["content-range"] || "")?.[1];
+      const declared = rangeTotal ? Number(rangeTotal) : lenH ? Number(lenH) : undefined;
+      const candidate = candidateFromResponse(u, headers["content-type"] || "", declared);
+      if (candidate && sniffed.length < 100) sniffed.push(candidate);
+
+      // XHR JSON is not part of page.content(). Keep only the one-item endpoint,
+      // never feed/recommendation JSON (which would let a different video's URL
+      // masquerade as the requested post).
+      if (platform !== "tiktok" || !/\/api\/item\/detail(?:\/|\?)/i.test(u)) return;
+      const responseId = tiktokPostId(u);
+      if (sourceId && responseId && responseId !== sourceId) return;
+      if (!sourceId && responseId) sourceId = responseId;
+      const read = res
+        .text()
+        .then((text) => {
+          if (sourceId && !text.includes(sourceId)) return;
+          for (const url of harvestMediaUrls(text)) apiCandidates.push({ url, from: "page-json", score: 0 });
+        })
+        .catch(() => undefined);
+      apiReads.add(read);
+      void read.finally(() => apiReads.delete(read));
     } catch {
       /* a detached response header set is not worth a failed publish */
     }
   };
   page.on("response", onResponse);
 
-  try {
-    log(
-      platform === "other"
-        ? `Opening source video page…`
-        : `Opening source video page… (${platform} link${
-            platform === "tiktok" ? "" : ` — cross-posting a ${platform} video is fine`
-          })`
-    );
-    await page.goto(sourceUrl, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
-    // The player decides its source late, and only once it trusts the browser.
-    // Wait for the player, not for a stopwatch. The old flat 3.5 s sleep made every
-    // publish pay for the slowest page instead of the one it actually got; 150 ms
-    // after the element exists is all the player needs to pick a source.
-    await page
-      .waitForFunction(() => !!document.querySelector("video"), null, { timeout: 12_000 })
-      .catch(() => undefined);
-    await sleep(700);
+  // All surfaces contribute to one ranked pool. Exact URLs are fetched once;
+  // TikTok's official player / refresh normally supplies a newly signed URL.
+  const candidates: MediaCandidate[] = [];
+  const attemptedUrls = new Set<string>();
+  const tried: MediaCandidate[] = [];
+  // More than the old four so a valid extensionless playAddr cannot sit just
+  // below a few decorative mp4s, but still bounded tightly enough that a page's
+  // related-video JSON can never turn into a broad download crawl.
+  const maxFetches = platform === "tiktok" ? 8 : 6;
+  let lastNote: string | null = null;
+  let lastHtml = "";
 
-    const html = await page.content().catch(() => "");
-    // A renderer that died mid-navigation used to surface as "no video URL in the
-    // page", which reads like a bad link and is not retryable. It is the browser,
-    // the video is still to be had, and the reopen is already under way — so name
-    // it in the words `isTabGone` recognises and let the publish try again.
+  const settleApiReads = async () => {
+    const pending = Array.from(apiReads);
+    if (!pending.length) return;
+    await Promise.race([Promise.allSettled(pending), sleep(1800)]);
+  };
+
+  /** Open one official representation of the same post and collect its evidence. */
+  const inspectSurface = async (url: string, player = false): Promise<string> => {
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
+    sourceId ||= platform === "tiktok" ? tiktokPostId(page.url()) : null;
+
+    // If hydration JSON already contains a media host, do not pay the old 12 s
+    // worst-case wait. Otherwise wait for a *ready/source-bearing* video, not just
+    // an empty element that React inserted before it knew what to play.
+    let earlyHtml = await page.content().catch(() => "");
+    const early = harvestMediaUrls(earlyHtml).map((mediaUrl) => ({ url: mediaUrl, from: "page-json" as const, score: 0 }));
+    const hasEarlyContent = splitByMediaHost(early, platform).kept.length > 0;
+    if (player) {
+      // Wake the official player as soon as its element exists. Waiting for
+      // readyState *before* play() made an idle player burn its full 14 s budget
+      // without ever issuing the media request we were waiting to sniff.
+      await page
+        .waitForFunction(() => !!document.querySelector("video"), null, { timeout: hasEarlyContent ? 2000 : 8000 })
+        .catch(() => undefined);
+      await page
+        .evaluate(() => {
+          const video = document.querySelector("video") as HTMLVideoElement | null;
+          if (!video) return;
+          video.muted = true;
+          void video.play().catch(() => undefined);
+        })
+        .catch(() => undefined);
+    }
+    await page
+      .waitForFunction(
+        () => {
+          const video = document.querySelector("video") as HTMLVideoElement | null;
+          return !!video && (video.readyState >= 1 || !!video.currentSrc || !!video.getAttribute("src"));
+        },
+        null,
+        { timeout: hasEarlyContent ? 3000 : player ? 6000 : 12_000 }
+      )
+      .catch(() => undefined);
+    await sleep(player ? 1100 : 650);
+    await settleApiReads();
+
+    const html = (await page.content().catch(() => "")) || earlyHtml;
     if (!html && (page.isClosed() || !(await page.evaluate(() => true).then(() => true).catch(() => false)))) {
       throw new Error("The tab has been closed while the source page was opening (it crashed) — waiting for the reopen");
     }
+    candidates.push(
+      ...harvestMediaUrls(html).map((mediaUrl) => ({ url: mediaUrl, from: "page-json" as const, score: 0 })),
+      ...(await playerHints(page)),
+      ...apiCandidates,
+      ...sniffed
+    );
+    lastHtml = html;
+    sourceId ||= platform === "tiktok" ? tiktokPostId(page.url()) : null;
+    return html;
+  };
+
+  /** Fetch newly discovered candidates, validating the complete bytes each time. */
+  const fetchAvailable = async (): Promise<VideoFile | null> => {
+    const { kept, dropped } = splitByMediaHost(candidates, platform);
+    const left = maxFetches - tried.length;
+    if (left <= 0) return null;
+    const ranked = rankCandidates(kept, platform, Math.max(24, kept.length))
+      .filter((candidate) => !attemptedUrls.has(candidate.url.split("#")[0]))
+      .slice(0, left);
+    if (!ranked.length) {
+      if (!kept.length && dropped.length) lastNote = describePage(lastHtml) || `${dropped.length} URL(s) were static/login assets`;
+      return null;
+    }
+    log(
+      `${ranked.length} new candidate video URL${ranked.length === 1 ? "" : "s"} from this surface` +
+        `${dropped.length ? ` (${dropped.length} page-asset URL${dropped.length === 1 ? "" : "s"} ignored)` : ""} — fetching in ranked order…`
+    );
+
+    const ua = await page.evaluate(() => navigator.userAgent).catch(() => "");
+    const language = await page.evaluate(() => navigator.language).catch(() => "en-US");
+    const referer = /^https?:/i.test(page.url()) ? page.url() : sourceUrl;
+    let requestOrigin = origin;
+    try {
+      requestOrigin = new URL(referer).origin;
+    } catch {
+      /* keep the validated source origin */
+    }
+    for (const candidate of ranked) {
+      const key = candidate.url.split("#")[0];
+      attemptedUrls.add(key);
+      tried.push(candidate);
+      const n = tried.length;
+      const host = hostOf(candidate.url);
+      const headers: Record<string, string> = {
+        referer,
+        origin: requestOrigin,
+        "user-agent": ua,
+        "accept-language": `${language},en;q=0.8`,
+        accept: "video/mp4,video/webm,video/*;q=0.9,*/*;q=0.5",
+      };
+      // Google's CDN requires an explicit range for a whole-file API request.
+      // TikTok does not: leaving Range off is deliberate, because its CDN can cap
+      // an open-ended range to one playback chunk while a plain GET returns the
+      // complete file (the 20.6 MB success in the report used that path).
+      if (/googlevideo\.com/i.test(candidate.url)) headers.range = "bytes=0-";
+      const resp = await ctx.request
+        .get(candidate.url, { headers, timeout: 120_000 })
+        .catch((error) => ((lastNote = `fetch failed: ${(error as Error).message}`), null));
+      if (!resp) {
+        log(`  · candidate ${n}/${maxFetches} ${host} (${candidate.from}) → ${lastNote}`);
+        continue;
+      }
+      const status = resp.status();
+      if (status !== 200 && status !== 206) {
+        lastNote = `${host} answered HTTP ${status}`;
+        log(`  · candidate ${n}/${maxFetches} ${host} (${candidate.from}) → HTTP ${status}`);
+        continue;
+      }
+      const responseHeaders = resp.headers();
+      const contentRange = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i.exec(responseHeaders["content-range"] || "");
+      const rangeStart = contentRange ? Number(contentRange[1]) : 0;
+      const rangeEnd = contentRange ? Number(contentRange[2]) : -1;
+      const rangeTotal = contentRange && contentRange[3] !== "*" ? Number(contentRange[3]) : 0;
+      const lenH = responseHeaders["content-length"];
+      const declared = rangeTotal || (lenH ? Number(lenH) : 0);
+      const tooBig = sizeRejection(declared);
+      if (tooBig) {
+        lastNote = tooBig;
+        log(`  · candidate ${n}/${maxFetches} ${host} (${candidate.from}) → ${tooBig}`);
+        continue;
+      }
+      const body = await resp.body().catch(() => null);
+      if (!body || body.length < 60_000) {
+        lastNote = `${host} returned ${body ? body.length : 0} bytes — not a video`;
+        log(`  · candidate ${n}/${maxFetches} ${host} (${candidate.from}) → ${lastNote}`);
+        continue;
+      }
+      // Never upload a valid-looking *piece* of an MP4. A first range starts with
+      // ftyp and can easily exceed 300 KB, so byte sniffing alone would bless a
+      // truncated file that TikTok's studio later cannot process.
+      if (rangeTotal && (rangeStart !== 0 || rangeEnd + 1 < rangeTotal)) {
+        lastNote = `${host} returned only bytes ${rangeStart}-${rangeEnd} of ${rangeTotal}`;
+        log(`  · candidate ${n}/${maxFetches} ${host} (${candidate.from}) → partial media range, not the complete clip`);
+        continue;
+      }
+      const floor = sizeFloorNote(body.length);
+      if (floor) {
+        lastNote = `${host}: ${floor}`;
+        log(`  · candidate ${n}/${maxFetches} ${host} (${candidate.from}) → ${floor}`);
+        continue;
+      }
+      if (!looksLikeVideoBytes(body)) {
+        lastNote = `${host} returned a page/error document, not video bytes`;
+        log(`  · candidate ${n}/${maxFetches} ${host} (${candidate.from}) → not a video container`);
+        continue;
+      }
+      const oversize = sizeRejection(body.length);
+      if (oversize) throw new Error(oversize);
+      const mime = (responseHeaders["content-type"] || "video/mp4").split(";")[0];
+      log(`Got complete video (${(body.length / 1_048_576).toFixed(1)} MB) from ${host} — opening the upload studio now.`);
+      return { name: `clip-${Date.now()}.mp4`, mime: mime.includes("video") ? mime : "video/mp4", buffer: body };
+    }
+    return null;
+  };
+
+  try {
+    log(
+      platform === "other"
+        ? "Reading the source video in a temporary background tab…"
+        : `Reading the source video in a temporary background tab… (${platform} link${
+            platform === "tiktok" ? "" : ` — cross-posting a ${platform} video is fine`
+          })`
+    );
+    const html = await inspectSurface(sourceUrl);
     const verdict = platform === "youtube" ? youtubePlayability(html) : null;
     if (verdict && verdict.status !== "OK") {
       log(
@@ -124,82 +319,31 @@ export async function downloadVideo(
           `still trying the URLs the page exposed, but that is usually a bot check on this IP.`
       );
     }
+    lastNote = describePage(html);
+    let video = await fetchAvailable();
+    if (video) return video;
 
-    const candidates: MediaCandidate[] = [
-      ...harvestMediaUrls(html).map((url) => ({ url, from: "page-json" as const, score: 0 })),
-      ...(await playerHints(page)),
-      ...sniffed,
-    ];
-    // The host decides, not the file type: a login wall serves real mp4s (its own
-    // background loop), and those download beautifully and upload as garbage.
-    const { kept, dropped } = splitByMediaHost(candidates, platform);
-    if (!kept.length && dropped.length) {
-      throw new Error(describeGrabFailure(platform, [], describePage(html), dropped.length));
-    }
-    const ranked = rankCandidates(kept, platform);
-    log(
-      ranked.length
-        ? `${ranked.length} candidate video URL${ranked.length === 1 ? "" : "s"} for this ${platform === "other" ? "page" : platform} link` +
-          `${dropped.length ? ` (${dropped.length} more ignored as page assets)` : ""} — fetching the best one…`
-        : `No video URL in the page or on the wire — inspecting what the site actually returned…`
-    );
-    if (!ranked.length) throw new Error(describeGrabFailure(platform, [], describePage(html), dropped.length));
+    if (platform === "tiktok") {
+      sourceId ||= tiktokPostId(page.url(), html);
+      if (sourceId) {
+        log("The share page exposed only previews or unusable URLs — trying TikTok’s official lightweight player for the same post…");
+        await inspectSurface(`https://www.tiktok.com/player/v1/${sourceId}?autoplay=1&controls=0`, true);
+        video = await fetchAvailable();
+        if (video) return video;
+      }
 
-    const ua = await page.evaluate(() => navigator.userAgent).catch(() => "");
-    let lastNote = describePage(html);
-    for (let i = 0; i < ranked.length; i++) {
-      const c = ranked[i];
-      const host = hostOf(c.url);
-      const headers: Record<string, string> = {
-        referer: sourceUrl,
-        origin,
-        "user-agent": ua,
-        accept: "*/*",
-      };
-      // Google's CDN answers 403 to a whole-file request unless a range is asked
-      // for; asking for everything is how you get the whole file back.
-      if (/googlevideo\.com/i.test(c.url)) headers.range = "bytes=0-";
-      const resp = await ctx.request
-        .get(c.url, { headers, timeout: 120_000 })
-        .catch((e) => ((lastNote = `fetch failed: ${(e as Error).message}`), null));
-      if (!resp) continue;
-      const status = resp.status();
-      if (status !== 200 && status !== 206) {
-        lastNote = `${host} answered HTTP ${status}`;
-        log(`  · candidate ${i + 1}/${ranked.length} ${host} → HTTP ${status}`);
-        continue;
-      }
-      const lenH = resp.headers()["content-length"];
-      const declared = lenH ? Number(lenH) : 0;
-      const tooBig = sizeRejection(declared);
-      if (tooBig) {
-        lastNote = tooBig;
-        log(`  · candidate ${i + 1}/${ranked.length} ${host} → ${tooBig}`);
-        continue;
-      }
-      const body = await resp.body().catch(() => null);
-      if (!body || body.length < 60_000) {
-        lastNote = `${host} returned ${body ? body.length : 0} bytes — not a video`;
-        continue;
-      }
-      const floor = sizeFloorNote(body.length);
-      if (floor) {
-        lastNote = `${host}: ${floor}`;
-        log(`  · candidate ${i + 1}/${ranked.length} ${host} → ${floor}`);
-        continue;
-      }
-      if (!looksLikeVideoBytes(body)) {
-        lastNote = `${host} returned a page/error document, not video bytes (bot wall?)`;
-        log(`  · candidate ${i + 1}/${ranked.length} ${host} → not a video container`);
-        continue;
-      }
-      const oversize = sizeRejection(body.length);
-      if (oversize) throw new Error(oversize);
-      const mime = (resp.headers()["content-type"] || "video/mp4").split(";")[0];
-      log(`Got video (${(body.length / 1_048_576).toFixed(1)} MB) from ${host} — ready to publish.`);
-      return { name: `clip-${Date.now()}.mp4`, mime: mime.includes("video") ? mime : "video/mp4", buffer: body };
+      // A fresh document gets fresh time-limited playAddr signatures. This is one
+      // bounded retry, not a loop: if the share page and official player both
+      // refuse the content, hammering them only makes the session less trusted.
+      log("No complete file yet — refreshing the original TikTok post once for fresh media URLs…");
+      await inspectSurface(sourceUrl);
+      video = await fetchAvailable();
+      if (video) return video;
     }
-    throw new Error(describeGrabFailure(platform, ranked, lastNote));
+
+    const { dropped } = splitByMediaHost(candidates, platform);
+    const uniqueDropped = rankCandidates(dropped, platform, Math.max(24, dropped.length)).length;
+    throw new Error(describeGrabFailure(platform, tried, lastNote || describePage(lastHtml), uniqueDropped));
   } finally {
     page.off("response", onResponse);
   }
@@ -318,18 +462,24 @@ async function dismissTikTokEditingTip(page: Page, log: StepLog): Promise<boolea
  * the input, and press the button that mounts it when the studio keeps the input
  * hidden inside "Upload video" until it is clicked.
  */
-export async function revealTiktokInput(page: Page, log: StepLog): Promise<"found" | "wall" | "missing"> {
+export async function revealTiktokInput(page: Page, log: StepLog): Promise<"found" | "wall" | "wrong-page" | "missing"> {
   const wall = await page
     .evaluate(() => {
       const u = location.href;
       const text = (document.body?.innerText || "").slice(0, 1500);
       const login = /\/login|passport|\/accounts\//i.test(u) || /log in to continue|phone or email|sign up to continue/i.test(text);
-      return { url: u, login, hasInput: !!document.querySelector('input[type="file"]') };
+      const at = new URL(u);
+      const studio = /\/((tiktokstudio|creator-center)\/)?upload(?:[/?#]|$)/i.test(at.pathname + at.search);
+      return { url: u, login, studio, hasInput: !!document.querySelector('input[type="file"]') };
     })
     .catch(() => null);
   if (wall?.login && !wall.hasInput) {
     log(`TikTok redirected to a login wall at ${wall.url.slice(0, 60)}`);
     return "wall";
+  }
+  if (wall && !wall.studio) {
+    log(`TikTok did not enter its upload studio — navigation stayed at ${wall.url.slice(0, 70)}`);
+    return "wrong-page";
   }
   const input = page.locator('input[type="file"]').first();
   if ((await input.count()) > 0) return "found";
@@ -344,9 +494,10 @@ export async function revealTiktokInput(page: Page, log: StepLog): Promise<"foun
   return "missing";
 }
 
-export async function uploadTikTok(page: Page, video: VideoFile, caption: string, log: StepLog) {
-  let state: "found" | "wall" | "missing" = "missing";
+export async function uploadTikTok(page: Page, video: VideoFile, caption: string, log: StepLog): Promise<UploadResult> {
+  let state: "found" | "wall" | "wrong-page" | "missing" = "missing";
   let lastUrl = "";
+  let lastActualUrl = "";
   for (const studio of TIKTOK_STUDIO_URLS) {
     lastUrl = studio;
     log(`Opening TikTok upload studio… (${studio.replace("https://www.tiktok.com", "")})`);
@@ -358,16 +509,26 @@ export async function uploadTikTok(page: Page, video: VideoFile, caption: string
       .catch(() => undefined);
     await readingPause(250, 700);
     state = await revealTiktokInput(page, log);
+    lastActualUrl = page.url();
     if (state === "found") break;
+  }
+  if (state === "wall") {
+    throw new Error(
+      `TikTok bounced the upload to a login wall (${lastUrl}) — this browser's session is not accepted any more. ` +
+        `Re-paste the session cookie in the deck, or log in once in the live browser, then post again.`
+    );
+  }
+  if (state === "wrong-page") {
+    throw new Error(
+      `TikTok did not enter either upload-studio URL; navigation remained at ${lastActualUrl.slice(0, 90)}. ` +
+        `No file was attached and nothing was posted.`
+    );
   }
   if (state !== "found") {
     throw new Error(
-      state === "wall"
-        ? `TikTok bounced the upload to a login wall (${lastUrl}) — this browser's session is not accepted any more. ` +
-          `Re-paste the session cookie in the deck, or log in once in the live browser, then post again.`
-        : `TikTok's studio never showed a file input at ${lastUrl.replace("https://www.tiktok.com", "")} — the page is ` +
-          `either challenging this session or its layout changed. Open the studio in the live browser to see which, ` +
-          `then post again (the video is already downloaded).`
+      `TikTok's studio loaded without a file input at ${lastUrl.replace("https://www.tiktok.com", "")} — ` +
+        `this session is not signed in there. Re-paste the session cookie or sign in once in the live studio, ` +
+        `then post again (the video is already downloaded).`
     );
   }
   await page.locator('input[type="file"]').first().setInputFiles({ name: video.name, mimeType: video.mime, buffer: video.buffer });
@@ -415,6 +576,7 @@ export async function uploadTikTok(page: Page, video: VideoFile, caption: string
   // Last-moment guard: if TikTok delayed the tour until the preview/settings
   // panel hydrated, remove it before the actual Post press as well.
   await dismissTikTokEditingTip(page, log);
+  const studioUrlBeforePost = page.url();
   const postBtn = page.locator('button[data-e2e="post_button"], button:has-text("Post")').last();
   let postPressed = await postBtn.click({ timeout: 15_000 }).then(() => true).catch(() => false);
   if (!postPressed && (await dismissTikTokEditingTip(page, log))) {
@@ -424,9 +586,13 @@ export async function uploadTikTok(page: Page, video: VideoFile, caption: string
     // Check the live URL even after an ambiguous click error: navigation can
     // detach the button quickly enough for Playwright to reject a click that did
     // in fact publish.
-    await page.waitForURL(/\/video\//, { timeout: 40_000 });
-    log("✅ TikTok publish confirmed — video is live, audience Everyone.");
-    return { ok: true as const, message: "Published on TikTok" };
+    await page.waitForURL(
+      (url) => /\/video\//i.test(url.pathname) && url.href !== studioUrlBeforePost,
+      { timeout: 40_000 }
+    );
+    const liveUrl = page.url();
+    log(`✅ TikTok publish confirmed — ${liveUrl.slice(0, 90)} · audience Everyone.`);
+    return { ok: true, message: "Published on TikTok", liveUrl };
   } catch {
     return postPressed
       ? { ok: false as const, message: "Posted but confirmation redirect wasn't observed — verify in the browser." }
@@ -448,6 +614,7 @@ export async function checkUploadAccess(
 ): Promise<{ ok: boolean; verdict: string }> {
   if (platform === "tiktok") {
     let wall = false;
+    let wrongPage = "";
     for (const studio of TIKTOK_STUDIO_URLS) {
       log(`Checking ${studio.replace("https://www.tiktok.com", "")}…`);
       await page.goto(studio, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
@@ -455,10 +622,15 @@ export async function checkUploadAccess(
       const state = await revealTiktokInput(page, log);
       if (state === "found") return { ok: true, verdict: "the upload studio is open and has a file input — this session can post" };
       if (state === "wall") wall = true;
+      if (state === "wrong-page") wrongPage = page.url();
     }
-    return wall
-      ? { ok: false, verdict: "TikTok redirected to a login wall — this session is not signed in for writes; re-paste the cookie or log in once in this tab" }
-      : { ok: false, verdict: "the studio loaded but never mounted a file input — a checkpoint or a layout change is in the way" };
+    if (wall) {
+      return { ok: false, verdict: "TikTok redirected to a login wall — this session is not signed in for writes; re-paste the cookie or log in once in this tab" };
+    }
+    if (wrongPage) {
+      return { ok: false, verdict: `TikTok did not enter its upload studio and stayed at ${wrongPage.slice(0, 70)} — no upload control was used` };
+    }
+    return { ok: false, verdict: "the studio loaded without a file input — this session is not signed in there; re-paste the cookie or sign in once in Studio" };
   }
 
   const studio = platform === "instagram" ? "https://www.instagram.com/create/select/" : "https://www.youtube.com/upload";
@@ -550,7 +722,7 @@ async function typeIntoCaptionEditor(page: Page, caption: string, log: StepLog):
 
 /* -------------------------------- Instagram -------------------------------- */
 
-export async function uploadInstagram(page: Page, video: VideoFile, caption: string, log: StepLog) {
+export async function uploadInstagram(page: Page, video: VideoFile, caption: string, log: StepLog): Promise<UploadResult> {
   log("Opening Instagram create flow…");
   await page.goto("https://www.instagram.com/create/select/", { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
   await page
@@ -604,8 +776,9 @@ export async function uploadInstagram(page: Page, video: VideoFile, caption: str
   await share.click({ timeout: 15_000 }).catch(() => undefined);
   try {
     await page.waitForURL(/\/(p|reel)\//, { timeout: 40_000 });
-    log("✅ Instagram publish confirmed — reel is live.");
-    return { ok: true as const, message: "Published on Instagram" };
+    const liveUrl = page.url();
+    log(`✅ Instagram publish confirmed — ${liveUrl.slice(0, 90)}.`);
+    return { ok: true, message: "Published on Instagram", liveUrl };
   } catch {
     return { ok: false as const, message: "Posted but confirmation redirect wasn't observed — verify in the browser." };
   }
@@ -617,7 +790,7 @@ export async function uploadToPlatform(
   video: VideoFile,
   caption: string,
   log: StepLog
-) {
+): Promise<UploadResult> {
   if (platform === "tiktok") return uploadTikTok(page, video, caption, log);
   if (platform === "youtube") return uploadYouTube(page, video, caption, log);
   return uploadInstagram(page, video, caption, log);
@@ -631,7 +804,7 @@ export async function uploadToPlatform(
  * are best-effort like the TikTok/IG uploaders and change over time; failures
  * log loudly and can always be finished by hand in the live browser.
  */
-export async function uploadYouTube(page: Page, video: VideoFile, caption: string, log: StepLog) {
+export async function uploadYouTube(page: Page, video: VideoFile, caption: string, log: StepLog): Promise<UploadResult> {
   log("Opening YouTube Studio upload flow…");
   await page.goto("https://www.youtube.com/upload", { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
   await page

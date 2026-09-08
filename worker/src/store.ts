@@ -11,7 +11,10 @@ export interface MetricCheck {
 
 export interface WorkerPost {
   id: string;
+  /** Confirmed destination URL when the studio exposes it. */
   url: string;
+  /** Original clip page; kept separately so it is never presented as the live post. */
+  sourceUrl?: string;
   caption: string;
   niche: string;
   source: "manual" | "ai";

@@ -514,12 +514,17 @@ export class Rig {
     }
     this.clearStaleLocks(profile);
     this.lastFatal = null;
-    this.status(`Launching the Clearcote browser (${stealth.headless ? "headless" : "headed on Xvfb"}, ${stealth.platform} persona)…`);
-    console.log(
-      `[${this.platform}] launching Clearcote browser (persona: ${stealth.platform}, humanized input: ${stealth.humanize ? "on" : "off"}, light stealth: ${stealth.lightStealth ? "on" : "off"}, profile: ${profile})`
-    );
-    const t0 = Date.now();
     const engine = browserEngine();
+    if (engine === "playwright") {
+      this.status(`Launching stock Chromium through Playwright (${stealth.headless ? "headless" : "headed on Xvfb"})…`);
+      console.log(`[${this.platform}] launching stock Chromium via Playwright (profile: ${profile})`);
+    } else {
+      this.status(`Launching the Clearcote browser (${stealth.headless ? "headless" : "headed on Xvfb"}, ${stealth.platform} persona)…`);
+      console.log(
+        `[${this.platform}] launching Clearcote browser (persona: ${stealth.platform}, humanized input: ${stealth.humanize ? "on" : "off"}, light stealth: ${stealth.lightStealth ? "on" : "off"}, profile: ${profile})`
+      );
+    }
+    const t0 = Date.now();
     if (engine === "playwright") {
       return this.launchStockChromium(profile, t0);
     }
@@ -1183,7 +1188,7 @@ export class Rig {
         logged = await this.detectLogin();
       }
       const detail = logged
-        ? `Signed in on ${this.platform} — ${describePlan(plan)}. Nothing posts until you press Start.`
+        ? `Signed in on ${this.platform} — ${describePlan(plan)}. Automatic posting stays off until Start; manual Post is available now.`
         : `${plan.detail} — installed, but the site still says signed out. An expired cookie, or one from another account?`;
       this.broadcast({ type: "log", level: logged ? "ok" : "warn", text: `${logged ? "✅" : "⚠️"} ${detail}`, at: Date.now() });
       this.broadcast({

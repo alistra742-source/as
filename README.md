@@ -221,8 +221,8 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 > (`Tapped "Email" — the pointer press was ignored, the DOM click worked`), because "it worked, but not the
 > way you asked" is the answer a remote control owes you.
 >
-> **Protocol version.** `PROTOCOL_VERSION` (6: a failed publish answers; 5: cookie login; 4: label taps and
-> the DOM escalation) travels
+> **Protocol version.** `PROTOCOL_VERSION` (8: Playwright/Clearcote engine identity; 6: a failed publish
+> answers; 5: cookie login; 4: label taps and the DOM escalation) travels
 > on `auth` and comes back on `ready`, so a deck newer than the worker warns on connect and an unknown
 > command fails loudly — `This worker does not understand "click-label" (protocol v5) — redeploy it` —
 > instead of a button that does nothing. `src/lib/protocol.ts` and `worker/src/protocol.ts` are mirrors: bump
@@ -235,9 +235,13 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 > the page's own embedded state instead — `__UNIVERSAL_DATA_FOR_REHYDRATION__` / `__SIGI_STATE__` for TikTok,
 > `video_versions` + `og:video` for Instagram, `ytInitialPlayerResponse.streamingData.formats[]` for YouTube —
 > with a tolerant URL scan rather than a schema assumption, plus every response the player actually fetched
-> while the page loaded. Candidates are ranked (own CDN + real mp4 + 480–1440p first; manifests, posters and
-> DRM-tagged formats last) and tried in order, and an attempt counts as a success only when the bytes begin
-> with `ftyp`/`moov`/EBML — an S3 `AccessDenied` XML page and a bot-wall login screen are both HTTP 200, and
+> while the page loaded. TikTok's current extensionless `v16-webapp-prime.tiktok.com/video/...` play address
+> is recognised directly (the old host regex accidentally required `webapp.` and lost `webapp-prime.`), and
+> the worker also captures the matching item-detail XHR. If the heavy share page still exposes only previews,
+> it tries TikTok's official `/player/v1/{postId}` surface and one fresh-page signature before giving up.
+> Candidates are ranked (own CDN + real mp4 + 480–1440p first; manifests, posters and DRM-tagged formats last)
+> and tried in order, and an attempt counts as a success only when the bytes begin with `ftyp`/`moov`/EBML —
+> an S3 `AccessDenied` XML page and a bot-wall login screen are both HTTP 200, and
 > uploading one of those as if it were footage is how you get a publish that "succeeded" and shows a black
 > video. Failures name the platform, how many candidates were tried and what the page showed instead
 > (`TikTok: fetched 3 candidate URLs and none of them gave a playable video (a login wall) — open the link
@@ -255,13 +259,15 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 > `LOGIN_REQUIRED` ("Sign in to confirm you're not a browser") more often than not; that is now reported as
 > the site's verdict, not as a broken deck.
 >
-> **A manual publish runs in the tab you are watching.** It used to run in a hidden second tab, which made a
-> working 60-second publish indistinguishable from a hung one — the dock sat on the For You page while a page
-> nobody could see did everything. Now Post drives the streamed tab (input lock held, ambient cursor and login
-> polling parked so a publish cannot be misread as "signed out"), you watch the source page open, the file hand
-> to the studio and Post get pressed, and the tab stays on the live video afterwards as the receipt. With no
-> browser tab open it falls back to its own hidden one. The hourly engine cycle still uses a hidden tab: it must
-> not steal the feed you are browsing.
+> **A manual upload runs in the tab you are watching; source retrieval does not.** Opening the source in the
+> streamed tab made a failed CDN fetch look like the deck had chosen to watch the video instead of uploading it.
+> Post now resolves/downloads the source in one short-lived background tab, closes it, then drives only the
+> destination studio in the streamed tab (input lock held, ambient cursor and login polling parked): you watch
+> the file attach, the product-tour popup close, the caption land and Post get pressed. The worker reports
+> success only after the uploader confirms it, and only a destination URL is labelled **Live publish** — the
+> old path incorrectly broadcast the source URL even when `uploadTikTok` had returned `ok:false`. With no
+> browser tab open the studio falls back to its own page. The hourly engine cycle remains hidden and cannot
+> steal the feed you are browsing.
 >
 > **Studio reachability.** TikTok's upload page has lived at two URLs, so `uploadTikTok` tries `/upload` then
 > `/tiktokstudio/upload`, clicks the "Upload video" trigger if the `<input type=file>` is mounted lazily, and

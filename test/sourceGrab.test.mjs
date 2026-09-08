@@ -23,6 +23,7 @@ import {
   splitByMediaHost,
   sizeRejection,
   sourcePlatformOf,
+  tiktokPostId,
   youtubePlayability,
 } from "../worker/src/sourceGrab.ts";
 
@@ -68,6 +69,16 @@ test("the source platform comes from the host, short links included", () => {
   assert.equal(sourcePlatformOf("not a url"), "other");
 });
 
+test("TikTok post ids survive share, player, embed and item-detail URL shapes", () => {
+  const id = "7682913092237380886";
+  assert.equal(tiktokPostId(`https://www.tiktok.com/@lizacrafter_/video/${id}?is_from_webapp=1`), id);
+  assert.equal(tiktokPostId(`https://www.tiktok.com/player/v1/${id}?autoplay=1`), id);
+  assert.equal(tiktokPostId(`https://www.tiktok.com/embed/v3/${id}`), id);
+  assert.equal(tiktokPostId(`https://www.tiktok.com/api/item/detail/?aid=1988&itemId=${id}&lang=en`), id);
+  assert.equal(tiktokPostId("https://vm.tiktok.com/ZM8abc123/"), null, "a short link has no id until it redirects");
+  assert.equal(tiktokPostId("https://www.tiktok.com/@1234567890123456789"), null, "an account id is not a post id");
+});
+
 /* --------------------------------- harvest --------------------------------- */
 
 test("TikTok's embedded state is read without needing valid JSON", () => {
@@ -76,6 +87,14 @@ test("TikTok's embedded state is read without needing valid JSON", () => {
   assert.ok(found.some((u) => u.includes("720p.mp4?ratio=720p")));
   assert.ok(found.some((u) => u.includes("o6t.mp4?a=1988&line=0")), "the escaped & must survive");
   assert.ok(!found.some((u) => u.startsWith("blob:")), "a blob URL cannot be re-fetched");
+});
+
+test("TikTok's extensionless webapp-prime playAddr is harvested from page JSON", () => {
+  const html = `<script>{"playAddr":"https:\\/\\/v16-webapp-prime.tiktok.com\\/video\\/tos\\/useast2a\\/token\\/?a=1988\\u0026bt=4143"}</script>`;
+  const found = harvestMediaUrls(html);
+  assert.equal(found.length, 1);
+  assert.match(found[0], /^https:\/\/v16-webapp-prime\.tiktok\.com\/video\/tos\//);
+  assert.match(found[0], /&bt=4143$/);
 });
 
 test("Instagram's video_versions and og:video are both picked up", () => {
@@ -98,6 +117,11 @@ test("YouTube's \\\\u0026 escapes and the manifest are handled correctly", () =>
 
 test("only real media files pass the URL test", () => {
   assert.equal(looksLikeMediaUrl("https://v16-webapp.tiktok.com/a/b/o6t.mp4?a=1988"), true);
+  assert.equal(
+    looksLikeMediaUrl("https://v16-webapp-prime.tiktok.com/video/tos/useast2a/tos-useast2a-ve-0068/clip-token/?a=1988&bt=4143"),
+    true,
+    "current playAddr has neither .mp4 nor webapp. — the -prime host + /video path identifies it"
+  );
   assert.equal(looksLikeMediaUrl("https://rr1---sn-x.googlevideo.com/videoplayback?itag=18"), true);
   assert.equal(looksLikeMediaUrl("https://cdn.example/videoplayback?mime=video%2Fmp4"), true);
   assert.equal(looksLikeMediaUrl("https://p16-sign.tiktokcdn.com/obj/tos/alice.jpg"), false);
@@ -116,6 +140,20 @@ test("the best TikTok candidate is the site's own 720p file, not the download co
   );
   assert.match(urls(ranked)[0], /720p\.mp4/);
   assert.match(urls(ranked)[ranked.length - 1], /download/, "downloadAddr is the flakiest copy, so it goes last");
+});
+
+test("a 223 KB TikTok page asset cannot outrank an extensionless webapp-prime playAddr", () => {
+  const content = "https://v16-webapp-prime.tiktok.com/video/tos/useast2a/real-token/?a=1988&bt=4143";
+  const asset = "https://sf16-va.tiktokcdn.com/obj/site-tour/editing-demo.mp4";
+  const ranked = rankCandidates(
+    [
+      { url: asset, from: "network", score: 0, size: 223 * 1024 },
+      { url: content, from: "page-json", score: 0 },
+    ],
+    "tiktok"
+  );
+  assert.equal(ranked[0].url, content);
+  assert.equal(ranked[1].url, asset);
 });
 
 test("YouTube prefers a progressive mp4 and drops the manifest", () => {
@@ -140,18 +178,20 @@ test("a DRM-tagged YouTube format is pushed down rather than tried first", () =>
   assert.equal(ranked[0].url, plain);
 });
 
-test("duplicates across sources collapse into one attempt", () => {
+test("duplicates across sources collapse into one attempt without losing wire metadata", () => {
   const dup = "https://scontent.cdninstagram.com/vt/16/o1/444.mp4?oh=abc";
   const ranked = rankCandidates(
     [
       { url: dup, from: "page-json", score: 0 },
-      { url: dup + "#t=1", from: "network", score: 0 },
+      { url: dup + "#t=1", from: "network", score: 0, size: 4_200_000 },
       { url: dup, from: "meta", score: 0 },
     ],
     "instagram"
   );
   assert.equal(ranked.length, 1);
   assert.equal(ranked[0].url, dup);
+  assert.equal(ranked[0].from, "network");
+  assert.equal(ranked[0].size, 4_200_000);
 });
 
 test("at most four candidates are tried", () => {
@@ -232,6 +272,7 @@ test("a login wall's own background video is refused, and the reason says so", (
 test("real content hosts pass, asset hosts do not", () => {
   const keep = [
     ["https://v16-webapp.tiktok.com/02abc/o08.mp4?a=1988&line=0", "tiktok"],
+    ["https://v16-webapp-prime.tiktok.com/video/tos/useast2a/token/?a=1988&bt=4143", "tiktok"],
     ["https://v16m.tiktokcdn-us.com/9f2/o700.mp4X", "tiktok"],
     ["https://www.tiktok.com/aweme/v1/play/?video_id=v0d00fg&ratio=1080p", "tiktok"],
     ["https://api16-normal-c-useast1a.tiktokv.com/aweme/v1/play/", "tiktok"],

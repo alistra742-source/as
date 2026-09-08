@@ -38,11 +38,37 @@ export interface MediaCandidate {
 
 const MP4_HINT = /\.mp4(\?|#|$)/i;
 /** CDN hosts that serve TikTok's own encoded file, watermark copy included. */
-const TIKTOK_CDN = /(v\d{2,3}m?-?(webapp|app|look)|api\d{2}-normal-c|aweme|snssdk|tiktokcdn|tiktokv)\./i;
+// `-prime` matters: current playAddr values use hosts such as
+// v16-webapp-prime.tiktok.com and have no .mp4 suffix. The old expression ended
+// at `webapp.` and therefore discarded the exact 20.6 MB host from the report
+// whenever the player did not also make a sniffable network request.
+const TIKTOK_CDN = /(v\d{2,3}m?-?(?:webapp|app|look)(?:-[a-z0-9]+)*|api\d{2}-normal-c|aweme|snssdk|tiktokcdn|tiktokv)\./i;
 const IG_CDN = /(cdninstagram|instagram\.fkrt|fburl|scontent|cdnvideo)\./i;
 const YT_CDN = /googlevideo\.com|ytimg\.com/i;
 /** Not a file, a playlist — useless to an uploader that wants one mp4. */
 const STREAM_MANIFEST = /\.(m3u8|mpd)(\?|#|$)|\/manifest\?|format=(m3u8|mpd)/i;
+
+/**
+ * Pull the post id from every official TikTok URL shape we may encounter: the
+ * share page, the lighter official player/embed page, or an item-detail XHR.
+ * Keeping this pure lets the downloader move to the official player when the
+ * heavy share page hydrates without ever starting its video request.
+ */
+export function tiktokPostId(...values: Array<string | null | undefined>): string | null {
+  const patterns = [
+    /\/(?:video|photo)\/(\d{15,24})(?:[/?#]|$)/i,
+    /\/(?:player\/v1|embed\/v\d+)\/(\d{15,24})(?:[/?#]|$)/i,
+    /[?&](?:itemId|item_id|aweme_id)=(\d{15,24})(?:&|$)/i,
+  ];
+  for (const value of values) {
+    if (!value) continue;
+    for (const pattern of patterns) {
+      const match = pattern.exec(value);
+      if (match) return match[1];
+    }
+  }
+  return null;
+}
 
 /** Which site the source link belongs to. */
 export function sourcePlatformOf(url: string): SourcePlatform {
@@ -131,14 +157,25 @@ function resolutionOf(url: string): number {
  * that a watermark-carrying or manifest-style URL does not win.
  */
 export function rankCandidates(list: MediaCandidate[], platform: SourcePlatform, max = 4): MediaCandidate[] {
-  const seen = new Set<string>();
-  const out: MediaCandidate[] = [];
-  for (const c of list) {
-    const key = c.url.split("#")[0];
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push({ ...c, score: scoreOf(c, platform) });
+  const byUrl = new Map<string, MediaCandidate>();
+  const sourceWeight: Record<MediaCandidate["from"], number> = { "page-json": 1, meta: 2, network: 3, player: 4 };
+  for (const candidate of list) {
+    const key = candidate.url.split("#")[0];
+    const prior = byUrl.get(key);
+    if (!prior) {
+      byUrl.set(key, { ...candidate });
+      continue;
+    }
+    // The same playAddr commonly appears in HTML and on the wire. Preserve the
+    // strongest provenance *and* the wire's declared total, rather than letting
+    // whichever copy was pushed first throw that evidence away.
+    byUrl.set(key, {
+      ...prior,
+      from: sourceWeight[candidate.from] > sourceWeight[prior.from] ? candidate.from : prior.from,
+      size: Math.max(prior.size ?? 0, candidate.size ?? 0) || undefined,
+    });
   }
+  const out = Array.from(byUrl.values(), (candidate) => ({ ...candidate, score: scoreOf(candidate, platform) }));
   out.sort((a, b) => b.score - a.score || (b.size ?? 0) - (a.size ?? 0));
   return out.slice(0, max);
 }
@@ -156,6 +193,11 @@ function scoreOf(c: MediaCandidate, platform: SourcePlatform): number {
   if (c.from === "player") s += 6; // the page's own player is playing it right now
   if (c.from === "network") s += 4; // some request succeeded with it
   if (c.from === "meta") s += 2;
+  // A response whose *complete/content-range total* is under the same 300 KB
+  // floor is almost certainly page furniture. Keep it as a last diagnostic
+  // attempt, but never let its familiar .mp4 suffix outrank an extensionless
+  // webapp-prime playAddr (the exact ordering in the user's failed run).
+  if (c.size && c.size < 300_000) s -= 60;
   if (platform === "tiktok") {
     if (TIKTOK_CDN.test(url)) s += 18;
     if (/download/i.test(url)) s -= 4; // the watermark-free copy is the flakiest one

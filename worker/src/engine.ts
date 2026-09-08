@@ -7,6 +7,7 @@ import { Rig, readVideoStats, scrapeCandidates, scrapeCommentSample } from "./br
 import { downloadVideo, isTabGone, uploadToPlatform } from "./uploads.js";
 import { groqAvailable, interpretMetrics, judgeCandidate, writeCaption } from "./groq.js";
 import { jitter, readingPause, sleep, thinkingPause } from "./human.js";
+import { publishReceipt } from "./publishReceipt.js";
 
 const uid = () => `wp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 const LOOP_TICK_MS = 60_000;
@@ -344,9 +345,15 @@ export class GrowthEngine {
       await thinkingPause(800, 2600);
       const video = await downloadVideo(page, this.rig.context!, bestUrl, (t) => this.log("info", t));
       const result = await uploadToPlatform(this.platform, page, video, caption, (t) => this.log("info", t));
+      const receipt = publishReceipt(result, bestUrl);
+      if (!receipt.confirmed) throw new Error(`Publish was not confirmed: ${receipt.error}`);
       const post: WorkerPost = {
         id: uid(),
-        url: bestUrl,
+        // Never label the source clip as our live post. TikTok/Instagram return
+        // the destination URL; platforms that do not expose it keep the source
+        // only as a metrics fallback, while the success event omits a fake link.
+        url: receipt.recordUrl,
+        sourceUrl: bestUrl,
         caption,
         niche,
         source: "ai",
@@ -364,9 +371,9 @@ export class GrowthEngine {
       e.niche = NICHE_CYCLE[(NICHE_CYCLE.indexOf(niche as never) + 1) % NICHE_CYCLE.length];
       this.hitNiche = null;
       this.store.save();
-      this.rig.broadcast({ type: "post-ok", postId: post.id, postedAt: post.postedAt, url: post.url });
+      this.rig.broadcast({ type: "post-ok", postId: post.id, postedAt: post.postedAt, url: receipt.liveUrl });
       this.toast("Posted — check the live browser for the live link.", "ok");
-      this.log(result.ok ? "ok" : "warn", result.ok ? `📤 Auto-posted (${this.audienceLabel()}). Verdict stored — first read in ~1h.` : `Auto-post result: ${result.message}`);
+      this.log("ok", `📤 Auto-posted (${this.audienceLabel()}). Verdict stored — first read in ~1h.`);
       this.pushEngine();
     } finally {
       await page.close().catch(() => undefined);
@@ -405,20 +412,36 @@ export class GrowthEngine {
       this.store.save();
       this.pushEngine();
     };
-    // A *manual* publish runs in the tab the deck is streaming, so the user watches
-    // the source page open, the file hand off to the studio and Post get pressed.
-    // The hourly cycle keeps its own hidden tab — nobody is watching it, and it
-    // must not steal the feed the user is browsing.
-    const publish = async (page: Page) => {
-      stage("Fetching the video from that link…");
-      const video = await downloadVideo(page, this.rig.context!, url, (t) => this.log("info", t));
-      stage(`Uploading ${(video.buffer.length / 1_048_576).toFixed(1)} MB to ${this.platform}…`);
-      return uploadToPlatform(this.platform, page, video, caption || "Posted via ViralDeck", (t) => this.log("info", t));
-    };
     try {
-      // Prefer the streamed tab; fall back to a tab of our own when there is none
-      // (or one already holds it). Either way the whole run is inside this try, so
-      // a throw on the way in still answers the deck instead of hanging the button.
+      // Resolve/download the source in a short-lived background tab. The streamed
+      // tab is reserved for the destination studio, so pressing Post can no longer
+      // strand the user on the source video when a CDN candidate fails.
+      const grabInBackground = async () => {
+        const sourcePage = await this.rig.newEnginePage();
+        try {
+          return await downloadVideo(sourcePage, this.rig.context!, url, (t) => this.log("info", t));
+        } finally {
+          await sourcePage.close().catch(() => undefined);
+        }
+      };
+      stage("Fetching the source in a temporary background tab — the live browser is reserved for the upload studio…");
+      let video: Awaited<ReturnType<typeof grabInBackground>>;
+      try {
+        video = await grabInBackground();
+      } catch (err) {
+        if (!isTabGone(err)) throw err;
+        stage("The background source tab died — retrying the source once in a clean tab…");
+        this.log("warn", `Source tab disappeared (${(err as Error).message}); retrying once without moving the live browser.`);
+        video = await grabInBackground();
+      }
+
+      stage(`Uploading ${(video.buffer.length / 1_048_576).toFixed(1)} MB to ${this.platform} in the live browser…`);
+      const publish = (page: Page) =>
+        uploadToPlatform(this.platform, page, video, caption || "Posted via ViralDeck", (t) => this.log("info", t));
+
+      // The upload itself still runs in the streamed tab: the user watches Studio
+      // open, the file attach, Got it close, the caption land and Post get pressed.
+      // Fall back to an owned tab only if no control tab is available.
       const inOwnTab = async () => {
         const own = await this.rig.newEnginePage();
         try {
@@ -432,21 +455,25 @@ export class GrowthEngine {
       try {
         result = await attempt();
       } catch (err) {
-        // The tab died under us (a renderer kill at the studio step is the common
-        // one) — but the video is already in memory, so waiting out the reopen and
-        // trying once is far more likely to post than telling the user to press
-        // again. Anything the *site* objected to is not retried.
+        // The tab died under us after the video was already downloaded. Reuse the
+        // same bytes; never reopen/refetch the source video for an upload crash.
         if (!isTabGone(err)) throw err;
-        stage("The tab died mid-publish — waiting for the browser and retrying once…");
-        this.log("warn", `Publish lost its tab (${(err as Error).message}); waiting for the reopen, then trying once more.`);
+        stage("The upload tab died mid-publish — waiting for the browser and retrying the same file once…");
+        this.log("warn", `Upload lost its tab (${(err as Error).message}); waiting for the reopen, then retrying the same file once.`);
         if (!(await this.rig.waitForRecovery())) throw err;
         await sleep(1200); // the reopened page needs its own moment before a goto
         result = await attempt();
-        this.log("ok", "Retry after the tab crash got through.");
+        this.log("ok", "Retry after the upload-tab crash got through.");
       }
+      // This was the old false-success path: uploadTikTok returned ok:false after
+      // Post was blocked, yet the engine stored/broadcast the *source* URL as a
+      // live publish. A manual press succeeds only when the uploader verified it.
+      const receipt = publishReceipt(result, url);
+      if (!receipt.confirmed) throw new Error(receipt.error);
       const post: WorkerPost = {
         id: uid(),
-        url,
+        url: receipt.recordUrl,
+        sourceUrl: url,
         caption: caption || "Posted via ViralDeck",
         niche: e.niche,
         source: "manual",
@@ -456,8 +483,12 @@ export class GrowthEngine {
         verdict: null,
       };
       this.store.addPost(this.platform, post);
-      this.rig.broadcast({ type: "post-ok", postId: post.id, postedAt: post.postedAt, url: post.url });
-      this.log("ok", `✅ Manual publish done — ${this.audienceLabel()}, caption “${(caption || "Posted via ViralDeck").slice(0, 60)}”.`);
+      this.rig.broadcast({ type: "post-ok", postId: post.id, postedAt: post.postedAt, url: receipt.liveUrl });
+      this.log(
+        "ok",
+        `✅ Manual publish verified${receipt.liveUrl ? ` at ${receipt.liveUrl.slice(0, 90)}` : " by the studio"} — ` +
+          `${this.audienceLabel()}, caption “${(caption || "Posted via ViralDeck").slice(0, 60)}”.`
+      );
       e.lastRunAt = now();
       if (e.running) {
         e.nextRunAt = now() + jitteredCadenceMs(e);
@@ -468,7 +499,7 @@ export class GrowthEngine {
       }
       this.store.save();
       this.pushEngine();
-      return result.ok;
+      return true;
     } catch (err) {
       const message = (err as Error).message;
       this.log("err", `Manual publish failed: ${message}`);
@@ -483,8 +514,8 @@ export class GrowthEngine {
       return false;
     } finally {
       this.manualBusy = false;
-      // The user's tab is deliberately left where the publish put it: landing on
-      // the live video page is the confirmation that it worked.
+      // The user's tab is left where the destination studio put it. The source
+      // page lived only in the temporary background tab and is already closed.
     }
   }
 }
