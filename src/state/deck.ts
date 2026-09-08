@@ -75,7 +75,15 @@ function defaultRoom(platform: Platform): Room {
     engine: freshEngine(),
     posts: [],
     log: freshLog(platform),
-    live: { wsUrl: "", token: "", connected: false, lastError: null },
+    live: {
+      wsUrl: "",
+      token: "",
+      connected: false,
+      lastError: null,
+      cookieAt: null,
+      cookieNames: [],
+      cookieExpiresAt: null,
+    },
     collapsed: false,
   };
 }

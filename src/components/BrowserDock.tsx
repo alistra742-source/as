@@ -17,7 +17,7 @@ import {
 } from "lucide-react";
 import type { Platform } from "../lib/types";
 import { START_URL } from "../lib/types";
-import type { RemoteCmd } from "../lib/protocol";
+import { PROTOCOL_VERSION, type RemoteCmd } from "../lib/protocol";
 import { connectLive, defaultWorkerUrl, sendBusCmd } from "../lib/liveBus";
 import { markerPercent, pointToPageFraction } from "../lib/tapMapping";
 import { useDeck } from "../state/deck";
@@ -181,7 +181,7 @@ function LiveViewport({ platform }: { platform: Platform }) {
   // the exact failure) — the deck must never sit on a silent placeholder.
   const [boot, setBoot] = useState<{ text: string; error: boolean } | null>(null);
   const [waitedSec, setWaitedSec] = useState(0);
-  const [toast, setToast] = useState<{ text: string; tone: "ok" | "warn" } | null>(null);
+  const [toast, setToast] = useState<{ text: string; tone: "info" | "ok" | "warn" | "err" } | null>(null);
 
   useEffect(() => {
     if (!toast) return;
@@ -246,11 +246,23 @@ function LiveViewport({ platform }: { platform: Platform }) {
       },
       onEngine: (state) => applyLiveEngine(platform, state),
       onPostOk: (_id, _at, url) => applyLivePostOk(platform, url),
-      onReady: (url, driver) => {
+      onReady: (url, driver, proto) => {
         setSession(platform, { url, state: "open", driver: driver ?? null });
+        // Tap-for-me and auto-tap are worker-side. A worker that predates them
+        // answers those commands with an error; better to say so on connect than
+        // to have the user press Email and watch nothing happen.
+        if (proto === undefined || proto < PROTOCOL_VERSION) {
+          const text = `Worker is ${proto === undefined ? "older than this deck (no Tap for me)" : `on protocol v${proto}, deck needs v${PROTOCOL_VERSION}`} — redeploy the worker service`;
+          setToast({ text, tone: "warn" });
+          addLog(platform, [{ id: `p-${Date.now()}`, at: Date.now(), level: "warn", text }]);
+        }
       },
       onInputFocus: () => setKbOpen(true),
       onToast: (text, tone) => setToast({ text, tone }),
+      // The login panel keeps its own account of what is in the profile; the
+      // worker is the only one who can know, so it is the one that reports.
+      onCookieState: ({ appliedAt, names, expiresAt }) =>
+        setLive(platform, { cookieAt: appliedAt, cookieNames: names, cookieExpiresAt: expiresAt }),
       onError: (message) => {
         setLive(platform, { lastError: message });
         // Only browser-level failures replace the picture. A single failed
@@ -490,10 +502,14 @@ function LiveViewport({ platform }: { platform: Platform }) {
                   <div
                     className={cn(
                       "max-w-[92%] truncate rounded-full border bg-ink-950/90 px-3 py-1 text-[11px]",
-                      toast.tone === "ok" ? "border-signal-400/40 text-signal-300" : "border-danger-400/40 text-danger-400"
+                      toast.tone === "ok"
+                        ? "border-signal-400/40 text-signal-300"
+                        : toast.tone === "info"
+                          ? "border-line text-slate-200"
+                          : "border-danger-400/40 text-danger-400"
                     )}
                   >
-                    {toast.tone === "ok" ? "✅ " : "⚠️ "}
+                    {toast.tone === "ok" ? "✅ " : toast.tone === "info" ? "ℹ️ " : "⚠️ "}
                     {toast.text}
                   </div>
                 </div>

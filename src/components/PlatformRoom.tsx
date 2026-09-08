@@ -8,6 +8,7 @@ import {
   ComposerPanel,
   EnginePanel,
   PostsPanel,
+  SessionCookiePanel,
   WorkerCard,
 } from "./panels";
 import { Chip, StatusDot, cn } from "./ui";
@@ -51,6 +52,7 @@ export function PlatformRoom({
       <div className="grid items-start gap-4 lg:grid-cols-[minmax(0,1fr)_390px]">
         <div className="space-y-4">
           <BrowserDock platform={platform} />
+          <SessionCookiePanel room={room} />
           <ComposerPanel room={room} />
         </div>
         <div className="space-y-4">

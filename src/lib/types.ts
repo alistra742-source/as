@@ -99,6 +99,15 @@ export interface LiveLink {
   token: string;
   connected: boolean;
   lastError: string | null;
+  /**
+   * Metadata about a session cookie pasted into the login panel. Names and dates
+   * only: the value never lands here, because this whole object is persisted to
+   * localStorage and a session cookie IS a login. It goes straight from the input
+   * to the worker and into the browser profile's own jar.
+   */
+  cookieAt: number | null;
+  cookieNames: string[];
+  cookieExpiresAt: number | null;
 }
 
 export interface Room {

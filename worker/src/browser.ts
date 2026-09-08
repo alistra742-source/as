@@ -3,11 +3,25 @@ import path from "node:path";
 import { launchPersistentContext, RELEASE } from "clearcote";
 import type { BrowserContext, Page } from "playwright-core";
 import { env, stealth, driverInfo, START_URLS, type PlatformKey } from "./config.js";
-import type { RemoteCmd, ServerMsg } from "./protocol.js";
+import { PROTOCOL_VERSION, type RemoteCmd, type ServerMsg } from "./protocol.js";
 import { Store } from "./store.js";
 import { asHumanPage, humanTap, humanType, jitter, readingPause, sleep, thinkingPause } from "./human.js";
+import { describePlan, planSessionCookies } from "./sessionCookie.js";
 import { ensureHumanized, humanizeContext, isHumanized } from "./humanizeAttach.js";
-import { CONTAINER_VIEWPORT_RATIO, INTERACTIVE_SEL, MAX_NUDGE_PX, findLabelTarget, tapAim, tapProbe, type AimResult, type TapReport } from "./tapAim.js";
+import {
+  CONTAINER_VIEWPORT_RATIO,
+  INTERACTIVE_SEL,
+  MAX_NUDGE_PX,
+  TARGET_ATTR,
+  activateMarked,
+  activityProbe,
+  findLabelTarget,
+  tapAim,
+  tapProbe,
+  type ActivityPhase,
+  type AimResult,
+  type TapReport,
+} from "./tapAim.js";
 
 /**
  * The rig drives the **Clearcote** browser the **nodriver** way: the binary is
@@ -143,7 +157,7 @@ async function resolveTapPoint(page: Page, x: number, y: number): Promise<AimRes
 async function pressLabel(page: Page, rawLabel: string): Promise<{ ok: boolean; detail: string; toast: string; tone: "ok" | "warn" }> {
   const label = rawLabel.trim();
   if (!label) return { ok: false, detail: "no label given", toast: "Nothing to tap — no label given", tone: "warn" };
-  const args = [label, INTERACTIVE_SEL, CONTAINER_VIEWPORT_RATIO] as [string, string, number];
+  const args = [label, INTERACTIVE_SEL, CONTAINER_VIEWPORT_RATIO, TARGET_ATTR] as [string, string, number, string];
   for (const frame of page.frames()) {
     // First pass locates it and scrolls it into view; the page settles; the
     // second pass reads the box that is actually on screen when we press.
@@ -166,13 +180,44 @@ async function pressLabel(page: Page, rawLabel: string): Promise<{ ok: boolean; 
     }
     const x = Math.round(t.x + ox);
     const y = Math.round(t.y + oy);
+
+    // Did the page ANSWER? That is the only question worth asking after a press,
+    // and it is what separates "the click missed" from "the click landed and this
+    // UI ignores synthetic input". Watched in the frame that holds the control.
+    const before = await frame.evaluate(activityProbe, ["start"] as [ActivityPhase]).catch(() => null);
     await humanTap(page, x, y);
-    const where = `${t.w}x${t.h}px box at (${x},${y})${frame === page.mainFrame() ? "" : " via iframe"}`;
+    await sleep(jitter(260, 460));
+    const peek = before ? await frame.evaluate(activityProbe, ["peek"] as [ActivityPhase]).catch(() => null) : null;
+    const where = `${t.w}x${t.h}px at (${x},${y})${frame === page.mainFrame() ? "" : " via iframe"}`;
+    // No fingerprint change and no DOM churn: the trusted press was ignored.
+    const answered = !before || !peek || peek.fp !== before.fp || peek.mutations > 40;
+    if (answered) {
+      await frame.evaluate(activityProbe, ["end"] as [ActivityPhase]).catch(() => undefined);
+      return {
+        ok: true,
+        detail: `pressed "${label}" (${where}, ${t.clickable ? "the row itself" : "its label"}) → the page answered`,
+        toast: `Tapped "${label}" (${where})`,
+        tone: "ok",
+      };
+    }
+
+    // Escalate: activate the very element from the DOM side. Not a trusted event,
+    // so it is never the first thing tried — but it reaches a row that an
+    // overlay, a hit-test-less window or a target-restricted handler will not.
+    const act = await frame.evaluate(activateMarked, [TARGET_ATTR] as [string]).catch(() => null);
+    await sleep(jitter(240, 420));
+    const done = await frame.evaluate(activityProbe, ["end"] as [ActivityPhase]).catch(() => null);
+    const escalated = !!act && !!before && !!done && (done.fp !== before.fp || done.mutations > 40);
+    const via = act ? `${act.tag}${act.label ? ` "${act.label}"` : ""} · ${act.events} DOM events` : "nothing was marked";
     return {
-      ok: true,
-      detail: `pressed "${label}" — ${t.clickable ? "its own control" : "the label text (the handler above it takes the bubbled click)"} · ${where} · "${t.label}"`,
-      toast: `Tapped "${label}" (${where})`,
-      tone: "ok",
+      ok: !!escalated,
+      detail:
+        `pressed "${label}" (${where}) → the page ignored the pointer press, so the element was activated from the DOM (${via})` +
+        `${escalated ? " → that worked" : " → and that did nothing either"}`,
+      toast: escalated
+        ? `Tapped "${label}" — the pointer press was ignored, the DOM click worked`
+        : `"${label}" was pressed but nothing on the page moved`,
+      tone: escalated ? "ok" : "warn",
     };
   }
   return {
@@ -761,6 +806,113 @@ export class Rig {
     }
   }
 
+  /** What the deck's cookie panel should show: names and a date, never a value. */
+  cookieState(): { appliedAt: number | null; names: string[]; expiresAt: number | null } {
+    const r = this.store.rig(this.platform);
+    return { appliedAt: r.cookieAt ?? null, names: r.cookieNames ?? [], expiresAt: r.cookieExpiresAt ?? null };
+  }
+
+  broadcastCookieState() {
+    this.broadcast({ type: "cookie-state", ...this.cookieState() });
+  }
+
+  /**
+   * Sign the profile in with a session cookie pasted into the deck — the way in
+   * when clicking through the site's own login wall inside a streamed screenshot
+   * refuses to behave. The cookie is written to the persistent *profile*, which is
+   * what both the manual tab and every engine run already share, so one paste
+   * covers all of it and survives a worker restart.
+   *
+   * It does not start anything. A signed-in profile only enables the deck's Start
+   * button; the engine arms on that press and on nothing else, and this method
+   * never calls into it. The pasted value is never stored, logged or broadcast:
+   * `detail` and the toast speak in cookie names and dates only.
+   */
+  async applySessionCookie(raw: string): Promise<{ ok: boolean; detail: string }> {
+    const plan = planSessionCookies(this.platform, raw);
+    if (!plan.ok) {
+      this.broadcast({ type: "log", level: "warn", text: `⚠️ Session cookie not applied: ${plan.detail}`, at: Date.now() });
+      this.broadcast({ type: "toast", text: "That is not a session cookie", tone: "warn" });
+      return { ok: false, detail: plan.detail };
+    }
+    try {
+      const ctx = await this.ensureContext();
+      await ctx.addCookies(
+        plan.cookies.map((c) => ({
+          name: c.name,
+          value: c.value,
+          domain: c.domain,
+          path: c.path,
+          expires: c.expires,
+          httpOnly: c.httpOnly,
+          secure: c.secure,
+          sameSite: c.sameSite,
+        }))
+      );
+      this.store.setCookie(this.platform, Date.now(), plan.names, plan.expiresAt);
+      this.broadcastCookieState();
+      this.broadcast({ type: "log", level: "info", text: `Session cookie installed — ${plan.detail}`, at: Date.now() });
+
+      // Reload through the command queue, so installing a session can never yank
+      // the page out from under a click that is mid-flight. If the tab is still
+      // coming up because the deck only just connected, wait for that instead of
+      // racing it with a second navigation of the same page.
+      for (let i = 0; i < 40 && (!this.control || this.control.isClosed()); i++) await sleep(250);
+      if (this.control && !this.control.isClosed()) await this.exec({ t: "navigate", url: START_URLS[this.platform] });
+      else await this.openControlSession();
+
+      let logged = false;
+      for (let i = 0; i < 10 && !logged; i++) {
+        await sleep(800); // sites decide "am I known" a beat after first paint
+        logged = await this.detectLogin();
+      }
+      const detail = logged
+        ? `Signed in on ${this.platform} — ${describePlan(plan)}. Nothing posts until you press Start.`
+        : `${plan.detail} — installed, but the site still says signed out. An expired cookie, or one from another account?`;
+      this.broadcast({ type: "log", level: logged ? "ok" : "warn", text: `${logged ? "✅" : "⚠️"} ${detail}`, at: Date.now() });
+      this.broadcast({
+        type: "toast",
+        text: logged ? "Signed in with your cookie — press Start when you want the engine to run" : "Cookie set, but the site still shows you signed out",
+        tone: logged ? "ok" : "warn",
+      });
+      return { ok: logged, detail };
+    } catch (e) {
+      const detail = `could not write cookies: ${(e as Error).message}`;
+      this.broadcast({ type: "log", level: "err", text: `⚠️ ${detail}`, at: Date.now() });
+      this.broadcast({ type: "toast", text: "The browser refused the cookie", tone: "warn" });
+      return { ok: false, detail };
+    }
+  }
+
+  /**
+   * Empty this profile's cookie jar. Honest about what that means: it removes the
+   * pasted session *and* the device ids the site uses to trust the browser, so the
+   * next manual login may be asked to verify itself again.
+   */
+  async clearSessionCookies(): Promise<{ ok: boolean; detail: string }> {
+    // Only the live profile can have its jar emptied (Playwright owns it), and
+    // launching a browser just to clear cookies would look like a hang.
+    if (!this.context) {
+      this.broadcast({ type: "toast", text: "No browser running — open the live session to clear it", tone: "info" });
+      return { ok: false, detail: "no browser context to clear" };
+    }
+    try {
+      await this.context.clearCookies();
+      this.store.setCookie(this.platform, null, [], null);
+      this.broadcastCookieState();
+      if (this.control && !this.control.isClosed()) {
+        await this.exec({ t: "navigate", url: START_URLS[this.platform] });
+        await sleep(1200);
+        await this.detectLogin();
+      }
+      this.broadcast({ type: "log", level: "info", text: "Cookies cleared from this profile — engine paused until you sign in again.", at: Date.now() });
+      this.broadcast({ type: "toast", text: "Signed out of this profile", tone: "info" });
+      return { ok: true, detail: "cookie jar emptied" };
+    } catch (e) {
+      return { ok: false, detail: (e as Error).message };
+    }
+  }
+
   /**
    * All deck commands (tap/scroll/type/key/navigate) run strictly one at a
    * time. The humanized cursor is a single shared resource: two concurrent
@@ -906,25 +1058,65 @@ export class Rig {
         // Humanized single-glide press: the SDK moves the cursor there as
         // native trusted events (min-jerk path, tremor), then we press and
         // release with a human hold — see humanTap().
+        const watch = await page.evaluate(activityProbe, ["start"] as [ActivityPhase]).catch(() => null);
         await humanTap(page, x, y);
         // What the press hit and what took focus — the deck's device-keyboard
         // hint, and the line that makes "I clicked X and nothing happened"
         // diagnosable from the deploy log instead of a mystery.
         const hit: TapReport = await page
-          .evaluate(tapProbe, [x, y, INTERACTIVE_SEL] as [number, number, string])
-          .catch(() => ({ under: "?", focused: "?", onField: false, interactive: true, scrollY: 0 }));
+          .evaluate(tapProbe, [x, y, INTERACTIVE_SEL, TARGET_ATTR] as [number, number, string, string])
+          .catch(() => ({ under: "?", focused: "?", onField: false, interactive: true, marked: false, scrollY: 0 }));
         // The glide is a few hundred ms of native moves; if the document moved in
         // that window, the press landed somewhere else than the probe just
         // measured — which is the last way a well-formed click can still do
         // nothing, so say so in the log instead of leaving it a mystery.
         const shifted =
           !m.stale && Math.abs(m.sy - hit.scrollY) > 2 ? ` · page moved ${Math.round(hit.scrollY - m.sy)}px mid-press` : "";
+        // "Did the page answer?" — the difference between a tap that missed and a
+        // tap that landed on a UI ignoring pointer input. In the first case say
+        // nothing more; in the second, activate the very node that was pressed.
+        // That is the fallback that makes "I clicked Password and nothing
+        // happened" work when the hit-test surface, not the aim, is the problem.
+        const peek = watch ? await page.evaluate(activityProbe, ["peek"] as [ActivityPhase]).catch(() => null) : null;
+        const responded = !watch || !peek || peek.fp !== watch.fp || peek.mutations > 40;
+        let fallback = "";
+        if (responded) {
+          await page.evaluate(activityProbe, ["end"] as [ActivityPhase]).catch(() => undefined);
+        } else if (!hit.marked) {
+          await page.evaluate(activityProbe, ["end"] as [ActivityPhase]).catch(() => undefined);
+          fallback = " · nothing landed on a control, so no DOM fallback was tried";
+        } else {
+          const act = await page.evaluate(activateMarked, [TARGET_ATTR] as [string]).catch(() => null);
+          await sleep(jitter(240, 420));
+          const done = await page.evaluate(activityProbe, ["end"] as [ActivityPhase]).catch(() => null);
+          const worked = !!act && !!done && (done.fp !== watch.fp || done.mutations > 40);
+          fallback = act
+            ? ` · press ignored → DOM click on ${act.tag}${act.label ? ` "${act.label}"` : ""}${worked ? " worked" : " did nothing either"}`
+            : " · press ignored and the control could not be marked for a DOM click";
+          if (worked) {
+            // The keyboard hint and the "what took focus" line have to be re-read:
+            // the fallback, not the press, is what changed the page.
+            const again: TapReport = await page
+              .evaluate(tapProbe, [x, y, INTERACTIVE_SEL, TARGET_ATTR] as [number, number, string, string])
+              .catch(() => hit);
+            hit.focused = again.focused;
+            hit.onField = again.onField;
+          }
+        }
         const where = `tap @ (${x},${y})${m.scale !== 1 ? ` [zoom ${m.scale.toFixed(2)}×]` : ""}`;
-        const summary = `${where} → ${hit.under}${hit.interactive ? "" : " · NOT on an interactive element"}; focus: ${hit.focused}${shifted}${isHumanized(page) ? "" : " [PLAIN input]"}`;
+        const summary = `${where} → ${hit.under}${hit.interactive ? "" : " · NOT on an interactive element"}; focus: ${hit.focused}${shifted}${fallback}${isHumanized(page) ? "" : " [PLAIN input]"}`;
         console.log(`[${this.platform}] ${summary}`);
-        if (shifted || !hit.interactive) this.broadcast({ type: "log", level: "warn", text: `⚠️ ${summary}`, at: Date.now() });
+        if (shifted || fallback || !hit.interactive) this.broadcast({ type: "log", level: fallback.includes("worked") ? "ok" : "warn", text: `${fallback.includes("worked") ? "✅" : "⚠️"} ${summary}`, at: Date.now() });
+        if (fallback.includes("ignored")) this.broadcast({ type: "toast", text: fallback.includes("worked") ? "Your tap was ignored by the page — activated it from the DOM instead" : "Your tap landed, but the page ignored it", tone: fallback.includes("worked") ? "ok" : "warn" });
         if (hit.onField) this.broadcast({ type: "input-focused" });
         return;
+      }
+      default: {
+        // An old worker behind a new deck would otherwise swallow an unknown
+        // command in silence — which looks exactly like "the button does
+        // nothing". Say what is actually wrong: it needs a redeploy.
+        const unknown = cmd as { t?: string };
+        throw new Error(`This worker does not understand "${unknown.t ?? "?"}" (protocol v${PROTOCOL_VERSION}) — redeploy it`);
       }
       case "scroll":
         // Direct wheel — the SDK's humanize wrapper eases it into native

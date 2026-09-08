@@ -30,12 +30,29 @@ export type RemoteCmd =
   | { t: "key"; key: "Backspace" | "Enter" | "Tab" | "Escape" }
   | { t: "ping" };
 
+/**
+   * What the deck and the worker must agree on. Bump it whenever a command or a
+   * message is added: the deck then tells the user the worker is behind instead
+   * of pressing a button whose command the old worker swallows in silence.
+   */
+export const PROTOCOL_VERSION = 5;
+
 export type ClientMsg =
-  | { type: "auth"; token: string }
+  | { type: "auth"; token: string; proto?: number }
   | { type: "cmd"; seq: number; cmd: RemoteCmd }
   | { type: "engine"; action: "start" | "stop" }
   | { type: "post"; url: string; caption: string }
-  | { type: "session"; action: "open" | "close" };
+  | { type: "session"; action: "open" | "close" }
+  /**
+   * Sign the profile in with a session cookie pasted into the deck instead of
+   * clicking through the site's login wall inside a streamed screenshot. `apply`
+   * writes the cookie and reloads the site so it notices; `clear` empties this
+   * profile's jar. The socket is already scoped to one platform's profile, so
+   * there is nothing else to address. Write-only as far as this protocol goes:
+   * the value never comes back in a log line, a toast or the `cookie-state`
+   * answer — only cookie names and timestamps do.
+   */
+  | { type: "cookie"; action: "apply" | "clear"; value?: string };
 
 export interface LastPostSnapshot {
   id: string;
@@ -64,15 +81,19 @@ export interface EngineSnapshot {
 }
 
 export type ServerMsg =
-  | { type: "ready"; sessionId: string; url: string; driver?: DriverInfo }
+  | { type: "ready"; sessionId: string; url: string; driver?: DriverInfo; proto?: number }
   | { type: "frame"; data: string; at: number }
   | { type: "nav"; url: string; title: string }
   | { type: "login"; loggedIn: boolean }
   | { type: "log"; level: string; text: string; at: number }
   | { type: "engine"; state: EngineSnapshot }
   | { type: "post-ok"; postId: string; postedAt: number; url: string }
-  | { type: "toast"; text: string; tone: "ok" | "warn" } // a one-line result the deck should show, not just log
+  | { type: "toast"; text: string; tone?: "info" | "ok" | "warn" | "err" } // a one-line result the deck should show, not just log
   | { type: "input-focused" } // a tap landed on a text field — open the device keyboard
+  /** Whether a pasted session cookie is installed in this profile, so the panel
+   * tells the truth after a reload. Names and timestamps only — the value stays
+   * inside the browser profile, never in a log line or a toast. */
+  | { type: "cookie-state"; appliedAt: number | null; names: string[]; expiresAt?: number | null }
   | { type: "error"; message: string };
 
 export function now(): number {

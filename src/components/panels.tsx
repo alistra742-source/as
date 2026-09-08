@@ -4,6 +4,7 @@ import {
   Check,
   ChevronRight,
   CircleAlert,
+  KeyRound,
   Paperclip,
   Play,
   Pause,
@@ -17,6 +18,7 @@ import { NICHES, NICHE_LABEL } from "../lib/types";
 import { clockTime, compactNumber, countdownLabel, timeAgo } from "../lib/format";
 import { useDeck } from "../state/deck";
 import { Button, Chip, NumberField, Panel, PanelHeader, StatusDot, cn } from "./ui";
+import { sendBusCookie } from "../lib/liveBus";
 
 /* ------------------------------- Engine panel ------------------------------ */
 
@@ -459,6 +461,194 @@ export function WorkerCard({ room }: { room: Room }) {
           the open-source <span className="text-slate-300">Clearcote</span> anti-fingerprint browser the
           nodriver way: raw CDP, no WebDriver layer, every click/keypress sent as trusted humanized input.
         </p>
+      </div>
+    </Panel>
+  );
+}
+
+/* ------------------------- Sign in with a session cookie ------------------------- */
+
+const COOKIE_FIELD: Record<Platform, { name: string; site: string; via: string }> = {
+  tiktok: {
+    name: "sessionid",
+    site: "https://www.tiktok.com",
+    via: "DevTools → Application → Cookies → www.tiktok.com → copy the value of sessionid",
+  },
+  instagram: {
+    name: "sessionid",
+    site: "https://www.instagram.com",
+    via: "DevTools → Application → Cookies → www.instagram.com → copy the value of sessionid",
+  },
+  youtube: {
+    name: "SID",
+    site: "https://www.youtube.com",
+    via: "DevTools → Application → Cookies → www.youtube.com → copy the value of SID",
+  },
+};
+
+/**
+ * Login without touching the remote browser.
+ *
+ * The verification screen in a streamed tab is the one place this product can
+ * stall: a 60 px row that has to be hit through a JPEG, at the wrong scale, on a
+ * phone. The click path has three fallbacks now, and this is the fourth door —
+ * paste the cookie your own signed-in browser already holds and the profile
+ * becomes you, no coordinates involved.
+ *
+ * It deliberately stops at "signed in". The engine arms only on the deck's Start
+ * button, and this panel never touches it; if the engine is already running the
+ * write is refused, because swapping the session out from under a posting loop
+ * would make it publish on an account that was never armed.
+ */
+export function SessionCookiePanel({ room }: { room: Room }) {
+  const p = room.platform;
+  const live = room.live;
+  const addLog = useDeck((s) => s.addLog);
+  const [value, setValue] = useState("");
+  const [busy, setBusy] = useState<"apply" | "clear" | null>(null);
+  const hint = COOKIE_FIELD[p];
+  const loggedIn = room.session?.state === "logged-in";
+  const installed = !!live.cookieAt;
+  const running = room.engine.running;
+
+  // The worker answers with cookie-state once the jar is written (and on every
+  // connect), so that is the only honest signal that the paste finished.
+  useEffect(() => {
+    setBusy(null);
+  }, [live.cookieAt, live.cookieNames.join(",")]);
+  useEffect(() => {
+    if (!busy) return;
+    const t = window.setTimeout(() => setBusy(null), 45_000);
+    return () => window.clearTimeout(t);
+  }, [busy]);
+
+  const log = (level: "info" | "ok" | "warn", text: string) =>
+    addLog(p, [{ id: `c-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, at: Date.now(), level, text }]);
+
+  function apply() {
+    const raw = value.trim();
+    if (!raw) return;
+    if (running) return;
+    if (!sendBusCookie(p, "apply", raw)) {
+      log("warn", "No worker socket open — the live browser above has to be connected before there is a profile to sign in.");
+      return;
+    }
+    // Drop the paste from component state immediately: it should not linger in a
+    // render, a React tree snapshot, or anything that gets persisted.
+    setValue("");
+    setBusy("apply");
+    log("info", `Installing a ${raw.length}-character session in the ${p} profile and reloading the site…`);
+  }
+
+  function clear() {
+    if (!sendBusCookie(p, "clear")) {
+      log("warn", "No worker socket open — nothing to clear.");
+      return;
+    }
+    setBusy("clear");
+    log("info", "Emptying this profile's cookie jar (signs the session out, device ids included).");
+  }
+
+  return (
+    <Panel>
+      <PanelHeader
+        icon={<KeyRound className="size-4" />}
+        title="Session cookie — sign in without clicking"
+        sub={`Paste ${hint.name} from a browser already signed in to ${hint.site}`}
+        right={
+          loggedIn ? (
+            <Chip tone="green">● signed in</Chip>
+          ) : installed ? (
+            <Chip tone="amber">cookie installed</Chip>
+          ) : (
+            <Chip tone="neutral">no cookie</Chip>
+          )
+        }
+      />
+      <div className="space-y-2.5 p-4">
+        <textarea
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          rows={3}
+          spellCheck={false}
+          autoCapitalize="off"
+          autoCorrect="off"
+          enterKeyHint="done"
+          placeholder={`${hint.name}=abc123…   ·   or the whole Cookie: header   ·   or just the bare value`}
+          className="w-full resize-y rounded-lg border border-line bg-ink-900 px-2.5 py-2 font-mono text-[11px] leading-relaxed text-slate-200 outline-none placeholder:text-faint focus:border-amber-400/60"
+        />
+        <div className="flex items-center gap-2">
+          <Button
+            size="sm"
+            onClick={apply}
+            loading={busy === "apply"}
+            disabled={!value.trim() || running}
+            title={running ? "Pause the engine before changing the session" : "Write it into the browser profile and reload"}
+          >
+            <Check className="size-3.5" /> Apply &amp; sign in
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={clear}
+            loading={busy === "clear"}
+            disabled={!installed || !live.connected}
+            title={live.connected ? "Empty this profile's cookie jar" : "Open the live browser first"}
+          >
+            Clear
+          </Button>
+          <span className="ml-auto whitespace-nowrap font-mono text-[10px] text-faint">
+            {installed
+              ? `${live.cookieNames.slice(0, 2).join(", ")}${
+                  live.cookieNames.length > 2 ? ` +${live.cookieNames.length - 2}` : ""
+                } · ${timeAgo(live.cookieAt as number)}`
+              : "not saved here"}
+          </span>
+        </div>
+
+        <p className="text-[11px] leading-snug text-muted">
+          <span className="text-slate-300">Start is still yours.</span> Applying a cookie only makes the profile
+          you — nothing is posted and the engine does not arm until you press Start. Where it came from:{" "}
+          <span className="text-slate-300">{hint.via}</span> (a whole <span className="font-mono">Cookie:</span>{" "}
+          header works too).
+        </p>
+
+        {running && (
+          <p className="rounded-lg border border-amber-500/25 bg-amber-400/5 px-3 py-2 text-[11px] leading-snug text-amber-200">
+            The engine is running on the current session — press Pause before swapping accounts, so it can never
+            post on a profile you did not arm.
+          </p>
+        )}
+        {!live.connected && (
+          <p className="rounded-lg border border-line bg-ink-900 px-3 py-2 text-[11px] leading-snug text-muted">
+            Not connected to a worker yet — open the live browser above so there is a profile to write into.
+          </p>
+        )}
+
+        <details className="rounded-lg border border-line bg-ink-900/60 px-3 py-2">
+          <summary className="cursor-pointer text-[11px] font-semibold text-slate-300">
+            Where the cookie goes (read once)
+          </summary>
+          <ul className="mt-2 space-y-1 text-[11px] leading-snug text-muted">
+            <li>
+              · It is sent once, over your own worker socket, straight into the browser profile&apos;s cookie jar —
+              the persistent one the manual tab and every engine run already share.
+            </li>
+            <li>
+              · It is never written to the deck&apos;s saved state, never printed in the activity log, and never
+              echoed back in a toast: only cookie <span className="text-slate-300">names</span> and dates are
+              reported.
+            </li>
+            <li>
+              · Clear empties the whole jar, including the device ids the site uses to trust this browser, so the
+              next manual sign-in may ask for a code.
+            </li>
+            <li>
+              · A TikTok session usually lives ~30 days; when it dies the site shows you signed out and you paste a
+              fresh one.
+            </li>
+          </ul>
+        </details>
       </div>
     </Panel>
   );

@@ -3,7 +3,7 @@ import { promises as fsp } from "node:fs";
 import path from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 import { env, driverInfo, PLATFORMS, START_URLS, stealth, type PlatformKey } from "./config.js";
-import type { ClientMsg, ServerMsg } from "./protocol.js";
+import { PROTOCOL_VERSION, type ClientMsg, type ServerMsg } from "./protocol.js";
 import { Store } from "./store.js";
 import { Rig, browserPreflight } from "./browser.js";
 import { GrowthEngine } from "./engine.js";
@@ -137,8 +137,19 @@ wss.on("connection", (ws, req) => {
         send: (m: ServerMsg) => send(ws, m),
       } as { __ws: WebSocket; send: (m: ServerMsg) => void };
       rig.clients.add(client);
-      send(ws, { type: "ready", sessionId: `rig-${platform}`, url: START_URLS[platform], driver: driverInfo() });
+      send(ws, { type: "ready", sessionId: `rig-${platform}`, url: START_URLS[platform], driver: driverInfo(), proto: PROTOCOL_VERSION });
+      // A deck newer than this worker presses buttons whose commands land in the
+      // `default:` branch of execInner and error out. Say it up front instead.
+      if (msg.type === "auth" && msg.proto && msg.proto !== PROTOCOL_VERSION) {
+        console.warn(`[worker] deck speaks protocol v${msg.proto}, this worker is v${PROTOCOL_VERSION} — redeploy the worker service`);
+        send(ws, {
+          type: "error",
+          message: `Deck protocol v${msg.proto} vs worker v${PROTOCOL_VERSION}: this worker is out of date — redeploy the service.`,
+        });
+      }
       send(ws, { type: "engine", state: engine.snapshot() });
+      // The cookie panel must not lie after a reload: say what this profile holds.
+      send(ws, { type: "cookie-state", ...rig.cookieState() });
       // Browser-start failures are logged to the console AND the client so the
       // reason is always visible in the deploy log and the deck.
       void rig.openControlSession().catch((e) => {
@@ -164,6 +175,24 @@ wss.on("connection", (ws, req) => {
       case "session":
         if (msg.action === "close") void rig.close();
         return;
+      case "cookie": {
+        // Length only: a session secret must not end up in the deploy log, which
+        // Railway shows to anyone with access to the service.
+        const len = (msg.value || "").trim().length;
+        console.log(`[${platform}] cookie ${msg.action} requested (${len} chars)`);
+        if (msg.action === "clear") {
+          void rig.clearSessionCookies();
+        } else if (!len) {
+          send(ws, { type: "toast", text: "Paste the session cookie value first", tone: "warn" });
+        } else if (engine.snapshot().running) {
+          // Deliberate: swapping the session under a running engine would post on
+          // an account the deck never armed. Stop first, then change identity.
+          send(ws, { type: "toast", text: "Press Pause on the engine before changing the session", tone: "warn" });
+        } else {
+          void rig.applySessionCookie(msg.value || "");
+        }
+        return;
+      }
     }
   });
 

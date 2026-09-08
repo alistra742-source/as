@@ -93,6 +93,19 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
    (no coordinates at all), and **Auto-tap Email** — on by default while a deck is connected —
    watches for that screen and clears it by itself. It presses at most three times per screen and
    never acts with nobody watching; toggle it off in the same row.
+6. **The login wall will not cooperate?** A tap on a 60 px row, through a resized JPEG, on a phone, is the
+   hardest click in this product — so there is a door that needs none. Paste your **`sessionid`** into
+   **Session cookie** under the browser: copy it from any browser where you are already signed in (DevTools
+   → Application → Cookies → `www.tiktok.com`), or paste a whole `Cookie:` request header, or the bare
+   value — all three are read. **Apply & sign in** writes it into the profile's own cookie jar and reloads
+   the site so it notices. That jar is the persistent profile the manual tab and every engine run already
+   share, so one paste covers all of it and survives a restart. **Nothing starts posting:** a signed-in
+   profile only enables **Start**, and the engine arms on that press alone (and refuses a session swap while
+   it is running, so a live loop can never end up publishing on an account you did not arm). The value is
+   never kept in the deck's saved state, never printed in the activity log, never echoed in a toast — only
+   cookie *names* and a date. TikTok's `sessionid_ss` twin is minted for you (it is the copy
+   `www.tiktok.com` reads), and a pasted `sid_guard` sets the expiry instead of the 365-day default.
+   **Clear** empties the jar — device ids included, so the next manual sign-in may ask for a code.
 
 > **Input note (why clicks now land):** the Clearcote SDK installs its humanize wrapper via
 > `context.browser()`, which Playwright returns as `null` for persistent contexts — the exact
@@ -132,7 +145,26 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 > miss; a tap that says "press the thing labelled Email" cannot. Auto-tap presses at most three times
 > per screen and only while a deck socket is connected, so nothing ever taps your account unwatched.
 >
-> Both sides of the geometry are unit-tested with no browser: `npm test`.
+> **When the press lands and nothing happens.** A trusted click can still be ignored — the row's handler is
+> attached by a framework that has not finished hydrating, or the listener sits on an ancestor the hit-test
+> never reaches. So every press, **Tap for me** or your own finger, is watched: `activityProbe` installs a
+> `MutationObserver` plus a title/text/scroll/focus fingerprint, and if the page shows no sign of having
+> answered, the worker escalates to a DOM-level click on the control it marked with `data-vd-tap`
+> (`pointerover → pointerdown → mouseover → mousedown → pointerup → mouseout → mouseup → click`, with the
+> `buttons` bits a real release carries; mouse-only when `PointerEvent` is absent, and an `<a>` is followed
+> by its own `href`). Only then, and only on a control you named or the node under your own tap — a press
+> that demonstrably worked is never followed up, and a probe that could not run counts as answered so we
+> never escalate blind. The log and toast say which path fired
+> (`Tapped "Email" — the pointer press was ignored, the DOM click worked`), because "it worked, but not the
+> way you asked" is the answer a remote control owes you.
+>
+> **Protocol version.** `PROTOCOL_VERSION` (5: cookie login; 4: label taps and the DOM escalation) travels
+> on `auth` and comes back on `ready`, so a deck newer than the worker warns on connect and an unknown
+> command fails loudly — `This worker does not understand "click-label" (protocol v5) — redeploy it` —
+> instead of a button that does nothing. `src/lib/protocol.ts` and `worker/src/protocol.ts` are mirrors: bump
+> both.
+>
+> Both sides of the geometry, and the cookie parser, are unit-tested with no browser: `npm test`.
 
 > **Login identity warning:** the Clearcote persona is fixed per platform and derived from
 > your `WORKER_TOKEN` (`STEALTH_FINGERPRINT` overrides it). Changing either **changes the

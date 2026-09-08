@@ -119,6 +119,8 @@ export interface TapReport {
   onField: boolean;
   interactive: boolean;
   scrollY: number;
+  /** True when the control found here was marked for the DOM-side fallback. */
+  marked: boolean;
 }
 
 /**
@@ -127,7 +129,7 @@ export interface TapReport {
  * Password and nothing happened" into a sentence in the deploy log — and
  * `onField` is what raises the deck's device keyboard.
  */
-export function tapProbe([px, py, sel]: [number, number, string]): TapReport {
+export function tapProbe([px, py, sel, markAttr]: [number, number, string, string]): TapReport {
   const at = document.elementFromPoint(px, py);
   const desc = (n: Element | null) => {
     if (!n) return "nothing";
@@ -158,11 +160,24 @@ export function tapProbe([px, py, sel]: [number, number, string]): TapReport {
     }
     node = node.parentElement ?? (node.getRootNode() as ShadowRoot | null)?.host ?? null;
   }
+  // Leave the control marked so the caller can activate THIS node from the DOM
+  // if it turns out the pointer press was ignored. One attribute, removed by
+  // whichever path consumes it (or by the next locate).
+  let marked = false;
+  if (node) {
+    try {
+      node.setAttribute(markAttr, "1");
+      marked = true;
+    } catch {
+      /* a node the framework refuses to touch: no fallback available */
+    }
+  }
   return {
     under: desc(at),
     focused: desc(document.activeElement),
     onField: isField(document.activeElement) || isField(at),
     interactive,
+    marked,
     scrollY: window.scrollY,
   };
 }
@@ -185,9 +200,10 @@ export function tapProbe([px, py, sel]: [number, number, string]): TapReport {
  * click handlers bubble and React listeners live above it anyway.
  *
  * Same rule as `tapAim`: it is stringified into the page, so it closes over
- * nothing and takes everything (including the container ratio) as arguments.
+ * nothing and takes everything — the selector, the container ratio, the name of
+ * the attribute used to mark the winner — as arguments.
  */
-export function findLabelTarget([text, sel, containerRatio]: [string, string, number]): LabelTarget | null {
+export function findLabelTarget([text, sel, containerRatio, markAttr]: [string, string, number, string]): LabelTarget | null {
   const norm = (s: string | null | undefined) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
   const want = norm(text);
   if (!want || !document.body) return null;
@@ -237,6 +253,14 @@ export function findLabelTarget([text, sel, containerRatio]: [string, string, nu
     target = parent;
     found = clickable(parent);
   }
+  // Hand the chosen node to the next evaluate: a DOM element cannot cross that
+  // boundary, so the mark is how `activateMarked` finds exactly this element.
+  try {
+    document.querySelector(`[${markAttr}]`)?.removeAttribute(markAttr);
+    target.setAttribute(markAttr, "1");
+  } catch {
+    /* a node React owns may refuse; the coordinate press still works without it */
+  }
   target.scrollIntoView({ block: "center", inline: "center" });
   const r = target.getBoundingClientRect();
   if (r.width < 4 || r.height < 4) return null;
@@ -248,4 +272,123 @@ export function findLabelTarget([text, sel, containerRatio]: [string, string, nu
     label: norm(target.getAttribute("aria-label") || target.textContent) || want,
     clickable: found,
   };
+}
+
+/**
+ * The attribute that carries a located element across to the next evaluate. A
+ * DOM node cannot cross the boundary, so the finder marks the node it chose and
+ * the activator looks the mark up. Marking happens *before* the activity watch
+ * starts, so it is never mistaken for the page responding.
+ */
+export const TARGET_ATTR = "data-vd-tap";
+
+/** `"start"` installs, `"peek"` reads without stopping, `"end"` reads and tears down. */
+export type ActivityPhase = "start" | "peek" | "end";
+
+/**
+ * Phase of the "did the page do ANYTHING?" probe, run in the frame that holds the
+ * control: `"start"` installs a MutationObserver and fingerprints the screen,
+ * `"end"` collects the count and re-fingerprints it.
+ *
+ * A press that produces no change is the whole complaint behind "I clicked
+ * Password and nothing happened", and it is the only honest way to know whether
+ * to leave the page alone or escalate. Fingerprinting the visible text (rather
+ * than trusting mutation counts alone) is deliberate: hover styles churn the DOM
+ * constantly and would report success for a click that did nothing.
+ */
+export function activityProbe([phase]: [ActivityPhase]): { mutations: number; fp: string } {
+  const fingerprint = () => {
+    try {
+      const text = (document.body?.innerText || "").replace(/\s+/g, " ").slice(0, 600);
+      const focus = document.activeElement ? document.activeElement.tagName.toLowerCase() : "";
+      return `${document.title}|${text}|${Math.round(window.scrollY)}|${focus}`;
+    } catch {
+      // A frame that is detaching mid-probe has no readable text; the throw
+      // itself is a strong hint something happened, so say so.
+      return "unreadable";
+    }
+  };
+  const w = window as unknown as { __vdWatch?: { n: number; obs?: MutationObserver } };
+  if (phase === "start") {
+    try {
+      w.__vdWatch?.obs?.disconnect();
+    } catch {
+      /* stale observer from a previous press */
+    }
+    const st = { n: 0, obs: undefined as MutationObserver | undefined };
+    try {
+      st.obs = new MutationObserver((recs) => {
+        st.n += recs.length;
+      });
+      st.obs.observe(document.body, { subtree: true, childList: true, attributes: true, characterData: true });
+    } catch {
+      /* detached document: the fingerprint alone still works */
+    }
+    w.__vdWatch = st;
+    return { mutations: 0, fp: fingerprint() };
+  }
+  const st = w.__vdWatch;
+  const read = { mutations: st?.n ?? 0, fp: fingerprint() };
+  if (phase === "end") {
+    try {
+      st?.obs?.disconnect();
+    } catch {
+      /* already gone */
+    }
+    delete w.__vdWatch;
+  }
+  return read;
+}
+
+/**
+ * Activate the marked control from the DOM side: a full pointer + mouse sequence
+ * dispatched on the node itself, with the event bubbling up to wherever the
+ * framework parked its handler.
+ *
+ * This is the escape hatch for the case a coordinate press cannot reach: an
+ * invisible layer above the modal, a row that only answers events whose `target`
+ * is the element it listens on, a window that lost its hit-test surface. It is
+ * NOT a trusted event (`isTrusted === false`) and it is never used first — only
+ * after a real, humanized, trusted press on the same element demonstrably did
+ * nothing, and only for a control the user named. Stealth says nothing else; a
+ * stuck login says everything.
+ *
+ * An `<a href>` in the chain is reported so the caller can navigate if the
+ * synthetic click is ignored too.
+ */
+export function activateMarked([attr]: [string]): { label: string; events: number; href: string; tag: string } | null {
+  const el = document.querySelector(`[${attr}]`) as HTMLElement | null;
+  if (!el) return null;
+  const r = el.getBoundingClientRect();
+  const cx = r.left + r.width / 2;
+  const cy = r.top + r.height / 2;
+  // Structural, not `typeof PointerEvent`: these constructors take their own
+  // init dicts, and the only thing this function needs is `new (type, init)`.
+  type Ctor = new (type: string, init?: Record<string, unknown>) => Event;
+  const PE = (globalThis as { PointerEvent?: Ctor }).PointerEvent;
+  const ME = (globalThis as { MouseEvent?: Ctor }).MouseEvent;
+  const base = { bubbles: true, cancelable: true, composed: true, view: window, clientX: cx, clientY: cy, screenX: cx, screenY: cy, button: 0 };
+  let fired = 0;
+  const fire = (type: string, Ctor?: Ctor) => {
+    if (!Ctor) return;
+    try {
+      el.dispatchEvent(new Ctor(type, { ...base, buttons: type.endsWith("up") || type === "click" ? 0 : 1 }));
+      fired += 1;
+    } catch {
+      /* a constructor this engine dislikes is not worth failing over */
+    }
+  };
+  fire("pointerover", PE);
+  fire("pointerenter", PE);
+  fire("pointerdown", PE);
+  fire("mouseover", ME);
+  fire("mousedown", ME);
+  fire("pointerup", PE);
+  fire("mouseout", ME);
+  fire("mouseup", ME);
+  fire("click", ME);
+  el.removeAttribute(attr);
+  const link = (el.closest?.("a[href]") ?? null) as HTMLAnchorElement | null;
+  const text = (el.getAttribute("aria-label") || el.textContent || "").replace(/\s+/g, " ").trim();
+  return { label: text.slice(0, 48), events: fired, href: link?.href || "", tag: el.tagName.toLowerCase() };
 }

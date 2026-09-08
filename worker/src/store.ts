@@ -37,12 +37,25 @@ export interface EngineRec {
 export interface RigRec {
   loggedIn: boolean;
   profile: string | null;
+  /**
+   * A session cookie pasted into the deck, if one is installed: when, which
+   * names, and when the site will stop accepting it. Only that — never the
+   * value. The jar itself is the browser profile's, and that is the only place
+   * a session secret should sit in this app.
+   */
+  cookieAt: number | null;
+  cookieNames: string[];
+  cookieExpiresAt: number | null;
 }
 
 interface DataFile {
   rigs: Record<PlatformKey, RigRec>;
   posts: Record<PlatformKey, WorkerPost[]>;
   engines: Record<PlatformKey, EngineRec>;
+}
+
+function blankRig(): RigRec {
+  return { loggedIn: false, profile: null, cookieAt: null, cookieNames: [], cookieExpiresAt: null };
 }
 
 function freshEngine(): EngineRec {
@@ -77,7 +90,7 @@ export class Store {
     try {
       const raw = JSON.parse(fs.readFileSync(this.file, "utf8")) as Partial<DataFile>;
       const d: DataFile = {
-        rigs: { tiktok: { loggedIn: false, profile: null }, instagram: { loggedIn: false, profile: null }, youtube: { loggedIn: false, profile: null } },
+        rigs: { tiktok: blankRig(), instagram: blankRig(), youtube: blankRig() },
         posts: { tiktok: [], instagram: [], youtube: [] },
         engines: { tiktok: freshEngine(), instagram: freshEngine(), youtube: freshEngine() },
       };
@@ -89,7 +102,7 @@ export class Store {
       return d;
     } catch {
       return {
-        rigs: { tiktok: { loggedIn: false, profile: null }, instagram: { loggedIn: false, profile: null }, youtube: { loggedIn: false, profile: null } },
+        rigs: { tiktok: blankRig(), instagram: blankRig(), youtube: blankRig() },
         posts: { tiktok: [], instagram: [], youtube: [] },
         engines: { tiktok: freshEngine(), instagram: freshEngine(), youtube: freshEngine() },
       };
@@ -125,6 +138,14 @@ export class Store {
       if (profile) r.profile = profile;
       this.save();
     }
+  }
+
+  setCookie(p: PlatformKey, at: number | null, names: string[], expiresAt: number | null = null) {
+    const r = this.rig(p);
+    r.cookieAt = at;
+    r.cookieNames = names;
+    r.cookieExpiresAt = expiresAt;
+    this.save();
   }
 
   patchEngine(p: PlatformKey, patch: Partial<EngineRec>) {
