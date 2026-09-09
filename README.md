@@ -286,10 +286,20 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 > marker, a new `/video/{id}` destination, or Studio's known post-success redirect to `/tiktokstudio/content`.
 > Otherwise the run reports the measured button state and visible Studio error; it never invents a publish.
 >
+> **TikTok Description must equal the requested caption before Post.** Studio pre-fills that field from the
+> uploaded basename, which used to leave public posts named `clip-<timestamp>` when its new 757×21 DraftJS
+> editor sat just outside the viewport. The picker now recognizes `.public-DraftEditor-content`,
+> `contenteditable="plaintext-only"`, caption metadata, and the filename-prefill shape even off-screen; it
+> scrolls there, selects all, replaces the filename, and verifies the normalized text exactly. The upload's
+> fallback filename is caption-derived as well. If readback still contains `clip-…` or differs from the
+> requested caption, the worker stops before Post rather than publishing the wrong name.
+>
 > **Signed-in state has hysteresis.** "The avatar is gone" is weak evidence — it is gone during hydration, on
-> a watch page and on a tab that just restarted — so a negative must survive three consecutive looks (≈15 s)
-> before the worker will call the session dead, disarm the engine and grey out Start; only a URL that *is*
-> the login wall flips it immediately. When a session installed from a pasted cookie dies within half an hour,
+> a watch page, on Studio's post-success screen and on a tab that just restarted — so a negative must survive
+> three observations spaced at least four seconds apart before the worker calls the session dead; a burst of
+> navigation events is one look, not three. A usable Studio upload control and `/tiktokstudio/content` count as
+> signed-in evidence, while an actual login-wall URL still flips immediately. When a session installed from a
+> pasted cookie dies within half an hour,
 > the log says the real reason (the site ended it because this browser doesn't match the one it came from)
 > instead of blaming the user for being logged out.
 >

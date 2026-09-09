@@ -4,8 +4,11 @@ import {
   CANDIDATE_ATTR,
   CAPTION_MAX_CHARS,
   CAPTION_SELECTOR,
+  captionTextMatches,
   collectEditableBoxes,
   pickEditableBox,
+  scoreEditableBox,
+  tiktokUploadFilename,
   type EditableBox,
 } from "./captionPick.js";
 import {
@@ -695,12 +698,32 @@ async function destinationTikTokHandle(page: Page): Promise<string> {
 }
 
 /** Press once, then require endpoint/UI evidence rather than equating click() with publication. */
-async function submitTikTokPost(page: Page, log: StepLog): Promise<UploadResult> {
+async function submitTikTokPost(page: Page, caption: string, log: StepLog): Promise<UploadResult> {
+  // Wait until TikTok has finished deriving the clip metadata before replacing
+  // its filename prefill. This avoids a late processing render restoring
+  // `clip-<timestamp>` after we already typed the real caption.
   await waitForTikTokPostReady(page, log);
   await dismissTikTokEditingTip(page, log);
-  // The tip dismissal can trigger one final React render, so mark/read the real
-  // control again immediately before the account-changing click.
-  await waitForTikTokPostReady(page, log, 20_000);
+
+  let captionFilled = await typeIntoCaptionEditor(page, caption, log);
+  if (!captionFilled && (await dismissTikTokEditingTip(page, log))) {
+    log("Retrying Description now that TikTok’s popup is out of the way…");
+    captionFilled = await typeIntoCaptionEditor(page, caption, log);
+  }
+  if (!captionFilled) {
+    throw new Error(
+      "TikTok’s Description editor did not accept the requested caption, so the worker stopped before Post. Nothing was submitted."
+    );
+  }
+  await dismissTikTokEditingTip(page, log);
+  await ensureTikTokAudienceEveryone(page, log);
+  log("Preparing to publish to Everyone…");
+  await readingPause(800, 2200); // a human checks the caption and audience before Post
+
+  // Caption/audience edits can briefly re-disable submission. Re-mark only the
+  // real enabled control immediately before the account-changing click.
+  await dismissTikTokEditingTip(page, log);
+  await waitForTikTokPostReady(page, log, 60_000);
 
   const beforeUrl = page.url();
   const beforeText = await page.evaluate(() => document.body?.innerText || "").catch(() => "");
@@ -901,8 +924,11 @@ export async function uploadTikTok(page: Page, video: VideoFile, caption: string
         `then post again (the video is already downloaded).`
     );
   }
-  await page.locator('input[type="file"]').first().setInputFiles({ name: video.name, mimeType: video.mime, buffer: video.buffer });
-  log("Video processing in studio…");
+  // TikTok initially copies the local basename into Description. Use the intended
+  // caption as that prefill too; the editor is still replaced and verified below.
+  const uploadName = tiktokUploadFilename(caption, video.name);
+  await page.locator('input[type="file"]').first().setInputFiles({ name: uploadName, mimeType: video.mime, buffer: video.buffer });
+  log("Video processing in studio… (caption-derived filename prefill installed)");
   await sleep(4000); // floor: the editor's DOM does not exist until the upload is accepted
   // The tour card can arrive before the editor beneath it finishes mounting.
   await dismissTikTokEditingTip(page, log);
@@ -910,35 +936,14 @@ export async function uploadTikTok(page: Page, video: VideoFile, caption: string
   // used to sit at this 4 s mark; a long one used to blow past it and have the
   // caption typed into a page that was still showing a progress bar.
   await page
-    .waitForFunction(() => !!document.querySelector('div[contenteditable="true"], textarea'), null, { timeout: 40_000 })
+    .waitForFunction((selector) => !!document.querySelector(selector), CAPTION_SELECTOR, { timeout: 40_000 })
     .catch(() => undefined);
   // It can also be mounted by the same render that adds the Description field.
   await dismissTikTokEditingTip(page, log);
 
-  // The caption is the part that silently vanishes when this is wrong, so it does
-  // not get a list of yesterday's selectors: score every editable box on the page
-  // by what labels it and how big it is, then type into the winner. The studio's
-  // redesigns move the box; "the wide contenteditable near the word Description"
-  // has survived all of them, and it beats the search input and the comment box
-  // (the two decoys) by construction rather than by luck.
-  const captionFilled = await typeIntoCaptionEditor(page, caption, log);
-  if (!captionFilled && (await dismissTikTokEditingTip(page, log))) {
-    // Covers the narrow race where the tip appeared between the pre-caption check
-    // and the click into Description. The first attempt did not land, so fill it
-    // again now that the backdrop is gone instead of publishing captionless.
-    log("Retrying the caption now that TikTok’s popup is out of the way…");
-    await typeIntoCaptionEditor(page, caption, log);
-  }
-  // Close a tip that raced the caption readback before touching audience controls.
-  await dismissTikTokEditingTip(page, log);
-
-  await ensureTikTokAudienceEveryone(page, log);
-
-  log("Preparing to publish to Everyone…");
-  await readingPause(800, 2200); // a human checks the draft before hitting Post
-  // The submission helper waits specifically for post_video_button to become
-  // enabled, presses it once, and requires network/UI evidence afterward.
-  return submitTikTokPost(page, log);
+  // Final submission waits for processing, replaces/verifies Description, checks
+  // Everyone, and only then presses TikTok's enabled post_video_button.
+  return submitTikTokPost(page, caption, log);
 }
 
 /**
@@ -995,70 +1000,151 @@ export async function checkUploadAccess(
 }
 
 /**
- * Find and fill the studio's description box (see `captionPick.ts` for the why).
- *
- * `insertText` (CDP `Input.insertText`) is tried before `keyboard.type` because a
- * hashtag typed one character at a time opens TikTok's suggestion popup, which
- * then swallows the following space and truncates the caption — the classic "my
- * hashtags disappeared". Inserting the whole string and pressing Escape avoids the
- * popup; per-character typing stays as the fallback for a box that refuses
- * programmatic text. Every outcome logs something, because the failure mode we are
- * guarding against is a publish that *succeeds* with no caption.
+ * Replace (never append to) the studio's Description and verify the exact result.
+ * TikTok's DraftJS editor starts with the local basename, so a mere non-empty
+ * readback would bless `clip-<timestamp> caption` and publish the wrong name.
  */
 async function typeIntoCaptionEditor(page: Page, caption: string, log: StepLog): Promise<boolean> {
-  const text = (caption || "").trim();
-  if (!text) return false;
-  const boxes = (
-    await page.evaluate(collectEditableBoxes, [CAPTION_SELECTOR, CANDIDATE_ATTR] as [string, string]).catch((): EditableBox[] => [])
-  ) as EditableBox[];
-  const best = pickEditableBox(boxes);
+  const expected = (caption || "").trim().slice(0, CAPTION_MAX_CHARS);
+  if (!expected) return false;
+
+  const discover = async () => {
+    const boxes = (await page
+      .evaluate(collectEditableBoxes, [CAPTION_SELECTOR, CANDIDATE_ATTR, expected] as [string, string, string])
+      .catch((): EditableBox[] => [])) as EditableBox[];
+    return { boxes, best: pickEditableBox(boxes) };
+  };
+  let { boxes, best } = await discover();
   if (!best) {
-    const seen = boxes
-      .slice(0, 5)
-      .map((b) => `${b.tag} "${(b.label || "unlabelled").slice(0, 28)}" ${b.width}x${b.height}${b.enabled ? "" : " (disabled)"}`);
+    const seen = boxes.slice(0, 6).map(
+      (b) =>
+        `${b.tag} "${(b.currentText || b.label || "unlabelled").slice(0, 38)}" ${b.width}x${b.height}` +
+        `${b.onScreen ? "" : " (off-screen)"}${b.enabled ? "" : " (disabled)"} score=${scoreEditableBox(b)}`
+    );
     log(
       seen.length
-        ? `No box on the page looks like a caption field — posting without one. Editable boxes found: ${seen.join(" · ")}`
-        : "No editable field on the page at all — posting without a caption (a signed-out studio shows exactly this)."
+        ? `Description not identified — stopping before publish. Editable boxes: ${seen.join(" · ")}`
+        : "No editable Description field was exposed — stopping before publish."
     );
     return false;
   }
-  log(`Caption → ${best.tag} "${(best.label || "no nearby label").slice(0, 32)}" (${best.width}x${best.height})`);
 
-  const box = page.locator(`[${CANDIDATE_ATTR}="${best.id}"]`).first();
-  // A real focus/click first: React editors install their own selection state on
-  // the event, and typing into a focused-but-never-clicked box is how you get an
-  // empty caption with no error anywhere.
-  // Wrapped in Promise.resolve() on purpose: if a driver's locator lacks one of
-  // these methods, the call throws *synchronously* and a bare .catch() never sees
-  // it — which would turn "the caption box was found" into a failed publish.
+  let box = page.locator(`[${CANDIDATE_ATTR}="${best.id}"]`).first();
+  const prior = (best.currentText || "").trim();
+  log(
+    `Description → ${best.identity || best.label.slice(0, 40) || best.tag} (${best.width}x${best.height}` +
+      `${best.onScreen ? "" : ", scrolling into view"}); replacing ${
+        prior ? `“${prior.slice(0, 52)}${prior.length > 52 ? "…" : ""}”` : "the empty value"
+      }…`
+  );
+
+  // Promise.resolve catches synchronous method gaps in alternate drivers too.
   const safe = (fn: () => unknown) => Promise.resolve().then(fn).catch(() => undefined);
-  await safe(() => box.scrollIntoViewIfNeeded());
-  await safe(() => box.click({ timeout: 5000 }));
-  await thinkingPause(220, 600); // read the draft before writing it
-  const written = await page.keyboard
-    .insertText(text.slice(0, CAPTION_MAX_CHARS))
-    .then(() => true)
-    .catch(async () => {
-      await page.keyboard.type(text.slice(0, CAPTION_MAX_CHARS)).catch(() => undefined);
-      return false;
-    });
-  await sleep(220);
-  // Dismiss the hashtag/mention popup so it cannot eat the next keystroke, and so
-  // the studio's own "Post" button is not behind an open suggestion list.
-  await page.keyboard.press("Escape").catch(() => undefined);
-  await page.evaluate((attr) => {
-    for (const el of Array.from(document.querySelectorAll(`[${attr}]`))) el.removeAttribute(attr);
-  }, CANDIDATE_ATTR).catch(() => undefined);
+  const read = async () =>
+    box
+      .evaluate(
+        (el: Element) =>
+          ((el as HTMLInputElement).value || (el as HTMLElement).innerText || el.textContent || "")
+            .replace(/[\u200b-\u200d\ufeff]/g, "")
+            .trim()
+      )
+      .catch(() => "");
+  const refind = async () => {
+    const refreshed = await discover();
+    if (!refreshed.best) return;
+    boxes = refreshed.boxes;
+    best = refreshed.best;
+    box = page.locator(`[${CANDIDATE_ATTR}="${best.id}"]`).first();
+  };
+  const finishInput = async () => {
+    await sleep(280);
+    await page.keyboard.press("Escape").catch(() => undefined);
+    let shown = await read();
+    if (!captionTextMatches(shown, expected)) {
+      await refind();
+      shown = await read();
+    }
+    return shown;
+  };
+  const focusSelected = async () => {
+    await safe(() => box.scrollIntoViewIfNeeded());
+    await safe(() => box.click({ timeout: 5000 }));
+    let focused = await box
+      .evaluate((el: Element) => el === document.activeElement || el.contains(document.activeElement))
+      .catch(() => false);
+    if (!focused) {
+      await refind();
+      await safe(() => box.scrollIntoViewIfNeeded());
+      await safe(() => box.click({ timeout: 5000 }));
+      await safe(() => box.focus({ timeout: 3000 }));
+      focused = await box
+        .evaluate((el: Element) => el === document.activeElement || el.contains(document.activeElement))
+        .catch(() => false);
+    }
+    return focused;
+  };
 
-  const shown = await box
-    .evaluate((el: Element) => ((el as HTMLTextAreaElement).value || (el as HTMLElement).innerText || "").trim())
-    .catch(() => "");
-  if (!shown) {
-    log(written ? "Typed into the caption field but it reads back empty — check the live browser before posting." : "The caption field would not accept text — posting without a caption.");
-    return false;
+  try {
+    if (!(await focusSelected())) {
+      log("Description was found but could not be focused — stopping before Post rather than typing into the page.");
+      return false;
+    }
+    await thinkingPause(180, 420);
+
+    // Trusted select-all + delete removes TikTok's clip filename. insertText sends
+    // the whole hashtag-bearing caption at once so mention suggestions cannot eat
+    // characters between per-key events.
+    await page.keyboard.press("Control+A").catch(() => undefined);
+    await page.keyboard.press("Backspace").catch(() => undefined);
+    await page.keyboard.insertText(expected).catch(() => undefined);
+    let shown = await finishInput();
+    let method = "select-all + insertText";
+
+    if (!captionTextMatches(shown, expected)) {
+      // Playwright fill explicitly supports contenteditable and emits the input
+      // event DraftJS listens for. It also replaces rather than appends.
+      await safe(() => box.fill(expected, { timeout: 6000 }));
+      shown = await finishInput();
+      method = "contenteditable fill";
+    }
+
+    if (!captionTextMatches(shown, expected)) {
+      // Last trusted-key fallback for editors that reject fill/Input.insertText.
+      // Re-check focus because the failed fill/readback may have rerendered DraftJS;
+      // never let Control+A escape into the whole page.
+      if (!(await focusSelected())) {
+        log("Description lost focus during retry — stopping before Post rather than sending keys to the page.");
+        return false;
+      }
+      await page.keyboard.press("Control+A").catch(() => undefined);
+      await page.keyboard.press("Backspace").catch(() => undefined);
+      await page.keyboard.type(expected, { delay: 1 }).catch(() => undefined);
+      shown = await finishInput();
+      method = "keyboard typing";
+    }
+
+    if (!captionTextMatches(shown, expected)) {
+      log(
+        `Description verification failed: expected ${expected.length} characters, read back ${shown.length}` +
+          `${shown ? ` (“${shown.slice(0, 70)}${shown.length > 70 ? "…" : ""}”)` : " (empty)"}.`
+      );
+      return false;
+    }
+
+    log(
+      `✅ Description verified (${shown.length} characters via ${method})` +
+        `${/^clip-\d+/i.test(prior) ? " — TikTok’s clip filename was replaced." : "."}`
+    );
+    return true;
+  } finally {
+    // Readback happens before cleanup. A Locator resolves dynamically, so the old
+    // implementation removed its marker first and then accidentally read nothing.
+    await page
+      .evaluate((attr) => {
+        for (const el of Array.from(document.querySelectorAll(`[${attr}]`))) el.removeAttribute(attr);
+      }, CANDIDATE_ATTR)
+      .catch(() => undefined);
   }
-  return true;
 }
 
 /* -------------------------------- Instagram -------------------------------- */

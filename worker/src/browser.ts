@@ -9,6 +9,7 @@ import { Store } from "./store.js";
 import { checkUploadAccess } from "./uploads.js";
 import { asHumanPage, humanTap, humanType, jitter, readingPause, sleep, thinkingPause } from "./human.js";
 import { describePlan, planSessionCookies } from "./sessionCookie.js";
+import { tiktokSignedInPage } from "./tiktokLogin.js";
 import { ensureHumanized, humanizeContext, isHumanized } from "./humanizeAttach.js";
 import {
   CONTAINER_VIEWPORT_RATIO,
@@ -358,8 +359,9 @@ export class Rig {
    * account when nobody is watching).
    */
   private autoVerify = { on: false, label: "Email", sig: "", pressed: false, tries: 0 };
-  /** How many looks in a row said "signed out" — see `detectLogin`. */
+  /** How many time-spaced looks in a row said "signed out" — see `detectLogin`. */
   private signedOutStreak = 0;
+  private lastSignedOutLookAt = 0;
   /**
    * Set while the worker drives the *visible* tab itself (a manual publish). The
    * ambient loops stand down and login detection pauses for the duration: a page
@@ -1024,16 +1026,7 @@ export class Rig {
         .evaluate(() => /login|passport|\/accounts\/|ServiceLogin|signin|challenge/i.test(location.href))
         .catch(() => false);
       if (this.platform === "tiktok") {
-        logged = await page.evaluate(() => {
-          const u = location.href;
-          if (u.includes("login") || u.includes("passport")) return false;
-          return !!(
-            document.querySelector(
-              '[data-e2e="profile-icon"], [data-e2e="user-avatar"], a[data-e2e="user-avatar"], [data-e2e="upload-icon"]'
-            ) ||
-            (u.includes("/foryou") && !document.querySelector('[data-e2e="top-login-button"]'))
-          );
-        });
+        logged = await page.evaluate(tiktokSignedInPage);
       } else if (this.platform === "instagram") {
         logged = await page.evaluate(() => {
           const u = location.href;
@@ -1064,13 +1057,19 @@ export class Rig {
       const prev = rig.loggedIn;
       if (logged) {
         this.signedOutStreak = 0;
+        this.lastSignedOutLookAt = 0;
         if (!prev) {
           this.store.setLoggedIn(this.platform, true);
           this.broadcast({ type: "login", loggedIn: true });
           this.broadcast({ type: "log", level: "ok", text: `✅ Signed in detected on ${this.platform} — the engine may act.`, at: Date.now() });
         }
+      } else if (!atLoginWall && Date.now() - this.lastSignedOutLookAt < 4000) {
+        // Navigation emits several frame events in one render. They are one look,
+        // not three independent observations; keep the previous trusted state.
+        return prev;
       } else if (atLoginWall || this.signedOutStreak >= 2) {
         this.signedOutStreak = 0;
+        this.lastSignedOutLookAt = 0;
         if (prev) {
           this.store.setLoggedIn(this.platform, false);
           this.broadcast({ type: "login", loggedIn: false });
@@ -1086,17 +1085,18 @@ export class Rig {
           if (freshCookie) this.broadcast({ type: "toast", text: "The site ended the pasted session — paste it again or log in by hand", tone: "warn" });
         }
       } else {
+        this.lastSignedOutLookAt = Date.now();
         this.signedOutStreak += 1;
         if (prev) {
           this.broadcast({
             type: "log",
             level: "info",
-            text: `Signed-in state uncertain on ${this.platform} (look ${this.signedOutStreak + 1}/3) — holding the engine until it is confirmed.`,
+            text: `Signed-in state uncertain on ${this.platform} (look ${this.signedOutStreak}/3) — holding the engine until it is confirmed.`,
             at: Date.now(),
           });
         }
       }
-      return logged;
+      return this.store.rig(this.platform).loggedIn;
     } catch {
       return this.store.rig(this.platform).loggedIn;
     } finally {

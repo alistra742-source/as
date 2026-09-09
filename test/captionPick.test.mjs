@@ -12,12 +12,15 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import vm from "node:vm";
 import {
   CANDIDATE_ATTR,
   CAPTION_SELECTOR,
+  captionTextMatches,
   collectEditableBoxes,
   pickEditableBox,
   scoreEditableBox,
+  tiktokUploadFilename,
 } from "../worker/src/captionPick.ts";
 
 /* ------------------------------- fake DOM -------------------------------- */
@@ -78,10 +81,10 @@ function withDom(candidates) {
 }
 
 /** Collect through the real page-side function, then score on the Node side. */
-function pick(candidates) {
+function pick(candidates, expectedCaption = "") {
   const off = withDom(candidates);
   try {
-    const boxes = collectEditableBoxes([CAPTION_SELECTOR, CANDIDATE_ATTR]);
+    const boxes = collectEditableBoxes([CAPTION_SELECTOR, CANDIDATE_ATTR, expectedCaption]);
     const best = pickEditableBox(boxes);
     return { boxes, best };
   } finally {
@@ -172,4 +175,91 @@ test("aria-labelledby is followed, because that is how the studio labels it now"
   const { best } = pick([heading, field]);
   assert.ok(best && best.id === 1, "the label is not a sibling here — only the id reference identifies the box");
   assert.match(best.label, /description/i);
+});
+
+test("TikTok's 757x21 DraftJS filename prefill is the Description editor even after auto-scroll", () => {
+  const editor = box(
+    { left: 42, top: -8, width: 757, height: 21 },
+    {
+      tag: "DIV",
+      text: "clip-199912839123727",
+      attrs: {
+        class: "notranslate public-DraftEditor-content",
+        role: "textbox",
+        contenteditable: "true",
+      },
+      editable: true,
+    }
+  );
+  const location = box(
+    { left: 580, top: 400, width: 208, height: 32 },
+    { tag: "INPUT", attrs: { placeholder: "Search locations", type: "text" } }
+  );
+  const { best } = pick([editor, location]);
+  assert.ok(best, "the exact field from the live failure log must no longer be rejected");
+  assert.equal(best.id, 0);
+  assert.equal(best.currentText, "clip-199912839123727");
+  assert.match(best.identity, /DraftJS/);
+  assert.ok(scoreEditableBox(best) > 0, "structural identity permits scrolling this editor back into view");
+});
+
+test("the clip timestamp prefill identifies TikTok's editor even if its DraftJS class changes", () => {
+  const editor = box(
+    { left: 42, top: -4, width: 757, height: 21 },
+    { tag: "DIV", text: "clip-1788949819601.mp4", attrs: { role: "textbox", contenteditable: "plaintext-only" } }
+  );
+  const { best } = pick([editor]);
+  assert.ok(best);
+  assert.match(best.identity, /filename prefill/);
+  assert.equal(best.editable, true, "contenteditable=plaintext-only is writable too");
+});
+
+test("the caption-derived filename fallback identifies the field if every TikTok class changes", () => {
+  const caption = "Dr donut reacts to jettism trapping him #viral #donutsmp";
+  const editor = box(
+    { left: 42, top: -4, width: 757, height: 21 },
+    { tag: "DIV", text: `${caption}.mp4`, attrs: { role: "textbox", contenteditable: "plaintext-only" } }
+  );
+  const { best } = pick([editor], caption);
+  assert.ok(best);
+  assert.match(best.identity, /caption-derived upload prefill/);
+});
+
+test("TikTok's fallback upload filename is caption-derived, safe, and byte-bounded", () => {
+  const caption = "Dr donut reacts to jettism trapping him #viral #donutsmp ¤drdonut #minecraft";
+  assert.equal(tiktokUploadFilename(caption, "clip-123.mp4"), `${caption}.mp4`);
+  assert.equal(tiktokUploadFilename("bad/name: still #tag", "clip.mov"), "bad name still #tag.mov");
+  const unicode = tiktokUploadFilename("🍩".repeat(200), "clip.mp4");
+  assert.ok(new TextEncoder().encode(unicode).byteLength <= 184);
+  assert.equal(tiktokUploadFilename("  ", "clip-123.mp4"), "clip-123.mp4");
+});
+
+test("caption verification rejects a leftover or prepended clip filename", () => {
+  const caption = "Dr donut reacts #viral";
+  assert.equal(captionTextMatches(`\u200b${caption}\n`, caption), true);
+  assert.equal(captionTextMatches(`clip-199912839123727 ${caption}`, caption), false);
+  assert.equal(captionTextMatches("clip-199912839123727", caption), false);
+});
+
+test("the expanded caption collector stays self-contained when Playwright serializes it", () => {
+  const editor = box(
+    { left: 42, top: -8, width: 757, height: 21 },
+    {
+      tag: "DIV",
+      text: "clip-199912839123727",
+      attrs: { class: "notranslate public-DraftEditor-content", role: "textbox", contenteditable: "true" },
+      editable: true,
+    }
+  );
+  const off = withDom([editor]);
+  try {
+    const result = vm.runInNewContext(
+      `(${collectEditableBoxes.toString()})(${JSON.stringify([CAPTION_SELECTOR, CANDIDATE_ATTR])})`,
+      { document: globalThis.document, window: globalThis.window }
+    );
+    assert.equal(result[0].currentText, "clip-199912839123727");
+    assert.match(result[0].identity, /DraftJS/);
+  } finally {
+    off();
+  }
 });
