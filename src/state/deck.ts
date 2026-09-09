@@ -331,18 +331,18 @@ export const useDeck = create<DeckState>()(
             },
           }));
           // Busy stays on until the worker answers (post-ok / post-failed) — a real
-          // grab + studio upload runs for tens of seconds, and a spinner that stops
-          // on its own timer is what makes a working publish look like nothing
-          // happened. This timer only exists so a dead socket cannot lock the panel
-          // forever.
+          // grab + TikTok's processing checks can run for several minutes, and a
+          // spinner that stops on its own timer is what makes a working publish
+          // look like nothing happened. This timer only exists so a dead socket
+          // cannot lock the panel forever.
           window.setTimeout(() => {
             if (get().rooms[p].composer.busy) {
               get().setComposer(p, {
                 busy: false,
-                error: "The worker has not answered in 4 minutes — the browser may be stuck on a challenge. Check the activity log.",
+                error: "The worker has not answered in 8 minutes — the browser may be stuck on a challenge. Check the activity log.",
               });
             }
-          }, 240_000);
+          }, 480_000);
           return;
         }
 

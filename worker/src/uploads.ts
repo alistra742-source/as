@@ -24,6 +24,15 @@ import {
   type SourcePlatform,
 } from "./sourceGrab.js";
 import { TIKTOK_EDITING_TIP_ATTR, markTikTokEditingTipButton } from "./tiktokPrompt.js";
+import {
+  isTikTokPublishResponseUrl,
+  markTikTokPostButton,
+  parseTikTokPublishResponse,
+  readTikTokPublishUi,
+  TIKTOK_POST_ATTR,
+  type TikTokPostButton,
+  type TikTokPublishEvidence,
+} from "./tiktokPublish.js";
 
 export interface VideoFile {
   name: string;
@@ -494,6 +503,367 @@ export async function revealTiktokInput(page: Page, log: StepLog): Promise<"foun
   return "missing";
 }
 
+const TIKTOK_POST_READY_TIMEOUT_MS = 180_000;
+const TIKTOK_POST_CONFIRM_TIMEOUT_MS = 70_000;
+
+/** A short, measured quote from Studio for a disabled/missing-control failure. */
+async function tiktokStudioDiagnostic(page: Page): Promise<string> {
+  return page
+    .evaluate(() => {
+      const lines = (document.body?.innerText || "")
+        .split(/\n+/)
+        .map((line) => line.replace(/\s+/g, " ").trim())
+        .filter(Boolean);
+      const relevant = lines.filter((line) =>
+        /processing|upload(?:ed|ing| failed)?|checking|copyright|violation|couldn.t|can.t post|failed|error|try again|verify|captcha|log in|unsupported|too (?:large|long)/i.test(
+          line
+        )
+      );
+      return (relevant.slice(-4).join(" · ") || lines.slice(-3).join(" · ")).slice(0, 420);
+    })
+    .catch(() => "");
+}
+
+/**
+ * Wait for TikTok's *actual* Studio submit control to finish processing. The
+ * current uploader calls it `post_video_button`; `post_button` is retained only
+ * for the classic uploader. An exact semantic fallback is allowed only when
+ * neither named control exists, so a nav item containing “Post” can never win.
+ */
+async function waitForTikTokPostReady(
+  page: Page,
+  log: StepLog,
+  timeout = TIKTOK_POST_READY_TIMEOUT_MS
+): Promise<TikTokPostButton> {
+  let observed = (await page
+    .evaluate(markTikTokPostButton, [TIKTOK_POST_ATTR, false] as [string, boolean])
+    .catch(() => null)) as TikTokPostButton | null;
+  if (observed?.enabled) {
+    log(
+      `TikTok’s Post control is enabled${observed.dataE2e ? ` (${observed.dataE2e})` : ""} ` +
+        `[aria-disabled=${observed.ariaDisabled}, data-disabled=${observed.dataDisabled}] — ready to submit.`
+    );
+    return observed;
+  }
+  if (observed) {
+    log(
+      `TikTok’s real Post control is present but ${observed.disabledBy || "disabled"} ` +
+        `[aria-disabled=${observed.ariaDisabled}, data-disabled=${observed.dataDisabled}] — waiting for upload processing/checks to finish…`
+    );
+  } else {
+    log("Waiting for TikTok Studio’s final Post control to appear and become enabled…");
+  }
+
+  const ready = (await page
+    .waitForFunction(markTikTokPostButton, [TIKTOK_POST_ATTR, true] as [string, boolean], {
+      timeout,
+      polling: 500,
+    })
+    .then(async (handle) => {
+      try {
+        return await handle.jsonValue();
+      } finally {
+        await handle.dispose().catch(() => undefined);
+      }
+    })
+    .catch(() => null)) as TikTokPostButton | null;
+  if (ready?.enabled) {
+    log(
+      `✅ TikTok enabled ${ready.dataE2e || `the exact “${ready.label}” control`} after processing ` +
+        `[aria-disabled=${ready.ariaDisabled}, data-disabled=${ready.dataDisabled}].`
+    );
+    return ready;
+  }
+  if (page.isClosed()) {
+    throw new Error("The upload tab has been closed while TikTok was preparing its Post control.");
+  }
+
+  observed = (await page
+    .evaluate(markTikTokPostButton, [TIKTOK_POST_ATTR, false] as [string, boolean])
+    .catch(() => null)) as TikTokPostButton | null;
+  const quote = await tiktokStudioDiagnostic(page);
+  const state = observed
+    ? `${observed.dataE2e || `“${observed.label}”`} stayed ${observed.disabledBy || "disabled"} ` +
+      `(aria-disabled=${observed.ariaDisabled}, data-disabled=${observed.dataDisabled})`
+    : "no real Post control appeared";
+  throw new Error(
+    `TikTok did not expose an enabled Post control within ${Math.round(timeout / 1000)} seconds: ${state}.` +
+      `${quote ? ` Studio currently says: “${quote}”.` : ""} Nothing was submitted.`
+  );
+}
+
+/**
+ * TikTok defaults new uploads to Everyone. Read that state without clicking it:
+ * clicking the already-selected “Everyone” text opens a menu that can cover Post.
+ * Only open the control when a different audience is actually shown.
+ */
+async function ensureTikTokAudienceEveryone(page: Page, log: StepLog): Promise<void> {
+  const audienceAttr = "data-vd-tiktok-audience";
+  const state = await page
+    .evaluate((attr) => {
+      for (const marked of Array.from(document.querySelectorAll(`[${attr}]`))) marked.removeAttribute(attr);
+      const norm = (value: string | null | undefined) => (value || "").replace(/\s+/g, " ").trim();
+      const namedControl = document.querySelector<HTMLElement>(
+        '[data-e2e="video_visibility_container"] button[role="combobox"], [data-e2e="video_visibility_container"] [role="combobox"]'
+      );
+      if (namedControl) {
+        const current = /\b(Everyone|Public|Friends|Only you|Private)\b/i.exec(
+          norm(namedControl.innerText || namedControl.textContent)
+        )?.[1] || "";
+        namedControl.setAttribute(attr, "1");
+        return { found: true, everyone: /^(everyone|public)$/i.test(current), current };
+      }
+      const all = Array.from(document.querySelectorAll<HTMLElement>("body *"));
+      const labels = all
+        .filter((el) => /^who can (?:see|view) this (?:post|video)$/i.test(norm(el.innerText || el.textContent)))
+        .sort((a, b) => norm(a.innerText).length - norm(b.innerText).length);
+      const label = labels[0];
+      if (!label) return { found: false, everyone: false, current: "" };
+      let node: HTMLElement | null = label;
+      let current = "";
+      for (let depth = 0; node && depth < 6; depth++, node = node.parentElement) {
+        const text = norm(node.innerText || node.textContent);
+        const value = /\b(Everyone|Public|Friends|Only you|Private)\b/i.exec(text)?.[1] || "";
+        if (value) current = value;
+        const controls = Array.from(node.querySelectorAll<HTMLElement>('button, [role="button"], [role="combobox"]'));
+        const control = controls.find((candidate) =>
+          /\b(Everyone|Public|Friends|Only you|Private)\b/i.test(norm(candidate.innerText || candidate.textContent))
+        );
+        if (control) {
+          control.setAttribute(attr, "1");
+          return { found: true, everyone: /^(everyone|public)$/i.test(current), current };
+        }
+      }
+      return { found: true, everyone: /^(everyone|public)$/i.test(current), current };
+    }, audienceAttr)
+    .catch(() => ({ found: false, everyone: false, current: "" }));
+
+  if (!state.found) {
+    throw new Error("TikTok did not expose an audience selector, so the worker could not verify Everyone; nothing was submitted.");
+  }
+  if (state.everyone) {
+    log(`Audience already set to ${state.current || "Everyone"} (Everyone) — keeping the selector closed.`);
+    return;
+  }
+
+  const control = page.locator(`[${audienceAttr}="1"]`).first();
+  if ((await control.count()) === 0) {
+    throw new Error(`TikTok shows audience “${state.current || "unknown"}”, but its selector could not be opened; nothing was submitted.`);
+  }
+  await control.click({ timeout: 6000 });
+  await sleep(350);
+  let picked = false;
+  let pickedLabel = "Everyone";
+  for (const label of ["Everyone", "Public"]) {
+    const options = page.getByText(label, { exact: true });
+    for (let i = (await options.count()) - 1; i >= 0; i--) {
+      const option = options.nth(i);
+      if (!(await option.isVisible().catch(() => false))) continue;
+      picked = await option.click({ timeout: 5000 }).then(() => true).catch(() => false);
+      if (picked) {
+        pickedLabel = label;
+        break;
+      }
+    }
+    if (picked) break;
+  }
+  await page.keyboard.press("Escape").catch(() => undefined);
+  if (!picked) {
+    throw new Error(`TikTok shows audience “${state.current || "unknown"}”, and the Everyone/Public option did not accept a click; nothing was submitted.`);
+  }
+  log(`Audience changed to ${pickedLabel} (Everyone).`);
+}
+
+async function destinationTikTokHandle(page: Page): Promise<string> {
+  return page
+    .evaluate(() => {
+      const selectors = [
+        'a[data-e2e*="avatar" i][href*="/@"]',
+        'a[data-e2e*="profile" i][href*="/@"]',
+        'nav a[href^="/@"]',
+        'header a[href^="/@"]',
+      ];
+      for (const selector of selectors) {
+        for (const link of Array.from(document.querySelectorAll<HTMLAnchorElement>(selector))) {
+          const handle = /\/@([^/?#]+)/.exec(link.href)?.[1];
+          if (handle) return decodeURIComponent(handle);
+        }
+      }
+      return "";
+    })
+    .catch(() => "");
+}
+
+/** Press once, then require endpoint/UI evidence rather than equating click() with publication. */
+async function submitTikTokPost(page: Page, log: StepLog): Promise<UploadResult> {
+  await waitForTikTokPostReady(page, log);
+  await dismissTikTokEditingTip(page, log);
+  // The tip dismissal can trigger one final React render, so mark/read the real
+  // control again immediately before the account-changing click.
+  await waitForTikTokPostReady(page, log, 20_000);
+
+  const beforeUrl = page.url();
+  const beforeText = await page.evaluate(() => document.body?.innerText || "").catch(() => "");
+  const destinationHandle = await destinationTikTokHandle(page);
+  let networkEvidence: TikTokPublishEvidence | null = null;
+  let publishGeneration = 0;
+  const responseReads = new Set<Promise<void>>();
+  const onResponse = (response: Response) => {
+    try {
+      if (response.request().method() !== "POST" || !isTikTokPublishResponseUrl(response.url())) return;
+      const generation = publishGeneration;
+      const read = response
+        .text()
+        .then((body) => {
+          const evidence = parseTikTokPublishResponse(body, response.status());
+          if (generation === publishGeneration && evidence.ok !== null) networkEvidence = evidence;
+        })
+        .catch(() => undefined);
+      responseReads.add(read);
+      void read.finally(() => responseReads.delete(read));
+    } catch {
+      /* a navigation can detach a response before its body is readable */
+    }
+  };
+  page.on("response", onResponse);
+
+  try {
+    log("Pressing TikTok’s enabled Post button once…");
+    let clickError = "";
+    let pressed = await page
+      .locator(`[${TIKTOK_POST_ATTR}="1"]`)
+      .first()
+      .click({ timeout: 15_000, noWaitAfter: true })
+      .then(() => true)
+      .catch((error) => {
+        clickError = (error as Error)?.message || String(error);
+        return false;
+      });
+    if (!pressed) {
+      // A harmless prompt or a React replacement can race the trusted click.
+      // Re-find and retry once; never DOM-click or force-click an account action.
+      await dismissTikTokEditingTip(page, log);
+      await waitForTikTokPostReady(page, log, 20_000);
+      pressed = await page
+        .locator(`[${TIKTOK_POST_ATTR}="1"]`)
+        .first()
+        .click({ timeout: 15_000, noWaitAfter: true })
+        .then(() => true)
+        .catch((error) => {
+          clickError = (error as Error)?.message || String(error);
+          return false;
+        });
+    }
+    if (!pressed) {
+      const quote = await tiktokStudioDiagnostic(page);
+      return {
+        ok: false,
+        message:
+          `TikTok’s enabled Post control rejected two trusted click attempts` +
+          `${quote ? `; Studio says “${quote}”` : ""}` +
+          `${clickError ? ` (${clickError.split("\n")[0].slice(0, 180)})` : ""}. Nothing was confirmed.`,
+      };
+    }
+
+    log("Post press accepted — waiting for TikTok’s publish response or a new destination…");
+    let postNowPressed = false;
+    let postNowDisabledLogged = false;
+    let deadline = Date.now() + TIKTOK_POST_CONFIRM_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      if (page.isClosed()) {
+        throw new Error("The upload tab has been closed while TikTok was confirming the publish.");
+      }
+      // Some accounts show a confirmation dialog after the primary control. This
+      // is a distinct exact “Post now” button used by TikTok's current uploader;
+      // press it once under the same user-armed publish, never by partial text.
+      if (!postNowPressed) {
+        for (const label of ["Post now", "Post Now", "Post anyway", "Continue to post"]) {
+          const confirmation = page.getByRole("button", { name: label, exact: true });
+          for (let i = (await confirmation.count()) - 1; i >= 0; i--) {
+            const option = confirmation.nth(i);
+            if (!(await option.isVisible().catch(() => false))) continue;
+            if (!(await option.isEnabled().catch(() => false))) {
+              if (!postNowDisabledLogged) {
+                log(`TikTok is showing its “${label}” confirmation, but it is still disabled — waiting…`);
+                postNowDisabledLogged = true;
+              }
+              break;
+            }
+            log(`TikTok requested the final exact “${label}” confirmation — pressing it once…`);
+            publishGeneration += 1;
+            networkEvidence = null; // only the response after this explicit override can be final
+            postNowPressed = await option.click({ timeout: 8000, noWaitAfter: true }).then(() => true).catch(() => false);
+            if (!postNowPressed) {
+              return {
+                ok: false,
+                message: `TikTok showed its “${label}” confirmation, but that enabled button rejected the trusted click. Publication was not confirmed.`,
+              };
+            }
+            deadline = Date.now() + TIKTOK_POST_CONFIRM_TIMEOUT_MS;
+            log(`“${label}” press accepted — waiting for TikTok’s confirmation…`);
+            break;
+          }
+          if (postNowPressed) break;
+        }
+      }
+
+      // Response bodies are small, but let any endpoint body already received
+      // finish parsing before reading the evidence variable.
+      if (responseReads.size) await Promise.race([Promise.allSettled(Array.from(responseReads)), sleep(250)]);
+      const endpoint = networkEvidence as TikTokPublishEvidence | null;
+      if (endpoint?.ok === false) {
+        return { ok: false, message: `TikTok rejected the publish: ${endpoint.error || "its publish endpoint returned an error"}.` };
+      }
+      if (endpoint?.ok === true) {
+        let liveUrl = endpoint.liveUrl;
+        if (!liveUrl && endpoint.postId && destinationHandle) {
+          liveUrl = `https://www.tiktok.com/@${encodeURIComponent(destinationHandle)}/video/${endpoint.postId}`;
+        }
+        log(
+          liveUrl
+            ? `✅ TikTok publish endpoint confirmed post ${endpoint.postId || "at the new destination"} — ${liveUrl.slice(0, 100)}`
+            : `✅ TikTok’s publish endpoint accepted the new post${endpoint.postId ? ` (ID ${endpoint.postId})` : ""}.`
+        );
+        return { ok: true, message: "Published on TikTok (Everyone)", ...(liveUrl ? { liveUrl } : {}) };
+      }
+
+      const afterUrl = page.url();
+      const afterText = await page.evaluate(() => document.body?.innerText || "").catch(() => "");
+      const ui = readTikTokPublishUi(beforeText, afterText, beforeUrl, afterUrl);
+      if (ui.ok === false) return { ok: false, message: `TikTok rejected the publish: ${ui.error}.` };
+      if (ui.ok === true) {
+        let liveUrl = ui.liveUrl;
+        if (!liveUrl && ui.postId && destinationHandle) {
+          liveUrl = `https://www.tiktok.com/@${encodeURIComponent(destinationHandle)}/video/${ui.postId}`;
+        }
+        log(
+          liveUrl
+            ? `✅ TikTok publish confirmed at a new destination — ${liveUrl.slice(0, 100)}`
+            : `✅ TikTok Studio confirmed “${ui.error}” after the Post press.`
+        );
+        return { ok: true, message: "Published on TikTok (Everyone)", ...(liveUrl ? { liveUrl } : {}) };
+      }
+      await sleep(750);
+    }
+
+    const finalButton = (await page
+      .evaluate(markTikTokPostButton, [TIKTOK_POST_ATTR, false] as [string, boolean])
+      .catch(() => null)) as TikTokPostButton | null;
+    const quote = await tiktokStudioDiagnostic(page);
+    return {
+      ok: false,
+      message:
+        `TikTok accepted the Post click but gave no publish response or new destination within ${Math.round(
+          TIKTOK_POST_CONFIRM_TIMEOUT_MS / 1000
+        )} seconds` +
+        `${finalButton ? `; the Post control is now ${finalButton.enabled ? "enabled again" : finalButton.disabledBy || "disabled"}` : ""}` +
+        `${quote ? `; Studio says “${quote}”` : ""}. Publication was not confirmed.`,
+    };
+  } finally {
+    page.off("response", onResponse);
+  }
+}
+
 export async function uploadTikTok(page: Page, video: VideoFile, caption: string, log: StepLog): Promise<UploadResult> {
   let state: "found" | "wall" | "wrong-page" | "missing" = "missing";
   let lastUrl = "";
@@ -562,42 +932,13 @@ export async function uploadTikTok(page: Page, video: VideoFile, caption: string
   // Close a tip that raced the caption readback before touching audience controls.
   await dismissTikTokEditingTip(page, log);
 
-  // Audience must be “Everyone”. It is TikTok's default; enforce it when the control exists.
-  const whoCanView = page.getByText("Who can view this video", { exact: false });
-  if ((await whoCanView.count()) > 0) {
-    const everyone = page.getByText("Everyone", { exact: true }).last();
-    if ((await everyone.count()) > 0) {
-      await everyone.click().catch(() => undefined);
-    }
-  }
+  await ensureTikTokAudienceEveryone(page, log);
 
-  log("Publishing to Everyone…");
+  log("Preparing to publish to Everyone…");
   await readingPause(800, 2200); // a human checks the draft before hitting Post
-  // Last-moment guard: if TikTok delayed the tour until the preview/settings
-  // panel hydrated, remove it before the actual Post press as well.
-  await dismissTikTokEditingTip(page, log);
-  const studioUrlBeforePost = page.url();
-  const postBtn = page.locator('button[data-e2e="post_button"], button:has-text("Post")').last();
-  let postPressed = await postBtn.click({ timeout: 15_000 }).then(() => true).catch(() => false);
-  if (!postPressed && (await dismissTikTokEditingTip(page, log))) {
-    postPressed = await postBtn.click({ timeout: 15_000 }).then(() => true).catch(() => false);
-  }
-  try {
-    // Check the live URL even after an ambiguous click error: navigation can
-    // detach the button quickly enough for Playwright to reject a click that did
-    // in fact publish.
-    await page.waitForURL(
-      (url) => /\/video\//i.test(url.pathname) && url.href !== studioUrlBeforePost,
-      { timeout: 40_000 }
-    );
-    const liveUrl = page.url();
-    log(`✅ TikTok publish confirmed — ${liveUrl.slice(0, 90)} · audience Everyone.`);
-    return { ok: true, message: "Published on TikTok", liveUrl };
-  } catch {
-    return postPressed
-      ? { ok: false as const, message: "Posted but confirmation redirect wasn't observed — verify in the browser." }
-      : { ok: false as const, message: "TikTok's Post button did not accept the click — check the live studio for a disabled button or another prompt." };
-  }
+  // The submission helper waits specifically for post_video_button to become
+  // enabled, presses it once, and requires network/UI evidence afterward.
+  return submitTikTokPost(page, log);
 }
 
 /**

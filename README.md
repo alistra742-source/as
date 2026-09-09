@@ -277,6 +277,15 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 > tab and reports whether a file input appeared, so "this session cannot write" is a ten-second answer instead
 > of a 40-second publish that ends in a log line.
 >
+> **Post means TikTok's enabled submit control, not text that happens to say Post.** Studio's current final
+> control is `button[data-e2e="post_video_button"]`; it exists while processing but remains
+> `aria-disabled="true"` / `data-disabled="true"`. The worker now waits up to three minutes for that named
+> control to become enabled (retaining the old `post_button` only for classic Studio), keeps an already-selected
+> Everyone menu closed, and handles TikTok's exact `Post now` / `Post anyway` confirmation once. A resolved
+> `click()` is only progress: success requires the post-create endpoint, a newly appearing upload-success
+> marker, a new `/video/{id}` destination, or Studio's known post-success redirect to `/tiktokstudio/content`.
+> Otherwise the run reports the measured button state and visible Studio error; it never invents a publish.
+>
 > **Signed-in state has hysteresis.** "The avatar is gone" is weak evidence — it is gone during hydration, on
 > a watch page and on a tab that just restarted — so a negative must survive three consecutive looks (≈15 s)
 > before the worker will call the session dead, disarm the engine and grey out Start; only a URL that *is*
