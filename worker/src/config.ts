@@ -103,10 +103,10 @@ export const stealth = {
    * produces incoherent font/canvas hashes (the SDK warns loudly). Set
    * "windows"/"macos" only together with a matching captured profile. */
   platform: (process.env.STEALTH_PLATFORM || "linux") as "windows" | "linux" | "macos" | "android",
-  /** Stable per-platform identity seed — same seed, same machine, forever.
-   * Includes the worker token so two deployments get unlinkable identities. */
-  seed: (p: PlatformKey) =>
-    `${process.env.STEALTH_FINGERPRINT || "viraldeck"}-${p}-${process.env.WORKER_TOKEN || "public"}`,
+  /** Stable per-account identity seed — same named browser profile, same machine,
+   * forever. Includes the worker token so two deployments stay unlinkable. */
+  seed: (scope: string) =>
+    `${process.env.STEALTH_FINGERPRINT || "viraldeck"}-${scope}-${process.env.WORKER_TOKEN || "public"}`,
   /** Coherent metadata spoof (hwConcurrency/deviceMemory/DPR/colorDepth/maxTouchPoints)
    * via native switches only — passes strict anti-bot checks. */
   lightStealth: process.env.STEALTH_LIGHT !== "false",

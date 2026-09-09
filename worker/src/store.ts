@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { accountDataDir, LEGACY_ACCOUNT_ID } from "./accountScope.js";
 import { env, type EnginePhase, type PlatformKey } from "./config.js";
 
 export interface MetricCheck {
@@ -15,6 +16,8 @@ export interface WorkerPost {
   url: string;
   /** Original clip page; kept separately so it is never presented as the live post. */
   sourceUrl?: string;
+  /** Opaque frontend publish request used to reconcile after a reconnect. */
+  requestId?: string;
   caption: string;
   niche: string;
   source: "manual" | "ai";
@@ -83,9 +86,12 @@ export class Store {
   data: DataFile;
   private saveTimer: NodeJS.Timeout | null = null;
 
-  constructor() {
-    fs.mkdirSync(env.dataDir, { recursive: true });
-    this.file = path.join(env.dataDir, "state.json");
+  constructor(platform?: PlatformKey, accountId = LEGACY_ACCOUNT_ID) {
+    // Legacy/default keeps `/data/state.json`; every named account gets a wholly
+    // separate state file beside its wholly separate Chromium profile.
+    const dir = platform ? accountDataDir(env.dataDir, platform, accountId) : env.dataDir;
+    fs.mkdirSync(dir, { recursive: true });
+    this.file = path.join(dir, "state.json");
     this.data = this.load();
   }
 

@@ -2,11 +2,9 @@
 # backend, then one process serves the app AND the /ws browser socket on the
 # same domain (auto-connect, no config needed).
 #
-# The browser driver is **Clearcote** (open-source anti-fingerprint Chromium,
-# engine-level persona compiled into the browser itself), driven nodriver-style
-# over raw CDP with humanized trusted input. No vanilla Chromium ships in this
-# image and none is ever downloaded at runtime — the verified Clearcote binary
-# is fetched once during the build.
+# The default browser driver is stock Chromium through Playwright; Clearcote's
+# anti-fingerprint build remains opt-in. Both are driven over CDP with humanized
+# trusted input and use the same persistent profile for each named account.
 #
 # Base + runtime deps mirror Clearcote's own official container
 # (github.com/clearcotelabs/clearcote-browser, docker/Dockerfile): Debian
@@ -38,6 +36,7 @@ RUN [ "$(uname -m)" = "x86_64" ] || { echo "[build] Clearcote ships x64 binaries
 RUN apt-get update && apt-get install -y --no-install-recommends \
     xz-utils \
     ca-certificates \
+    ffmpeg \
     xvfb \
     libnss3 \
     libnspr4 \
@@ -77,6 +76,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-unifont \
     fonts-wqy-zenhei \
   && rm -rf /var/lib/apt/lists/*
+
+# Fail the image build—not a user's publish—if Debian ever drops the exact
+# filters/encoders used by the adaptive quality master. This exercises the same
+# denoise → exposure → Lanczos → blur/overlay → H.264/AAC path on two frames.
+RUN ffmpeg -hide_banner -loglevel error \
+    -f lavfi -i "testsrc2=size=540x960:rate=30:duration=0.2" \
+    -f lavfi -i "sine=frequency=1000:sample_rate=48000:duration=0.2" \
+    -filter_complex "[0:v]hqdn3d=1.0:1.0:3.5:3.5,eq=brightness=0.055:contrast=1.050:saturation=1.080:gamma=1.100,unsharp=5:5:0.72:5:5:0,split=2[base][front];[base]scale=1080:1920:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:1920,gblur=sigma=28[bg];[front]scale=1080:1920:force_original_aspect_ratio=decrease:flags=lanczos[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2:shortest=1,setsar=1,format=yuv420p[v]" \
+    -map "[v]" -map 1:a:0 -frames:v 2 -c:v libx264 -preset ultrafast -c:a aac \
+    -movflags +faststart /tmp/viraldeck-ffmpeg-smoke.mp4 \
+  && test "$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 /tmp/viraldeck-ffmpeg-smoke.mp4)" = "1080x1920" \
+  && rm -f /tmp/viraldeck-ffmpeg-smoke.mp4
 
 WORKDIR /app
 

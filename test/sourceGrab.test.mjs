@@ -142,6 +142,19 @@ test("the best TikTok candidate is the site's own 720p file, not the download co
   assert.match(urls(ranked)[ranked.length - 1], /download/, "downloadAddr is the flakiest copy, so it goes last");
 });
 
+test("a 1080p page candidate beats the adaptive player's first 540p request", () => {
+  const high = "https://v16-webapp.tiktok.com/video/high.mp4?ratio=1080p";
+  const early = "https://v16-webapp.tiktok.com/video/early.mp4?gear_name=adapt_540_1";
+  const ranked = rankCandidates(
+    [
+      { url: early, from: "network", score: 0, size: 12_000_000 },
+      { url: high, from: "page-json", score: 0, size: 20_000_000 },
+    ],
+    "tiktok"
+  );
+  assert.equal(ranked[0].url, high);
+});
+
 test("a 223 KB TikTok page asset cannot outrank an extensionless webapp-prime playAddr", () => {
   const content = "https://v16-webapp-prime.tiktok.com/video/tos/useast2a/real-token/?a=1988&bt=4143";
   const asset = "https://sf16-va.tiktokcdn.com/obj/site-tour/editing-demo.mp4";

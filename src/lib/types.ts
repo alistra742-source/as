@@ -18,6 +18,15 @@ export type EnginePhase =
   | "paused"
   | "error";
 
+export interface ManagedAccount {
+  /** Opaque, path-safe key. Names are presentation only and can be changed later. */
+  id: string;
+  name: string;
+  platform: Platform;
+  createdAt: number;
+  lastOpenedAt: number | null;
+}
+
 export interface BrowserSession {
   id: string;
   platform: Platform;
@@ -108,10 +117,18 @@ export interface LiveLink {
   cookieAt: number | null;
   cookieNames: string[];
   cookieExpiresAt: number | null;
+  /** Public OAuth status only. Google tokens remain encrypted on the worker and
+   * are never sent to, logged by, or persisted in the frontend. */
+  youtubeOAuthConfigured: boolean;
+  youtubeOAuthConnected: boolean;
+  youtubeOAuthError: string | null;
 }
 
 export interface Room {
   platform: Platform;
+  /** Present for a named account room; omitted only by the empty account menu. */
+  accountId?: string;
+  accountName?: string;
   session: BrowserSession | null;
   composer: ComposerState;
   engine: EngineState;

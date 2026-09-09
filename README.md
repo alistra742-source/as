@@ -10,16 +10,24 @@ the engine keep the account growing on your rules:
 - No link? Groq reviews **faceless videos with 50K+ likes** (captions + comment sentiment) and
   only posts clips that clear its quality bar.
 - Niches it cycles: **faceless stories · scary stories · fun facts**.
+- Every platform opens to an **account switchboard**. Press **+**, name the account, then open its
+  tile; each tile has its own persistent browser profile, login, engine, composer, posts and log.
+- Every source is quality-inspected before upload. The worker prefers 1080p media and adaptively
+  builds a 1080p CRF-16 master for soft, low-resolution or dark footage (exposure/color recovery,
+  mild denoise, Lanczos scaling and sharpening) across TikTok, Instagram and YouTube.
+- Named YouTube accounts can use Google’s official `youtube.upload` OAuth scope. API uploads are
+  Public, require a returned video ID before success, and fall back to the isolated Studio browser
+  when that named account has not connected Google.
 
 ## Browser engine — Playwright + stock Chromium by default, Clearcote when you need it
 
 `BROWSER_ENGINE` picks the browser; everything else in the deck is identical for both, and both
-read the **same persistent profile**, so switching never logs you out.
+read the **same persistent profile for the selected account**, so switching engines never logs that account out.
 
 | Engine | What it is | When to use it |
 | --- | --- | --- |
 | **`playwright`** (default) | Stock Chromium launched by Playwright over CDP — no chromedriver/WebDriver layer, no custom binary to fetch, `--enable-automation` stripped, and a ~35-hostname third-party blocklist applied at the DNS resolver. `navigator.webdriver` is undefined and `window.chrome` exists; nothing else is faked, because fake plugin/language lists are a tell in themselves. | Always, unless a site is actively rejecting the session. It is the faster, smaller, better-supported option, and page load is most of a publish. |
-| **`clearcote`** | The open-source **[Clearcote](https://github.com/clearcotelabs/clearcote-browser)** browser — a de-Googled Chromium with fingerprint control compiled **into the engine itself** (C++), not injected via detectable JS patches: one coherent, seed-stable "machine" per platform (UA + UA-CH + TLS/JA4 + canvas/WebGL/audio/fonts/GPU all agree). SHA-256-verified and pre-downloaded at build time (`--build-arg WITH_CLEARCOTE=true`). | When a platform's risk engine is flagging the account. It buys stealth with a 150 MB binary and a slower start. |
+| **`clearcote`** | The open-source **[Clearcote](https://github.com/clearcotelabs/clearcote-browser)** browser — a de-Googled Chromium with fingerprint control compiled **into the engine itself** (C++), not injected via detectable JS patches: one coherent, seed-stable "machine" per named account (UA + UA-CH + TLS/JA4 + canvas/WebGL/audio/fonts/GPU all agree). SHA-256-verified and pre-downloaded at build time (`--build-arg WITH_CLEARCOTE=true`). | When a platform's risk engine is flagging the account. It buys stealth with a 150 MB binary and a slower start. |
 
 Input is the same in both cases: every click, keystroke and scroll is a **native trusted CDP
 event** driven by the human motor model in `worker/src/human.ts` (minimum-jerk cursor paths with
@@ -64,8 +72,8 @@ Everything is env-configurable — see `worker/env.example` (`BROWSER_ENGINE`, `
 │      live browser stream, click/scroll/type, uploads, Groq captions +      │
 │      reviews, hourly engine + metrics, login profiles                     │
 │  · Browser: Playwright + stock Chromium (default) or the Clearcote build   │
-│      (BROWSER_ENGINE) — raw CDP, humanized trusted input, one shared       │
-│      persistent profile per platform                                       │
+│      (BROWSER_ENGINE) — raw CDP, humanized trusted input, one isolated     │
+│      persistent profile per named account                                   │
 └──────────────────────────────────────────────────────────────┬─────────────┘
                                                                │ Railway volume
                                                                ▼
@@ -73,18 +81,19 @@ Everything is env-configurable — see `worker/env.example` (`BROWSER_ENGINE`, `
                                         (profiles + state.json)
 ```
 
-- **Frontend** is a plain Vite + React + Tailwind app (no account system — it's your private
-  control deck; state persists in the browser).
+- **Frontend** is a plain Vite + React + Tailwind private control deck. Its account switchboard
+  stores only account labels, public connection status and UI state in the browser; login secrets
+  stay in each server-side Chromium profile. Google access/refresh tokens never reach the frontend.
 - **Backend** (`worker/src/`) ships in the same deploy — the root `Dockerfile` builds both and
-  one process serves the app and the browser socket on the same domain, so live mode
-  auto-connects with **zero configuration**. Everything sensitive (your logins, Groq key,
-  browser sessions) lives on the server, never in the browser UI.
+  one process serves the app, OAuth callback/API and browser socket on the same domain, so live mode
+  auto-connects with **zero configuration**. Everything sensitive (browser logins, encrypted
+  per-account Google refresh tokens, Groq key) lives on the server, never in the browser UI.
 
 ## Try it now (demo mode — no server needed)
 
 1. `bun install && bun run dev`
-2. Open **Main → TikTok** (Instagram or YouTube), press **＋ Open browser (demo)**.
-3. The simulated browser opens. Type anything into the login fields (your phone keyboard pops
+2. Open **Main → TikTok** (Instagram or YouTube), press **+**, name an account, then open its tile.
+3. Open the demo browser from that account's Worker card. The simulated browser opens. Type anything into the login fields (your phone keyboard pops
    up naturally because they're real inputs) and tap **Log in**.
 4. Paste a link + caption under the browser and hit **Post** — watch the engine read the post,
    hit the 3,000-view trigger, and schedule "similar content". The demo compresses time
@@ -108,14 +117,25 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
    (`STEALTH_HEADLESS=false` in the image — headed avoids headless-mode tells, and the dock's
    geometry assumes a real window).
 2. Add a **volume** mounted at `/app/data` (keeps your logins + state across restarts).
-3. Set one environment variable: `GROQ_API_KEY` (get one at console.groq.com — free tier is
-   plenty). Optional: `GROQ_MODEL`, `WORKER_TOKEN` (if set, paste the same value in the
-   Worker card), `BROWSER_ENGINE` / `BLOCK_TRACKERS` / `CHROME_PATH`, and the stealth knobs in
-   `worker/env.example` (`STEALTH_PLATFORM`,
-   `STEALTH_HEADLESS`, `STEALTH_CADENCE_JITTER_MIN`, …). Sensible defaults are on out of the box.
-4. Open the app, hit **＋ Live browser** in any room — it auto-connects to the same domain
-   and streams the *real* platform in your dock. Click, drag to scroll, tap **Keyboard** to
-   type with your phone's keyboard, log in, then hit **Start**.
+3. Set `GROQ_API_KEY` (get one at console.groq.com — free tier is plenty) and a long random
+   `WORKER_TOKEN` (paste the same worker token in the deck’s Worker card). For official YouTube
+   uploads, add these as **four separate Railway variables**: `GOOGLE_CLIENT_ID`,
+   `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI=https://<your-service>/callback`, and
+   `GOOGLE_SCOPES=https://www.googleapis.com/auth/youtube.upload` (`SCOPES` is accepted too).
+   Never paste the client secret into the deck or chat. Optional: `GROQ_MODEL`,
+   `GOOGLE_TOKEN_ENCRYPTION_KEY`, `BROWSER_ENGINE` / `BLOCK_TRACKERS` / `CHROME_PATH`, and the
+   stealth knobs in `worker/env.example` (`STEALTH_PLATFORM`, `STEALTH_HEADLESS`,
+   `STEALTH_CADENCE_JITTER_MIN`, …).
+4. Open a platform, press **+**, name the account, then click its tile. That creates a fresh,
+   isolated persistent browser profile and streams the *real* platform in its dock. Click, drag
+   to scroll, tap **Keyboard** to type with your phone's keyboard, log in, then hit **Start**.
+   **All accounts** returns to the switchboard; another **+** creates another clean profile.
+   Idle, closed account browsers hibernate after 30 seconds to save RAM, but their cookie/storage
+   profile remains on the mounted volume and reopens still signed in. Armed engines remain live.
+   In a YouTube account, **Connect Google** starts the signed one-time OAuth flow; do not reuse a
+   hand-built authorization URL because it has no account-bound CSRF state. While the consent
+   screen is in Google’s **Testing** mode, test-user refresh grants may expire after seven days and
+   need the same button again.
 5. Stuck on a **"Verify it's really you"** / choose-a-method screen? Use **Tap for me** above
    the stream: **Email** / **Password** find that row by the text it shows and press its centre
    (no coordinates at all), and **Auto-tap Email** — on by default while a deck is connected —
@@ -161,16 +181,13 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 > and a press that resolves to the page background is reported as that, with no fake fallback
 > pretending to try harder.
 
-> **Caption note (why a publish went out without one):** *"Caption editor not found — posting
-> without a caption"* was a selector list going stale around TikTok's studio redesigns, and the
-> failure is invisible because the video still posts. `worker/src/captionPick.ts` now **ranks**
-> every editable box on the page — label proximity via `aria-label` / `aria-labelledby` / the
-> heading above it, `contenteditable` + `role=textbox`, width, and a hard veto on the two decoys
-> (search, comment) — then fills the winner with `Input.insertText` so a `#hashtag` cannot open
-> the suggestion popup and eat the next character, dismisses that popup with `Escape`, and reads
-> the box back to confirm text is actually in it. The log says what it chose
-> (`Caption → DIV "Description" (536x120)`), and a miss prints the boxes it *did* see, so the
-> next redesign shows up as a readable line instead of a captionless post.
+> **Caption note (why a publish went out without one):** *"No box on the page looks like a caption
+> field — posting without one"* is the old build's unsafe path. The current worker cannot emit that
+> line: `worker/src/captionPick.ts` identifies TikTok's 757×21 off-screen DraftJS filename field,
+> and `uploads.ts` focuses it, selects all, deletes `clip-…`, inserts the requested caption and reads
+> it back exactly. A miss now says *"Description not identified — stopping before publish"* and
+> throws before Post. New-run proof is the explicit log *"✅ Description verified (…) — TikTok’s clip
+> filename was replaced"*; without that line, no account-changing Post click is allowed.
 >
 > **TikTok's editing-tour popup:** after a file is accepted, Studio sometimes covers the whole
 > editor with **“New editing features added” → “Got it”**. The uploader now finds that exact button
@@ -221,8 +238,9 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 > (`Tapped "Email" — the pointer press was ignored, the DOM click worked`), because "it worked, but not the
 > way you asked" is the answer a remote control owes you.
 >
-> **Protocol version.** `PROTOCOL_VERSION` (8: Playwright/Clearcote engine identity; 6: a failed publish
-> answers; 5: cookie login; 4: label taps and the DOM escalation) travels
+> **Protocol version.** `PROTOCOL_VERSION` (10: OAuth and request-correlated manual-publish reconnect state; 9: isolated
+> named-account scope; 8: Playwright/Clearcote engine identity; 6: a failed publish answers;
+> 5: cookie login; 4: label taps and the DOM escalation) travels
 > on `auth` and comes back on `ready`, so a deck newer than the worker warns on connect and an unknown
 > command fails loudly — `This worker does not understand "click-label" (protocol v5) — redeploy it` —
 > instead of a button that does nothing. `src/lib/protocol.ts` and `worker/src/protocol.ts` are mirrors: bump
@@ -239,8 +257,9 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 > is recognised directly (the old host regex accidentally required `webapp.` and lost `webapp-prime.`), and
 > the worker also captures the matching item-detail XHR. If the heavy share page still exposes only previews,
 > it tries TikTok's official `/player/v1/{postId}` surface and one fresh-page signature before giving up.
-> Candidates are ranked (own CDN + real mp4 + 480–1440p first; manifests, posters and DRM-tagged formats last)
-> and tried in order, and an attempt counts as a success only when the bytes begin with `ftyp`/`moov`/EBML —
+> Candidates are ranked (own CDN + real mp4, with explicit 1080p over 720p over the player's early
+> adaptive 540p request; manifests, posters and DRM-tagged formats last) and tried in order. An attempt
+> counts as a success only when the bytes begin with `ftyp`/`moov`/EBML —
 > an S3 `AccessDenied` XML page and a bot-wall login screen are both HTTP 200, and
 > uploading one of those as if it were footage is how you get a publish that "succeeded" and shows a black
 > video. Failures name the platform, how many candidates were tried and what the page showed instead
@@ -258,6 +277,17 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 > instead of blaming your link. YouTube answers a datacenter IP with
 > `LOGIN_REQUIRED` ("Sign in to confirm you're not a browser") more often than not; that is now reported as
 > the site's verdict, not as a broken deck.
+>
+> **Quality and lighting are a gate, not wishful copy.** After download, `ffprobe` records the actual
+> width, height, frame rate, bitrate, codec and duration; two representative 64×64 frames provide a
+> measured luminance value. A soft 540P/720P, low-bitrate, or dark source is rebuilt by FFmpeg as a
+> platform-ready 1080p H.264 **CRF 16** master: adaptive exposure/gamma, restrained contrast and color,
+> mild block denoise, Lanczos upscale and detail sharpening, AAC 192 kbps, with a blurred full-frame
+> background rather than black bars when the aspect ratio differs. The output is probed again for exact
+> dimensions and duration before upload. A clean, balanced 1080p source is kept byte-for-byte to avoid
+> generation loss. `VD_VIDEO_ENHANCE=always|adaptive|off` controls this (adaptive is default); enhancement
+> failure stops before upload instead of silently posting the old bad-quality file. This cannot invent
+> detail the source never contained, which is why choosing the highest-resolution CDN candidate happens first.
 >
 > **A manual upload runs in the tab you are watching; source retrieval does not.** Opening the source in the
 > streamed tab made a failed CDN fetch look like the deck had chosen to watch the video instead of uploading it.
@@ -337,8 +367,8 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 > Both sides of the geometry, the cookie parser and the source grab are unit-tested with no browser:
 > `npm test`.
 
-> **Login identity warning:** on `BROWSER_ENGINE=clearcote` the persona is fixed per platform
-> and derived from your `WORKER_TOKEN` (`STEALTH_FINGERPRINT` overrides it). Changing either
+> **Login identity warning:** on `BROWSER_ENGINE=clearcote` the persona is fixed per named account
+> and derived from its opaque account id plus your `WORKER_TOKEN` (`STEALTH_FINGERPRINT` overrides the base). Changing either
 > **changes the fingerprint identity**, which can re-trigger login challenges — pick a token,
 > keep it, and don't rotate it. On the **Playwright** engine there is no synthetic persona at
 > all: the browser reports itself consistently with the machine it runs on, which is the
@@ -347,7 +377,8 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 > **Resources — read this if TikTok "doesn't load":** a TikTok tab alone is **600–900 MB** in
 > its renderer process; headed Chromium (Playwright's build + Xvfb) needs roughly **1.5–2 GB
 > RAM**
-> per service to be comfortable. When the container is smaller, the kernel OOM-kills the
+> per active browser to be comfortable. Named accounts that are not open and whose engines are not armed
+> hibernate after 30 seconds (their persistent login remains); armed accounts stay resident. When the container is smaller, the kernel OOM-kills the
 > renderer: the dock shows *"… Target crashed"* (or *"The browser process was killed right
 > after start"*) and the tab goes dark. The worker now (a) runs the browser on a memory diet
 > (one renderer per site, no GPU process, capped JS heap, Chrome's own OOM intervention),
@@ -387,8 +418,8 @@ nothing silently breaks.
   a residential-grade IP (or put a SOCKS5 proxy in front of it — Clearcote keeps the persona
   coherent with the proxy region via `geoip`, and `webrtcIp` matches the egress IP). If a
   platform challenges the session anyway, do the verification manually in the dock; the worker
-  waits for the signed-in state. YouTube uploads run through **Studio**, so the logged-in
-  session must be a Google account with an associated channel.
+  waits for the signed-in state. A named YouTube account with **Connect Google** uses the official
+  Data API instead; without that grant, its isolated YouTube Studio browser remains the fallback.
 - Humanized input is deliberately slower than raw automation (a 200-char caption types over
   30–60 s, uploads take minutes) — that's the point. Engine-typed captions include the
   occasional auto-corrected typo; keystrokes you type from the deck do not.
@@ -404,17 +435,28 @@ nothing silently breaks.
 
 The YouTube room is fully wired to the same deck flow:
 
-- **Live browser** starts on youtube.com — sign in with your Google account (the dock also has
-  one-tap links to `/shorts` and `studio.youtube.com` for verification).
-- **Post a link + caption**: the worker downloads the clip and publishes it through YouTube
-  Studio with the caption as the **title** and visibility **Public** (Everyone). A vertical
-  clip under ~3 minutes is published as a **Short** automatically; anything else uploads as a
-  regular video, so paste Shorts links for Shorts output.
-- **AI auto-post**: discovery searches YouTube for the active niche (`faceless storytime
-  shorts`, `scary stories shorts`, `mind blowing facts shorts`), opens each candidate to read
-  its like count, and only the clips above the 50K floor go to the Groq review. Same 1/hour
-  cadence and 3K+/hour double-down trigger as the other rooms; stats are read from each video's
-  page.
-- Studio selectors are best-effort like the TikTok/IG uploaders (they change over time) —
-  failures land in the deck activity feed and you can always finish a publish by hand in the
-  live browser.
+- **Connect Google (preferred)** starts on the worker, adds a signed one-time `state` bound to
+  the selected named account, and requests only `youtube.upload`. The callback exchanges the code
+  server-side and AES-GCM-encrypts the refresh token inside that account’s isolated volume directory.
+  OAuth codes/tokens are never put in localStorage, WebSocket payloads, URLs shown by the deck, or logs.
+- **Strict official upload**: the worker creates a resumable YouTube Data API upload with the exact
+  caption as its description, a Unicode-safe first-line title (YouTube’s 100-character limit), and
+  visibility **Public**. A success exists only when Google returns a valid video ID and confirms
+  `privacyStatus: public`; the receipt is `https://www.youtube.com/watch?v=<id>`.
+- **Browser fallback**: without an OAuth grant, the account’s persistent Chromium starts on
+  youtube.com and uploads through Studio. The dock has one-tap `/shorts` and Studio links. This
+  remains useful for finishing a selector-changing flow by hand.
+- A vertical clip under YouTube’s current Shorts duration rules is classified as a Short by YouTube;
+  other footage is a regular public video. ViralDeck does not fake that classification.
+- **AI auto-post** uses the same OAuth-first/fallback uploader. Discovery searches YouTube for the
+  active niche (`faceless storytime shorts`, `scary stories shorts`, `mind blowing facts shorts`),
+  reads candidate engagement, enforces the 50K floor, then runs Groq review. Cadence and the
+  3K+/hour double-down trigger are unchanged.
+
+The raw Google authorization link is intentionally not used directly: it lacks the app-generated,
+account-bound, one-use state marker. In Google OAuth **Testing** mode, even a persistent encrypted
+refresh token for a test user may expire after seven days; move the consent screen to Production
+when appropriate, or reconnect the named account when the panel reports `invalid_grant`.
+OAuth verification and the **YouTube API compliance audit** are separate: Google can force uploads
+from an unaudited API project to Private even when `privacyStatus=public` was requested. ViralDeck
+reports the returned video ID but rejects that result as a public success instead of lying.

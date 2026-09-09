@@ -5,6 +5,7 @@ import type {
   EnginePhase,
   EngineState,
   LogEntry,
+  ManagedAccount,
   Niche,
   Platform,
   PostRecord,
@@ -14,6 +15,7 @@ import type {
 import { PLATFORMS, START_URL, type BrowserSession } from "../lib/types";
 import type { EngineSnapshot } from "../lib/protocol";
 import { uid } from "../lib/format";
+import { accountNameTaken, accountRoomKey, cleanAccountName } from "../lib/accounts";
 import { disconnectLive, isLiveConnected, sendBusRaw } from "../lib/liveBus";
 import { DEMO_CANDIDATES } from "../data/demo";
 import {
@@ -67,9 +69,10 @@ function freshLog(platform: Platform): LogEntry[] {
   return lines.map((text) => logEntry("info", text));
 }
 
-function defaultRoom(platform: Platform): Room {
+function defaultRoom(platform: Platform, account?: Pick<ManagedAccount, "id" | "name">): Room {
   return {
     platform,
+    ...(account ? { accountId: account.id, accountName: account.name } : {}),
     session: null,
     composer: freshComposer(),
     engine: freshEngine(),
@@ -83,6 +86,9 @@ function defaultRoom(platform: Platform): Room {
       cookieAt: null,
       cookieNames: [],
       cookieExpiresAt: null,
+      youtubeOAuthConfigured: false,
+      youtubeOAuthConnected: false,
+      youtubeOAuthError: null,
     },
     collapsed: false,
   };
@@ -93,6 +99,8 @@ function normalizeRoom(partial: Partial<Room>): Room {
   const d = defaultRoom(platform);
   const base: Room = {
     platform,
+    ...(partial.accountId ? { accountId: partial.accountId } : {}),
+    ...(partial.accountName ? { accountName: partial.accountName } : {}),
     session: partial.session
       ? { ...d.session!, ...partial.session }
       : null,
@@ -114,8 +122,37 @@ function normalizeRooms(rooms?: Partial<Record<Platform, Partial<Room>>>): Recor
   return out;
 }
 
+function emptyAccounts(): Record<Platform, ManagedAccount[]> {
+  return { tiktok: [], instagram: [], youtube: [] };
+}
+
+function emptyActiveAccounts(): Record<Platform, string | null> {
+  return { tiktok: null, instagram: null, youtube: null };
+}
+
+function meaningfulLegacyRoom(room: Room): boolean {
+  return !!(
+    room.session ||
+    room.posts.length ||
+    room.engine.running ||
+    room.live.cookieAt ||
+    room.live.wsUrl ||
+    room.live.token ||
+    room.composer.url.trim() ||
+    room.composer.caption.trim() ||
+    room.log.length > 2
+  );
+}
+
 interface DeckState {
+  /** The room currently open for each platform; blank while its account menu is up. */
   rooms: Record<Platform, Room>;
+  accounts: Record<Platform, ManagedAccount[]>;
+  accountRooms: Record<string, Room>;
+  activeAccountIds: Record<Platform, string | null>;
+  createAccount: (p: Platform, name: string) => { ok: boolean; error?: string; id?: string };
+  selectAccount: (p: Platform, accountId: string) => boolean;
+  leaveAccount: (p: Platform) => void;
   // ---- session / browser ----
   openDemoSession: (p: Platform) => void;
   openLiveSession: (p: Platform) => boolean;
@@ -139,9 +176,9 @@ interface DeckState {
   // ---- live ----
   setLive: (p: Platform, patch: Partial<Room["live"]>) => void;
   applyLiveEngine: (p: Platform, snap: EngineSnapshot) => void;
-  applyLivePostOk: (p: Platform, url: string) => void;
-  /** Undo the optimistic post record and put the reason on the composer. */
-  applyLivePostFailed: (p: Platform, message: string) => void;
+  applyLivePostOk: (p: Platform, url: string, requestId?: string) => void;
+  /** Undo only the failed request's optimistic record and report its reason. */
+  applyLivePostFailed: (p: Platform, message: string, requestId?: string) => void;
   // ---- logs / misc ----
   addLog: (p: Platform, entries: LogEntry[]) => void;
   tick: (now: number) => void;
@@ -152,6 +189,93 @@ export const useDeck = create<DeckState>()(
   persist(
     (set, get) => ({
       rooms: normalizeRooms(),
+      accounts: emptyAccounts(),
+      accountRooms: {},
+      activeAccountIds: emptyActiveAccounts(),
+
+      createAccount: (p, rawName) => {
+        const name = cleanAccountName(rawName);
+        if (!name) return { ok: false, error: "Give this account a name first." };
+        if (accountNameTaken(get().accounts[p], name)) {
+          return { ok: false, error: `An account named “${name}” already exists in ${p}.` };
+        }
+        let id = uid("acct");
+        while (get().accounts[p].some((account) => account.id === id)) id = uid("acct");
+        const account: ManagedAccount = { id, name, platform: p, createdAt: Date.now(), lastOpenedAt: null };
+        const room = defaultRoom(p, account);
+        set((s) => ({
+          accounts: { ...s.accounts, [p]: [...s.accounts[p], account] },
+          accountRooms: { ...s.accountRooms, [accountRoomKey(p, id)]: room },
+        }));
+        return { ok: true, id };
+      },
+
+      selectAccount: (p, accountId) => {
+        const account = get().accounts[p].find((item) => item.id === accountId);
+        if (!account) return false;
+        const outgoingId = get().activeAccountIds[p];
+        if (outgoingId) disconnectLive(p, outgoingId);
+        set((s) => {
+          const outgoingId = s.activeAccountIds[p];
+          const saved = { ...s.accountRooms };
+          if (outgoingId) {
+            saved[accountRoomKey(p, outgoingId)] = {
+              ...s.rooms[p],
+              live: { ...s.rooms[p].live, connected: false },
+            };
+          }
+          const key = accountRoomKey(p, account.id);
+          const prior = normalizeRoom(saved[key] ?? defaultRoom(p, account));
+          const session: BrowserSession = prior.session ?? {
+            id: uid("ses"),
+            platform: p,
+            mode: "live",
+            state: "connecting",
+            url: START_URL[p],
+            startedAt: Date.now(),
+          };
+          const room: Room = {
+            ...prior,
+            accountId: account.id,
+            accountName: account.name,
+            session,
+            live: { ...prior.live, connected: false, lastError: null },
+          };
+          saved[key] = room;
+          return {
+            rooms: { ...s.rooms, [p]: room },
+            accountRooms: saved,
+            activeAccountIds: { ...s.activeAccountIds, [p]: account.id },
+            accounts: {
+              ...s.accounts,
+              [p]: s.accounts[p].map((item) =>
+                item.id === account.id ? { ...item, lastOpenedAt: Date.now() } : item
+              ),
+            },
+          };
+        });
+        return true;
+      },
+
+      leaveAccount: (p) => {
+        const outgoingId = get().activeAccountIds[p];
+        if (outgoingId) disconnectLive(p, outgoingId);
+        set((s) => {
+          const accountId = s.activeAccountIds[p];
+          const saved = { ...s.accountRooms };
+          if (accountId) {
+            saved[accountRoomKey(p, accountId)] = {
+              ...s.rooms[p],
+              live: { ...s.rooms[p].live, connected: false },
+            };
+          }
+          return {
+            rooms: { ...s.rooms, [p]: defaultRoom(p) },
+            accountRooms: saved,
+            activeAccountIds: { ...s.activeAccountIds, [p]: null },
+          };
+        });
+      },
 
       openDemoSession: (p) => {
         const room = get().rooms[p];
@@ -216,7 +340,8 @@ export const useDeck = create<DeckState>()(
       },
 
       closeSession: (p) => {
-        disconnectLive(p);
+        const accountId = get().rooms[p].accountId ?? "default";
+        disconnectLive(p, accountId);
         set((s) => {
           const room = s.rooms[p];
           return {
@@ -281,10 +406,16 @@ export const useDeck = create<DeckState>()(
 
       postNow: (p) => {
         const room = get().rooms[p];
+        const accountId = room.accountId ?? "default";
         const c = room.composer;
         if (c.busy) return;
-        if (!room.session || room.session.state !== "logged-in") {
-          get().setComposer(p, { error: "Log in first inside the browser, then come back and post." });
+        const youtubeOAuth = p === "youtube" && room.live.youtubeOAuthConnected;
+        if (!room.session || (room.session.state !== "logged-in" && !youtubeOAuth)) {
+          get().setComposer(p, {
+            error: p === "youtube"
+              ? "Connect Google (or sign in inside the browser) first, then post."
+              : "Log in first inside the browser, then come back and post.",
+          });
           return;
         }
 
@@ -297,7 +428,7 @@ export const useDeck = create<DeckState>()(
             });
             return;
           }
-          if (!isLiveConnected(p)) {
+          if (!isLiveConnected(p, room.accountId ?? "default")) {
             get().setComposer(p, { error: "Worker not connected — check the worker URL/token." });
             return;
           }
@@ -307,10 +438,11 @@ export const useDeck = create<DeckState>()(
             { url, caption: c.caption.trim() || "Posted via ViralDeck", niche: room.engine.activeNiche, source: "manual" },
             now
           );
-          const ok = sendBusRaw(p, {
+          const ok = sendBusRaw(p, room.accountId ?? "default", {
             type: "post",
             url,
             caption: c.caption.trim() || "Posted via ViralDeck",
+            requestId: optimistic.id,
           });
           if (!ok) {
             get().setComposer(p, { error: "Worker socket not open yet — try again in a second." });
@@ -336,12 +468,29 @@ export const useDeck = create<DeckState>()(
           // look like nothing happened. This timer only exists so a dead socket
           // cannot lock the panel forever.
           window.setTimeout(() => {
-            if (get().rooms[p].composer.busy) {
-              get().setComposer(p, {
-                busy: false,
-                error: "The worker has not answered in 8 minutes — the browser may be stuck on a challenge. Check the activity log.",
-              });
+            const timeoutError =
+              "The worker has not answered in 8 minutes — the browser may be stuck on a challenge. Check the activity log.";
+            const current = get();
+            if (current.activeAccountIds[p] === accountId) {
+              if (current.rooms[p].composer.busy) {
+                current.setComposer(p, { busy: false, error: timeoutError });
+              }
+              return;
             }
+            // The user may have switched from Personal to Brand while Personal's
+            // publish was running. Update only Personal's hidden snapshot; a late
+            // timer is never allowed to put its error on Brand's composer.
+            set((s) => {
+              const key = accountRoomKey(p, accountId);
+              const saved = s.accountRooms[key];
+              if (!saved?.composer.busy) return {};
+              return {
+                accountRooms: {
+                  ...s.accountRooms,
+                  [key]: { ...saved, composer: { ...saved.composer, busy: false, error: timeoutError } },
+                },
+              };
+            });
           }, 480_000);
           return;
         }
@@ -354,6 +503,26 @@ export const useDeck = create<DeckState>()(
         get().setComposer(p, { busy: true, error: null });
 
         window.setTimeout(() => {
+          if (get().activeAccountIds[p] !== accountId) {
+            // Demo work is local-only, so leaving its account cancels the fake
+            // publish and clears only that account's hidden busy flag.
+            set((s) => {
+              const key = accountRoomKey(p, accountId);
+              const saved = s.accountRooms[key];
+              if (!saved) return {};
+              return {
+                accountRooms: {
+                  ...s.accountRooms,
+                  [key]: {
+                    ...saved,
+                    composer: { ...saved.composer, busy: false },
+                    log: [...saved.log, logEntry("warn", "Demo publish canceled when this account was left.")].slice(-MAX_LOG),
+                  },
+                },
+              };
+            });
+            return;
+          }
           const fresh = get().rooms[p];
           const now = Date.now();
           const niche = fresh.engine.activeNiche;
@@ -419,18 +588,24 @@ export const useDeck = create<DeckState>()(
       startEngine: (p) => {
         const room = get().rooms[p];
         if (room.engine.running) return;
-        if (!room.session || room.session.state !== "logged-in") {
+        const youtubeOAuth = p === "youtube" && room.live.youtubeOAuthConnected;
+        if (!room.session || (room.session.state !== "logged-in" && !youtubeOAuth)) {
           get().addLog(p, [
-            logEntry("warn", "Start blocked — log in to the platform in the browser first (demo: tap Log in)."),
+            logEntry(
+              "warn",
+              p === "youtube"
+                ? "Start blocked — connect Google or sign in to YouTube in this account browser first."
+                : "Start blocked — log in to the platform in the browser first (demo: tap Log in)."
+            ),
           ]);
           return;
         }
         if (room.session.mode === "live") {
-          if (!isLiveConnected(p)) {
+          if (!isLiveConnected(p, room.accountId ?? "default")) {
             get().addLog(p, [logEntry("err", "Worker not connected — connect it in the Worker card first.")]);
             return;
           }
-          sendBusRaw(p, { type: "engine", action: "start" });
+          sendBusRaw(p, room.accountId ?? "default", { type: "engine", action: "start" });
           set((s) => ({
             rooms: {
               ...s.rooms,
@@ -473,7 +648,7 @@ export const useDeck = create<DeckState>()(
       stopEngine: (p) => {
         const room = get().rooms[p];
         if (room.session?.mode === "live") {
-          sendBusRaw(p, { type: "engine", action: "stop" });
+          sendBusRaw(p, room.accountId ?? "default", { type: "engine", action: "stop" });
         }
         set((s) => ({
           rooms: {
@@ -533,10 +708,21 @@ export const useDeck = create<DeckState>()(
             : "idle";
           let posts = room.posts;
           const last = snap.lastPost;
+          const optimistic = room.composer.lastPostedId
+            ? posts.find((post) => post.id === room.composer.lastPostedId)
+            : undefined;
+          const lastIsOptimistic = !!(
+            optimistic &&
+            last &&
+            last.source === "manual" &&
+            last.requestId === optimistic.id &&
+            optimistic.url === last.sourceUrl &&
+            optimistic.caption === last.caption
+          );
           if (last) {
             const idx = posts.findIndex(
               (pr) =>
-                pr.url === last.url &&
+                (pr.url === last.url || (!!last.sourceUrl && pr.url === last.sourceUrl)) &&
                 pr.caption === last.caption &&
                 Math.abs(pr.postedAt - last.postedAt) < 6 * 3_600_000
             );
@@ -557,6 +743,20 @@ export const useDeck = create<DeckState>()(
               posts = [...posts, rec].slice(-MAX_POSTS);
             }
           }
+          let composer = room.composer;
+          if (snap.manualBusy === false && room.composer.busy) {
+            if (optimistic && !lastIsOptimistic) {
+              posts = posts.filter((post) => post.id !== optimistic.id);
+            }
+            composer = {
+              ...room.composer,
+              busy: false,
+              lastPostedId: null,
+              error: lastIsOptimistic
+                ? null
+                : room.composer.error || "The worker is no longer publishing this request; no success receipt was returned.",
+            };
+          }
           return {
             rooms: {
               ...s.rooms,
@@ -574,6 +774,7 @@ export const useDeck = create<DeckState>()(
                   thresholdViews: snap.thresholdViews,
                   likesFloor: snap.likesFloor,
                 },
+                composer,
                 posts,
               },
             },
@@ -581,44 +782,61 @@ export const useDeck = create<DeckState>()(
         });
       },
 
-      applyLivePostFailed: (p, message) => {
-        const c = get().rooms[p].composer;
-        if (c.lastPostedId) {
-          // The placeholder `postNow` inserted has to go back out: a history entry
-          // for a video that was never published is worse than no feedback at all,
-          // and it would be measured for metrics forever.
-          const id = c.lastPostedId;
-          set((s) => {
-            const room = s.rooms[p];
-            return { rooms: { ...s.rooms, [p]: { ...room, posts: room.posts.filter((x) => x.id !== id) } } };
-          });
-        }
-        get().setComposer(p, { busy: false, error: message, lastPostedId: null });
+      applyLivePostFailed: (p, message, requestId) => {
+        set((s) => {
+          const room = s.rooms[p];
+          // `post-failed` is manual-only, so an older worker without correlation
+          // can safely fall back to the one current manual placeholder.
+          const failedId = requestId ?? room.composer.lastPostedId ?? undefined;
+          const isCurrent = !!failedId && room.composer.lastPostedId === failedId;
+          return {
+            rooms: {
+              ...s.rooms,
+              [p]: {
+                ...room,
+                // A history entry for a video that was never published is worse
+                // than no feedback. The request id prevents a late failure from
+                // deleting a newer account-local publish.
+                posts: failedId ? room.posts.filter((post) => post.id !== failedId) : room.posts,
+                composer: isCurrent
+                  ? { ...room.composer, busy: false, error: message, lastPostedId: null }
+                  : room.composer,
+              },
+            },
+          };
+        });
       },
 
-      applyLivePostOk: (p, url) => {
-        const optimisticId = get().rooms[p].composer.lastPostedId;
-        if (url && optimisticId) {
-          // The optimistic row starts with the source link. Once the worker has a
-          // destination URL, replace it so history/metrics never call the source
-          // video our live upload.
-          set((s) => {
-            const room = s.rooms[p];
-            return {
-              rooms: {
-                ...s.rooms,
-                [p]: {
-                  ...room,
-                  posts: room.posts.map((post) => (post.id === optimisticId ? { ...post, url } : post)),
-                },
+      applyLivePostOk: (p, url, requestId) => {
+        set((s) => {
+          const room = s.rooms[p];
+          const isCurrent = !!requestId && room.composer.lastPostedId === requestId;
+          return {
+            rooms: {
+              ...s.rooms,
+              [p]: {
+                ...room,
+                // Only the matching manual placeholder can receive this receipt.
+                // Auto-publish events intentionally have no request id and cannot
+                // clear or relabel a manual operation that happens at the same time.
+                posts:
+                  requestId && url
+                    ? room.posts.map((post) => (post.id === requestId ? { ...post, url } : post))
+                    : room.posts,
+                composer: isCurrent
+                  ? { ...room.composer, busy: false, error: null, lastPostedId: null }
+                  : room.composer,
+                log: [
+                  ...room.log,
+                  logEntry(
+                    "ok",
+                    `✅ ${requestId ? "Live" : "Automatic"} publish confirmed${url ? ` — ${url.slice(0, 72)}` : ""} · audience Everyone.`
+                  ),
+                ].slice(-MAX_LOG),
               },
-            };
-          });
-        }
-        get().setComposer(p, { busy: false, error: null, lastPostedId: null });
-        get().addLog(p, [
-          logEntry("ok", `✅ Live publish confirmed${url ? ` — ${url.slice(0, 72)}` : ""} · audience Everyone.`),
-        ]);
+            },
+          };
+        });
       },
 
       addLog: (p, entries) => {
@@ -655,17 +873,104 @@ export const useDeck = create<DeckState>()(
       },
 
       resetRoom: (p) => {
-        set((s) => ({
-          rooms: { ...s.rooms, [p]: defaultRoom(p) },
-        }));
+        set((s) => {
+          const id = s.activeAccountIds[p];
+          const account = id ? s.accounts[p].find((item) => item.id === id) : undefined;
+          return { rooms: { ...s.rooms, [p]: defaultRoom(p, account) } };
+        });
       },
     }),
     {
       name: "viraldeck-v1",
-      partialize: (s) => ({ rooms: s.rooms }),
+      partialize: (s) => {
+        // The open room is fresher than its menu snapshot. Overlay it at write
+        // time so a refresh never loses a caption, post receipt or engine state.
+        const accountRooms = { ...s.accountRooms };
+        for (const platform of PLATFORMS) {
+          const accountId = s.activeAccountIds[platform];
+          if (!accountId) continue;
+          accountRooms[accountRoomKey(platform, accountId)] = {
+            ...s.rooms[platform],
+            live: { ...s.rooms[platform].live, connected: false },
+          };
+        }
+        return { accounts: s.accounts, accountRooms };
+      },
       merge: (persisted, current) => {
-        const p = persisted as { rooms?: Partial<Record<Platform, Partial<Room>>> } | undefined;
-        return { ...current, rooms: normalizeRooms(p?.rooms) };
+        const raw = persisted as
+          | {
+              rooms?: Partial<Record<Platform, Partial<Room>>>;
+              accounts?: Partial<Record<Platform, ManagedAccount[]>>;
+              accountRooms?: Record<string, Partial<Room>>;
+            }
+          | undefined;
+        const accounts = emptyAccounts();
+        const accountRooms: Record<string, Room> = {};
+        for (const platform of PLATFORMS) {
+          const candidateAccounts = raw?.accounts?.[platform];
+          const seenIds = new Set<string>();
+          const listed = (Array.isArray(candidateAccounts) ? candidateAccounts : [])
+            .filter((account): account is ManagedAccount => {
+              if (
+                !account ||
+                typeof account !== "object" ||
+                typeof account.id !== "string" ||
+                !/^[a-z0-9][a-z0-9_-]{0,63}$/i.test(account.id) ||
+                seenIds.has(account.id)
+              ) {
+                return false;
+              }
+              seenIds.add(account.id);
+              return true;
+            })
+            .map((account) => ({
+              ...account,
+              name: cleanAccountName(typeof account.name === "string" ? account.name : "") || "Account",
+              platform,
+              createdAt: Number.isFinite(account.createdAt) ? account.createdAt : Date.now(),
+              lastOpenedAt: Number.isFinite(account.lastOpenedAt) ? account.lastOpenedAt : null,
+            }));
+          accounts[platform] = listed;
+          for (const account of listed) {
+            const key = accountRoomKey(platform, account.id);
+            accountRooms[key] = normalizeRoom({
+              ...(raw?.accountRooms?.[key] ?? defaultRoom(platform, account)),
+              platform,
+              accountId: account.id,
+              accountName: account.name,
+            });
+          }
+
+          // One-time migration: the pre-account app had one persistent profile
+          // per platform. Put it behind an account tile without moving its disk
+          // profile, cookies, posts or running-engine state.
+          if (!listed.length && raw?.rooms?.[platform]) {
+            const legacy = normalizeRoom(raw.rooms[platform] as Partial<Room>);
+            if (meaningfulLegacyRoom(legacy)) {
+              const account: ManagedAccount = {
+                id: "default",
+                name: `Existing ${platform === "youtube" ? "YouTube" : platform[0].toUpperCase() + platform.slice(1)} account`,
+                platform,
+                createdAt: legacy.session?.startedAt ?? Date.now(),
+                lastOpenedAt: null,
+              };
+              accounts[platform] = [account];
+              accountRooms[accountRoomKey(platform, account.id)] = {
+                ...legacy,
+                accountId: account.id,
+                accountName: account.name,
+                live: { ...legacy.live, connected: false },
+              };
+            }
+          }
+        }
+        return {
+          ...current,
+          rooms: normalizeRooms(),
+          accounts,
+          accountRooms,
+          activeAccountIds: emptyActiveAccounts(),
+        };
       },
     }
   )

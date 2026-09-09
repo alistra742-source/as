@@ -36,7 +36,8 @@ export function EnginePanel({ room }: { room: Room }) {
   const toggleNiche = useDeck((s) => s.toggleNiche);
   const [, force] = useState(0);
   const engine = room.engine;
-  const loggedIn = room.session?.state === "logged-in";
+  const oauthReady = room.platform === "youtube" && room.live.youtubeOAuthConnected;
+  const loggedIn = room.session?.state === "logged-in" || oauthReady;
   const hasSession = !!room.session;
 
   useEffect(() => {
@@ -66,7 +67,15 @@ export function EnginePanel({ room }: { room: Room }) {
               size="sm"
               onClick={() => startEngine(room.platform)}
               disabled={!loggedIn || !hasSession}
-              title={!hasSession ? "Open a browser session first" : !loggedIn ? "Log in in the browser first" : ""}
+              title={
+                !hasSession
+                  ? "Open the account browser first"
+                  : !loggedIn
+                    ? room.platform === "youtube"
+                      ? "Connect Google or sign in in this account browser first"
+                      : "Log in in the browser first"
+                    : ""
+              }
             >
               <Play className="size-3.5" /> Start
             </Button>
@@ -217,7 +226,8 @@ export function ComposerPanel({ room }: { room: Room }) {
   const setComposer = useDeck((s) => s.setComposer);
   const postNow = useDeck((s) => s.postNow);
   const c = room.composer;
-  const loggedIn = room.session?.state === "logged-in";
+  const oauthReady = room.platform === "youtube" && room.live.youtubeOAuthConnected;
+  const loggedIn = room.session?.state === "logged-in" || oauthReady;
   const niche = NICHE_LABEL[room.engine.activeNiche];
 
   return (
@@ -228,7 +238,9 @@ export function ComposerPanel({ room }: { room: Room }) {
         sub={
           room.session?.mode === "demo"
             ? "Demo mode — posting is simulated"
-            : "Sent to your live browser — real publish"
+            : oauthReady
+              ? "Official YouTube API upload — browser remains available as fallback"
+              : "Sent to your live browser — real publish"
         }
         right={
           <Chip tone={room.session?.mode === "demo" ? "amber" : "green"}>
@@ -286,8 +298,16 @@ export function ComposerPanel({ room }: { room: Room }) {
           <Button
             size="md"
             loading={c.busy}
-            disabled={!loggedIn}
-            title={!loggedIn ? "Sign in in the browser (or paste a session cookie) first" : ""}
+            disabled={!loggedIn || !room.session}
+            title={
+              !room.session
+                ? "Open the account browser so the worker command channel is connected"
+                : !loggedIn
+                  ? room.platform === "youtube"
+                    ? "Connect Google, sign in in the browser, or paste a session cookie first"
+                    : "Sign in in the browser (or paste a session cookie) first"
+                  : ""
+            }
             onClick={() => postNow(room.platform)}
           >
             {c.url.trim() ? (c.busy ? "Grabbing video + publishing…" : "Post video") : <Sparkles className="size-4" />}
@@ -516,6 +536,7 @@ const COOKIE_FIELD: Record<Platform, { name: string; site: string; via: string }
  */
 export function SessionCookiePanel({ room }: { room: Room }) {
   const p = room.platform;
+  const accountId = room.accountId ?? "default";
   const live = room.live;
   const addLog = useDeck((s) => s.addLog);
   const [value, setValue] = useState("");
@@ -543,7 +564,7 @@ export function SessionCookiePanel({ room }: { room: Room }) {
     const raw = value.trim();
     if (!raw) return;
     if (running) return;
-    if (!sendBusCookie(p, "apply", raw)) {
+    if (!sendBusCookie(p, accountId, "apply", raw)) {
       log("warn", "No worker socket open — the live browser above has to be connected before there is a profile to sign in.");
       return;
     }
@@ -555,7 +576,7 @@ export function SessionCookiePanel({ room }: { room: Room }) {
   }
 
   function clear() {
-    if (!sendBusCookie(p, "clear")) {
+    if (!sendBusCookie(p, accountId, "clear")) {
       log("warn", "No worker socket open — nothing to clear.");
       return;
     }
@@ -615,7 +636,7 @@ export function SessionCookiePanel({ room }: { room: Room }) {
             size="sm"
             variant="ghost"
             onClick={() => {
-              if (!sendBusCmd(p, { t: "check-upload" })) {
+              if (!sendBusCmd(p, accountId, { t: "check-upload" })) {
                 log("warn", "No worker socket open — there is no browser to check.");
                 return;
               }

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { launchPersistentContext, RELEASE } from "clearcote";
+import { accountProfileDir, LEGACY_ACCOUNT_ID } from "./accountScope.js";
 import { browserEngine, dockSize, installStealthLite, launchPlaywrightContext, playwrightChromiumPath } from "./browserLaunch.js";
 import type { BrowserContext, Page } from "playwright-core";
 import { cgroupMemoryMb, env, stealth, driverInfo, START_URLS, v8HeapMb, type PlatformKey } from "./config.js";
@@ -319,6 +320,8 @@ async function pressLabel(page: Page, rawLabel: string): Promise<{ ok: boolean; 
 
 export class Rig {
   platform: PlatformKey;
+  readonly accountId: string;
+  accountName: string;
   store: Store;
   clients = new Set<RigClient>();
   context: BrowserContext | null = null;
@@ -350,6 +353,11 @@ export class Rig {
   private lastUrl = "";
   private crashes = 0;
   private recovering = false;
+  /** True only for an intentional hibernate/close; suppresses the crash alarm. */
+  private closing = false;
+  /** A reconnect that lands during hibernation waits for the old profile owner
+   * to exit before launching another Chromium against the same disk profile. */
+  private closeInFlight: Promise<void> | null = null;
   /**
    * "Tap the verification method for me." The code/identity screen is the one
    * place a login stalls forever when a press does not land — a list of bare
@@ -371,15 +379,33 @@ export class Rig {
   private driving = false;
   /** The screen signature we last acted on, so one modal = at most a few presses. */
 
-  constructor(platform: PlatformKey, store: Store) {
+  constructor(
+    platform: PlatformKey,
+    store: Store,
+    accountId = LEGACY_ACCOUNT_ID,
+    accountName = "Default"
+  ) {
     this.platform = platform;
+    this.accountId = accountId;
+    this.accountName = accountName.trim().slice(0, 48) || "Account";
     this.store = store;
   }
 
+  /** The label is display metadata, but a runtime discovered from disk before
+   * the deck reconnects must still learn the real name rather than stay “Account”. */
+  setAccountName(name: string) {
+    this.accountName = name.trim().slice(0, 48) || this.accountName;
+  }
+
+  /** Each named account owns a persistent cookie/storage profile of its own. */
   profileDir(): string {
-    const dir = path.join(env.dataDir, `profile-${this.platform}`);
+    const dir = accountProfileDir(env.dataDir, this.platform, this.accountId);
     fs.mkdirSync(dir, { recursive: true });
     return dir;
+  }
+
+  private identitySeed(): string {
+    return `${this.platform}-${this.accountId}`;
   }
 
   broadcast(msg: ServerMsg) {
@@ -393,6 +419,9 @@ export class Rig {
   }
 
   async ensureContext(): Promise<BrowserContext> {
+    // Never overlap an intentional close with a relaunch of the same persistent
+    // directory: Chromium's singleton lock is an identity boundary, not a retry.
+    if (this.closeInFlight) await this.closeInFlight;
     if (this.context) return this.context;
     if (this.launching) return this.launching;
     this.launching = this.launchContext().finally(() => {
@@ -439,6 +468,7 @@ export class Rig {
           `${stealthDietOn() ? ", renderer limit 3 + site isolation off" : ""}${mem.text ? `, ${mem.text}` : ""}) — opening ${START_URLS[this.platform]}`
       );
       this.context.on("close", () => {
+        if (this.closing) return;
         console.error(`[${this.platform}] browser closed unexpectedly — will relaunch on next connect`);
         this.lastFatal = "The browser process exited (crash or out-of-memory). Reconnecting will relaunch it.";
         this.broadcast({ type: "error", message: `Browser exited: ${this.lastFatal}` });
@@ -543,8 +573,8 @@ export class Rig {
         locale: "en-US",
         timezoneId: stealth.timezone,
         args: launchArgs(profile),
-        // Clearcote persona: one coherent, seed-stable machine identity per platform.
-        fingerprint: stealth.seed(this.platform),
+        // One coherent, seed-stable machine identity per isolated account.
+        fingerprint: stealth.seed(this.identitySeed()),
         platform: stealth.platform,
         lightStealth: stealth.lightStealth,
         timezone: stealth.timezone,
@@ -576,6 +606,7 @@ export class Rig {
       // If the browser dies later (OOM kill, crash), drop everything so the
       // next connect relaunches instead of screenshotting a corpse forever.
       this.context.on("close", () => {
+        if (this.closing) return;
         console.error(`[${this.platform}] browser closed unexpectedly — will relaunch on next connect`);
         this.lastFatal = "The browser process exited (crash or out-of-memory). Reconnecting will relaunch it.";
         this.broadcast({ type: "error", message: `Browser exited: ${this.lastFatal}` });
@@ -605,7 +636,7 @@ export class Rig {
   }
 
   private humanizeOpts() {
-    return { humanize: stealth.humanize, showCursor: stealth.showCursor, seed: stealth.seed(this.platform) };
+    return { humanize: stealth.humanize, showCursor: stealth.showCursor, seed: stealth.seed(this.identitySeed()) };
   }
 
   /**
@@ -1059,7 +1090,7 @@ export class Rig {
         this.signedOutStreak = 0;
         this.lastSignedOutLookAt = 0;
         if (!prev) {
-          this.store.setLoggedIn(this.platform, true);
+          this.store.setLoggedIn(this.platform, true, this.accountName);
           this.broadcast({ type: "login", loggedIn: true });
           this.broadcast({ type: "log", level: "ok", text: `✅ Signed in detected on ${this.platform} — the engine may act.`, at: Date.now() });
         }
@@ -1488,16 +1519,35 @@ export class Rig {
     }
   }
 
-  async close() {
-    this.stopLoops();
-    this.clients.clear();
-    const ctx = this.context;
-    this.teardown();
-    this.lastFatal = null;
+  async close(): Promise<void> {
+    if (this.closeInFlight) return this.closeInFlight;
+    const task = (async () => {
+      this.closing = true;
+      this.stopLoops();
+      // Do not clear clients: an authenticated socket can arrive in the tiny
+      // gap between an idle check and context.close(). It should wait and then
+      // relaunch this same profile, not become an untracked live connection.
+      // A cold Chromium launch can outlive the 30-second hibernation grace. Join
+      // it before teardown; otherwise it can finish after close(), take ownership
+      // of the profile with no clients, and evade both hibernation and relaunch
+      // serialization.
+      if (!this.context && this.launching) await this.launching.catch(() => undefined);
+      const ctx = this.context;
+      this.teardown();
+      this.lastFatal = null;
+      try {
+        await ctx?.close();
+      } catch {
+        /* already closed */
+      } finally {
+        this.closing = false;
+      }
+    })();
+    this.closeInFlight = task;
     try {
-      await ctx?.close();
-    } catch {
-      /* already closed */
+      await task;
+    } finally {
+      if (this.closeInFlight === task) this.closeInFlight = null;
     }
   }
 }

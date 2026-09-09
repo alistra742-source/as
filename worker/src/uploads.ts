@@ -256,7 +256,9 @@ export async function downloadVideo(
       // complete file (the 20.6 MB success in the report used that path).
       if (/googlevideo\.com/i.test(candidate.url)) headers.range = "bytes=0-";
       const resp = await ctx.request
-        .get(candidate.url, { headers, timeout: 120_000 })
+        // A CDN candidate is already host-allowlisted. Do not let a redirect turn
+        // that checked URL into a fetch of an unrelated/private destination.
+        .get(candidate.url, { headers, timeout: 120_000, maxRedirects: 0 })
         .catch((error) => ((lastNote = `fetch failed: ${(error as Error).message}`), null));
       if (!resp) {
         log(`  · candidate ${n}/${maxFetches} ${host} (${candidate.from}) → ${lastNote}`);

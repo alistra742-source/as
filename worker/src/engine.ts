@@ -5,6 +5,8 @@ import { Store, type WorkerPost } from "./store.js";
 import type { Page } from "playwright-core";
 import { Rig, readVideoStats, scrapeCandidates, scrapeCommentSample } from "./browser.js";
 import { downloadVideo, isTabGone, uploadToPlatform } from "./uploads.js";
+import { enhanceVideoForUpload } from "./mediaEnhance.js";
+import { uploadYouTubeWithOAuth, youtubeOAuthConnected } from "./youtubeOAuth.js";
 import { groqAvailable, interpretMetrics, judgeCandidate, writeCaption } from "./groq.js";
 import { jitter, readingPause, sleep, thinkingPause } from "./human.js";
 import { publishReceipt } from "./publishReceipt.js";
@@ -38,6 +40,20 @@ export class GrowthEngine {
   private manualBusy = false;
   private hitNiche: string | null = null;
 
+  /** Used only to avoid hibernating an account while its manual/auto job runs. */
+  isBusy(): boolean {
+    return this.inFlight || this.manualBusy;
+  }
+
+  /** A connected YouTube OAuth grant is a destination login even when the
+   * optional Studio browser itself is signed out. Other platforms stay browser-only. */
+  private publishAuthenticated(): boolean {
+    return (
+      this.store.rig(this.platform).loggedIn ||
+      (this.platform === "youtube" && youtubeOAuthConnected(this.rig.accountId))
+    );
+  }
+
   constructor(platform: PlatformKey, store: Store, rig: Rig) {
     this.platform = platform;
     this.store = store;
@@ -67,6 +83,8 @@ export class GrowthEngine {
       ? {
           id: last.id,
           url: last.url,
+          sourceUrl: last.sourceUrl,
+          requestId: last.requestId,
           caption: last.caption,
           niche: last.niche,
           source: last.source,
@@ -86,7 +104,11 @@ export class GrowthEngine {
       cadenceHours: e.cadenceHours,
       thresholdViews: e.thresholdViews,
       likesFloor: e.likesFloor,
+      // This wire field drives the browser-session badge only. YouTube OAuth is
+      // separate destination authentication and must not pretend Chromium itself
+      // is signed in.
       loggedIn: this.store.rig(this.platform).loggedIn,
+      manualBusy: this.manualBusy,
       lastPost,
     };
   }
@@ -163,12 +185,12 @@ export class GrowthEngine {
 
   async runCycle(reason: string) {
     const e = this.store.engine(this.platform);
-    if (!e.running || this.inFlight) return;
+    if (!e.running || this.inFlight || this.manualBusy) return;
     this.inFlight = true;
     try {
-      if (!this.store.rig(this.platform).loggedIn) {
+      if (!this.publishAuthenticated()) {
         e.phase = "analyzing";
-        e.message = "Signed in? Waiting for login before the engine acts…";
+        e.message = "Signed in? Waiting for a browser login or YouTube Google connection before the engine acts…";
         this.store.save();
         this.pushEngine();
         return;
@@ -343,8 +365,12 @@ export class GrowthEngine {
       const caption = best.caption || (await writeCaption({ niche, hook: best.angle }));
       // A human sits with the chosen clip for a beat before publishing it.
       await thinkingPause(800, 2600);
-      const video = await downloadVideo(page, this.rig.context!, bestUrl, (t) => this.log("info", t));
-      const result = await uploadToPlatform(this.platform, page, video, caption, (t) => this.log("info", t));
+      const sourceVideo = await downloadVideo(page, this.rig.context!, bestUrl, (t) => this.log("info", t));
+      const video = await enhanceVideoForUpload(sourceVideo, (t) => this.log("info", t));
+      const result =
+        this.platform === "youtube" && youtubeOAuthConnected(this.rig.accountId)
+          ? await uploadYouTubeWithOAuth(this.rig.accountId, video, caption, (t) => this.log("info", t))
+          : await uploadToPlatform(this.platform, page, video, caption, (t) => this.log("info", t));
       const receipt = publishReceipt(result, bestUrl);
       if (!receipt.confirmed) throw new Error(`Publish was not confirmed: ${receipt.error}`);
       const post: WorkerPost = {
@@ -382,23 +408,33 @@ export class GrowthEngine {
 
   /* -------------------------------- manual post ----------------------------- */
 
-  async manualPost(url: string, caption: string) {
+  async manualPost(url: string, caption: string, rawRequestId?: string) {
     const e = this.store.engine(this.platform);
-    if (this.manualBusy) {
-      this.log("warn", "A publish is already in progress — one at a time.");
-      this.toast("A publish is already running — one at a time.", "warn");
-      return false;
-    }
-    if (!this.store.rig(this.platform).loggedIn) {
-      this.log("warn", "Manual post blocked — sign in to the platform in the live browser first.");
-      this.toast("Not signed in on this profile — sign in (or paste a session cookie) first.", "warn");
+    const requestId = /^[a-z0-9][a-z0-9_-]{0,79}$/i.test(rawRequestId || "") ? rawRequestId : undefined;
+    const reject = (message: string, detail = message) => {
+      this.log("warn", detail);
+      this.rig.broadcast({ type: "post-failed", message, requestId });
+      this.toast(message, "warn");
       this.pushEngine();
       return false;
+    };
+    if (this.manualBusy) {
+      return reject("A publish is already running on this named account — wait for its receipt, then try again.");
+    }
+    if (this.inFlight) {
+      return reject("The automatic engine is using this account browser right now — retry when this pass finishes.");
+    }
+    if (!this.publishAuthenticated()) {
+      return reject(
+        "Not signed in on this account — use the browser, session cookie, or YouTube Connect Google first.",
+        "Manual post blocked — sign in to the browser or connect this named YouTube account to Google first."
+      );
     }
     if (!/^https?:\/\//i.test((url || "").trim())) {
-      this.log("warn", `Manual post needs a real link — got “${String(url).slice(0, 40)}”.`);
-      this.toast("The source link has to be a full http(s) URL.", "warn");
-      return false;
+      return reject(
+        "The source link has to be a full http(s) URL.",
+        `Manual post needs a real link — got “${String(url).slice(0, 40)}”.`
+      );
     }
     this.manualBusy = true;
     const prevPhase = e.phase;
@@ -435,35 +471,64 @@ export class GrowthEngine {
         video = await grabInBackground();
       }
 
-      stage(`Uploading ${(video.buffer.length / 1_048_576).toFixed(1)} MB to ${this.platform} in the live browser…`);
-      const publish = (page: Page) =>
-        uploadToPlatform(this.platform, page, video, caption || "Posted via ViralDeck", (t) => this.log("info", t));
-
-      // The upload itself still runs in the streamed tab: the user watches Studio
-      // open, the file attach, Got it close, the caption land and Post get pressed.
-      // Fall back to an owned tab only if no control tab is available.
-      const inOwnTab = async () => {
-        const own = await this.rig.newEnginePage();
-        try {
-          return await publish(own);
-        } finally {
-          await own.close().catch(() => undefined);
+      stage("Inspecting source quality and preparing a clean upload master…");
+      video = await enhanceVideoForUpload(video, (t) => this.log("info", t));
+      const useYouTubeApi = this.platform === "youtube" && youtubeOAuthConnected(this.rig.accountId);
+      let result: { ok: boolean; message: string; liveUrl?: string };
+      if (useYouTubeApi) {
+        stage(
+          `Uploading ${(video.buffer.length / 1_048_576).toFixed(1)} MB quality-approved master through the official YouTube API…`
+        );
+        result = await uploadYouTubeWithOAuth(
+          this.rig.accountId,
+          video,
+          caption || "Posted via ViralDeck",
+          (t) => this.log("info", t)
+        );
+        // The source stayed in a background tab. Once Google returns a strict
+        // video id, leave the streamed browser on the public destination rather
+        // than on the source clip or a pretend success page.
+        if (result.liveUrl) {
+          stage("YouTube confirmed the public video — opening its destination in the live browser…");
+          await this.rig
+            .withVisibleTab(async (visible) => {
+              await visible.goto(result.liveUrl!, { waitUntil: "domcontentloaded", timeout: 45_000 });
+              return true;
+            })
+            .catch(() => undefined);
         }
-      };
-      const attempt = async () => (await this.rig.withVisibleTab(publish)).value ?? (await inOwnTab());
-      let result: Awaited<ReturnType<typeof attempt>>;
-      try {
-        result = await attempt();
-      } catch (err) {
-        // The tab died under us after the video was already downloaded. Reuse the
-        // same bytes; never reopen/refetch the source video for an upload crash.
-        if (!isTabGone(err)) throw err;
-        stage("The upload tab died mid-publish — waiting for the browser and retrying the same file once…");
-        this.log("warn", `Upload lost its tab (${(err as Error).message}); waiting for the reopen, then retrying the same file once.`);
-        if (!(await this.rig.waitForRecovery())) throw err;
-        await sleep(1200); // the reopened page needs its own moment before a goto
-        result = await attempt();
-        this.log("ok", "Retry after the upload-tab crash got through.");
+      } else {
+        stage(
+          `Uploading ${(video.buffer.length / 1_048_576).toFixed(1)} MB quality-approved master to ${this.platform} in the live browser…`
+        );
+        const publish = (page: Page) =>
+          uploadToPlatform(this.platform, page, video, caption || "Posted via ViralDeck", (t) => this.log("info", t));
+
+        // Browser fallback: the user watches Studio open, the file attach, the
+        // caption land and Post get pressed. Use an owned tab only if no streamed
+        // control tab is available.
+        const inOwnTab = async () => {
+          const own = await this.rig.newEnginePage();
+          try {
+            return await publish(own);
+          } finally {
+            await own.close().catch(() => undefined);
+          }
+        };
+        const attempt = async () => (await this.rig.withVisibleTab(publish)).value ?? (await inOwnTab());
+        try {
+          result = await attempt();
+        } catch (err) {
+          // The tab died under us after the video was already downloaded. Reuse
+          // the same bytes; never reopen/refetch the source for an upload crash.
+          if (!isTabGone(err)) throw err;
+          stage("The upload tab died mid-publish — waiting for the browser and retrying the same file once…");
+          this.log("warn", `Upload lost its tab (${(err as Error).message}); waiting for the reopen, then retrying the same file once.`);
+          if (!(await this.rig.waitForRecovery())) throw err;
+          await sleep(1200);
+          result = await attempt();
+          this.log("ok", "Retry after the upload-tab crash got through.");
+        }
       }
       // This was the old false-success path: uploadTikTok returned ok:false after
       // Post was blocked, yet the engine stored/broadcast the *source* URL as a
@@ -474,6 +539,7 @@ export class GrowthEngine {
         id: uid(),
         url: receipt.recordUrl,
         sourceUrl: url,
+        requestId,
         caption: caption || "Posted via ViralDeck",
         niche: e.niche,
         source: "manual",
@@ -483,7 +549,13 @@ export class GrowthEngine {
         verdict: null,
       };
       this.store.addPost(this.platform, post);
-      this.rig.broadcast({ type: "post-ok", postId: post.id, postedAt: post.postedAt, url: receipt.liveUrl });
+      this.rig.broadcast({
+        type: "post-ok",
+        postId: post.id,
+        postedAt: post.postedAt,
+        url: receipt.liveUrl,
+        requestId,
+      });
       this.log(
         "ok",
         `✅ Manual publish verified${receipt.liveUrl ? ` at ${receipt.liveUrl.slice(0, 90)}` : " by the studio"} — ` +
@@ -506,7 +578,7 @@ export class GrowthEngine {
       // The deck's Post button waits for one of these two answers; without this it
       // spins for its own timeout and the user is left deciding whether anything
       // ever ran. The failure says which stage died so the fix is actionable.
-      this.rig.broadcast({ type: "post-failed", message });
+      this.rig.broadcast({ type: "post-failed", message, requestId });
       this.toast(`Publish failed: ${message}`, "err");
       e.phase = prevPhase === "paused" ? "paused" : "idle";
       this.store.save();
@@ -514,6 +586,9 @@ export class GrowthEngine {
       return false;
     } finally {
       this.manualBusy = false;
+      // Reconnects use this final snapshot to clear a stale local spinner without
+      // ever applying one account's completion to another account's composer.
+      this.pushEngine();
       // The user's tab is left where the destination studio put it. The source
       // page lived only in the temporary background tab and is already closed.
     }

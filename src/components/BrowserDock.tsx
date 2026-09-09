@@ -57,6 +57,7 @@ function DockToolbar({ platform }: { platform: Platform }) {
 
   const loggedIn = room.session?.state === "logged-in";
   const isLive = room.session?.mode === "live";
+  const accountId = room.accountId ?? "default";
 
   return (
     <div className="border-b border-line-soft">
@@ -112,7 +113,7 @@ function DockToolbar({ platform }: { platform: Platform }) {
               if (e.key === "Enter" && urlDraft.trim()) {
                 const target = /^https?:\/\//.test(urlDraft.trim()) ? urlDraft.trim() : `https://${urlDraft.trim()}`;
                 if (room.session?.mode === "demo") setSession(platform, { url: target });
-                else sendBusCmd(platform, { t: "navigate", url: target });
+                else sendBusCmd(platform, accountId, { t: "navigate", url: target });
                 setUrlDraft(target);
               }
             }}
@@ -133,7 +134,7 @@ function DockToolbar({ platform }: { platform: Platform }) {
           <button
             key={u}
             onClick={() => {
-              if (room.session?.mode === "live") sendBusCmd(platform, { t: "navigate", url: u });
+              if (room.session?.mode === "live") sendBusCmd(platform, accountId, { t: "navigate", url: u });
               else if (room.session) setSession(platform, { url: u });
             }}
             className={cn(
@@ -226,6 +227,7 @@ function LiveViewport({ platform }: { platform: Platform }) {
   }, [tapMark]);
 
   const { wsUrl, token } = room.live;
+  const accountId = room.accountId ?? "default";
 
   useEffect(() => {
     // Empty URL = same-origin auto-connect (single-service deploy).
@@ -252,10 +254,10 @@ function LiveViewport({ platform }: { platform: Platform }) {
         ]);
       },
       onEngine: (state) => applyLiveEngine(platform, state),
-      onPostOk: (_id, _at, url) => applyLivePostOk(platform, url),
+      onPostOk: (_id, _at, url, requestId) => applyLivePostOk(platform, url, requestId),
       // A publish that died mid-grab used to be only a log line, three panels
       // away from the button that started it. Put it back on the button.
-      onPostFailed: (message) => applyLivePostFailed(platform, message),
+      onPostFailed: (message, requestId) => applyLivePostFailed(platform, message, requestId),
       onReady: (url, driver, proto) => {
         setSession(platform, { url, state: "open", driver: driver ?? null });
         // Tap-for-me and auto-tap are worker-side. A worker that predates them
@@ -299,10 +301,10 @@ function LiveViewport({ platform }: { platform: Platform }) {
           window.setTimeout(() => setAttempt((a) => a + 1), 6000);
         }
       },
-    });
+    }, accountId, room.accountName ?? "Account");
     return disconnect;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [platform, wsUrl, token, attempt]);
+  }, [platform, accountId, room.accountName, wsUrl, token, attempt]);
 
   useEffect(() => setLive(platform, { connected }), [connected, platform, setLive]);
 
@@ -311,8 +313,8 @@ function LiveViewport({ platform }: { platform: Platform }) {
   // an account while nobody is watching it.
   useEffect(() => {
     if (!connected) return;
-    sendBusCmd(platform, { t: "auto-verify", on: autoTap, label: AUTO_TAP_LABEL });
-  }, [connected, autoTap, platform]);
+    sendBusCmd(platform, accountId, { t: "auto-verify", on: autoTap, label: AUTO_TAP_LABEL });
+  }, [connected, autoTap, platform, accountId]);
 
   // Seconds spent without a frame — a wall clock beats a spinner that never ends.
   useEffect(() => {
@@ -324,7 +326,7 @@ function LiveViewport({ platform }: { platform: Platform }) {
     return () => window.clearInterval(id);
   }, [frame, connected]);
 
-  const send = useCallback((cmd: RemoteCmd) => sendBusCmd(platform, cmd), [platform]);
+  const send = useCallback((cmd: RemoteCmd) => sendBusCmd(platform, accountId, cmd), [platform, accountId]);
 
   const onPointerDown = (e: RPointerEvent<HTMLDivElement>) => {
     // Ignore a second finger; the first one owns the gesture.

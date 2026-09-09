@@ -146,7 +146,16 @@ export function candidateFromResponse(url: string, contentType: string, length: 
 }
 
 function resolutionOf(url: string): number {
-  const m = /(?:ratio=|_)(\d{3,4})p?([^a-z0-9]|$)/i.exec(url);
+  let readable = url;
+  try {
+    readable = decodeURIComponent(url);
+  } catch {
+    /* malformed percent escape: inspect the raw URL */
+  }
+  const m =
+    /(?:ratio|quality|resolution)[=:_-](\d{3,4})p?(?:[^a-z0-9]|$)/i.exec(readable) ||
+    /(?:adapt|normal|gear)[_-](\d{3,4})(?:p|_|[^a-z0-9]|$)/i.exec(readable) ||
+    /(?:^|[^\d])(\d{3,4})p(?:[^a-z0-9]|$)/i.exec(readable);
   const n = m ? Number(m[1]) : 0;
   return n >= 144 && n <= 4320 ? n : 0;
 }
@@ -186,10 +195,15 @@ function scoreOf(c: MediaCandidate, platform: SourcePlatform): number {
   if (MP4_HINT.test(url)) s += 30;
   if (/mime=video%2fmp4|mime=video\/mp4/i.test(url)) s += 26;
   const res = resolutionOf(url);
-  // 720p–1080p is the sweet spot for a re-upload; 144p preview trick is worthless.
-  if (res >= 480 && res <= 1440) s += 14;
-  else if (res && res < 360) s -= 22;
-  else if (res >= 2160) s -= 6; // a 4K file that will not fit the upload's memory diet
+  // Resolution outranks provenance: the player's first adaptive request is often
+  // 360/540p, while page JSON already exposes 720/1080p. Picking the sniffed one
+  // merely because it played first produced the visibly soft 540P upload.
+  if (res >= 2160) s += 34; // excellent, but a huge 4K file loses to a safer 1080p copy
+  else if (res >= 1080) s += 38;
+  else if (res >= 720) s += 31;
+  else if (res >= 540) s += 20;
+  else if (res >= 480) s += 11;
+  else if (res && res < 360) s -= 28;
   if (c.from === "player") s += 6; // the page's own player is playing it right now
   if (c.from === "network") s += 4; // some request succeeded with it
   if (c.from === "meta") s += 2;
@@ -277,9 +291,9 @@ export function mediaHostOk(url: string, platform: SourcePlatform): boolean {
     return false;
   }
   if (ASSET_HOST.test(host) || ASSET_HOST.test(url)) return false;
-  // An extensionless tiktok `play` endpoint is content even though the host is the
-  // site itself (`www.tiktok.com/aweme/v1/play/?video_id=…`).
-  if (platform === "tiktok" && /\/aweme\/v\d\/play/i.test(url)) return true;
+  // The host check is never bypassed by a familiar path: an attacker-controlled
+  // page can name its own endpoint `/aweme/v1/play`, but that does not make it a
+  // TikTok CDN. `www.tiktok.com` already matches the allowlist below.
   if (platform === "other") return true; // an unknown host keeps whatever looks like video
   return MEDIA_HOST[platform].test(host);
 }
