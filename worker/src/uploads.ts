@@ -1,4 +1,4 @@
-import type { BrowserContext, Page, Response } from "playwright-core";
+import type { BrowserContext, Locator, Page, Response } from "playwright-core";
 import { readingPause, sleep, thinkingPause } from "./human.js";
 import {
   CANDIDATE_ATTR,
@@ -1227,6 +1227,61 @@ export async function uploadToPlatform(
 
 /* --------------------------------- YouTube -------------------------------- */
 
+async function youtubeRadioChecked(radio: Locator): Promise<boolean> {
+  return radio
+    .evaluate((element) => {
+      const nodes = [element, ...Array.from(element.querySelectorAll("[role='radio'], input[type='radio']"))];
+      return nodes.some((node) => {
+        const control = node as HTMLElement & { checked?: boolean; selected?: boolean };
+        return (
+          control.checked === true ||
+          control.selected === true ||
+          control.getAttribute("aria-checked") === "true" ||
+          control.getAttribute("aria-selected") === "true" ||
+          (control.hasAttribute("checked") && control.getAttribute("checked") !== "false") ||
+          control.classList.contains("iron-selected")
+        );
+      });
+    })
+    .catch(() => false);
+}
+
+/** YouTube requires an explicit COPPA audience answer. Fail before Publish if
+ * Studio cannot prove that the exact “No” radio is selected. */
+async function ensureYouTubeNotMadeForKids(page: Page, log: StepLog): Promise<void> {
+  const notKids = page
+    .locator(
+      [
+        "ytcp-uploads-dialog tp-yt-paper-radio-button[name='VIDEO_MADE_FOR_KIDS_NOT_MFK']",
+        "ytcp-uploads-dialog paper-radio-button[name='VIDEO_MADE_FOR_KIDS_NOT_MFK']",
+        "ytcp-uploads-dialog [role='radio']:has-text(\"No, it's not made for kids\")",
+        "ytcp-uploads-dialog [role='radio']:has-text(\"No, it’s not made for kids\")",
+      ].join(", ")
+    )
+    .first();
+  try {
+    await notKids.waitFor({ state: "visible", timeout: 20_000 });
+  } catch {
+    throw new Error(
+      "YouTube Studio did not expose the exact “No, it's not made for kids” audience option; nothing was published."
+    );
+  }
+  if (!(await youtubeRadioChecked(notKids))) {
+    await notKids.click({ timeout: 8_000 });
+  }
+  const deadline = Date.now() + 8_000;
+  while (Date.now() < deadline) {
+    if (await youtubeRadioChecked(notKids)) {
+      log("Audience confirmed: No, it’s not made for kids.");
+      return;
+    }
+    await sleep(200);
+  }
+  throw new Error(
+    "YouTube Studio did not confirm “No, it's not made for kids” after the selection; nothing was published."
+  );
+}
+
 /**
  * Publish through YouTube Studio (youtube.com/upload). The user's spec maps
  * to: title = caption, visibility = Public (= TikTok's “Everyone”). Selectors
@@ -1276,14 +1331,9 @@ export async function uploadYouTube(page: Page, video: VideoFile, caption: strin
     log("Could not type the title automatically — paste it in the studio draft if needed.");
   }
 
-  // “Made for kids” — YouTube requires an explicit answer; choose “No”.
-  const notKids = page
-    .locator("ytcp-uploads-dialog div[role='radio']:has-text(\"No, it's not made for kids\"), ytcp-uploads-dialog:has-text(\"Made for kids\") div[role='radio']")
-    .first();
-  if ((await notKids.count()) > 0) {
-    await notKids.click({ timeout: 4000 }).catch(() => undefined);
-    await sleep(300);
-  }
+  // Never rely on a channel default or click the first radio in the audience
+  // section (that first option is usually “Yes”). Select and verify exact “No”.
+  await ensureYouTubeNotMadeForKids(page, log);
 
   // Visibility = Public (the “Everyone” audience). Best-effort: pick the
   // Public radio inside the upload dialog.
@@ -1308,13 +1358,13 @@ export async function uploadYouTube(page: Page, video: VideoFile, caption: strin
     .then(() => true)
     .catch(() => false);
   if (dialogGone) {
-    log("✅ YouTube publish confirmed — visibility Public (Everyone).");
-    return { ok: true as const, message: "Published on YouTube (Public)" };
+    log("✅ YouTube publish confirmed — Public (Everyone), not made for kids.");
+    return { ok: true as const, message: "Published on YouTube (Public; not made for kids)" };
   }
   const body = await page.evaluate(() => document.body?.innerText?.slice(0, 600) ?? "");
   if (/publish\s*ed/i.test(body) || /video\s+publish/i.test(body)) {
-    log("✅ YouTube publish confirmed — visibility Public (Everyone).");
-    return { ok: true as const, message: "Published on YouTube (Public)" };
+    log("✅ YouTube publish confirmed — Public (Everyone), not made for kids.");
+    return { ok: true as const, message: "Published on YouTube (Public; not made for kids)" };
   }
   return { ok: false as const, message: "Publish clicked but Studio kept the dialog open — check for an error in the live browser." };
 }

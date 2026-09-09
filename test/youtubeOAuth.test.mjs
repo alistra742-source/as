@@ -20,29 +20,53 @@ test("YouTube uses the first caption line as a Unicode-safe bounded title", () =
   assert.ok(!youtubeTitle(emoji).endsWith("\ud83c"), "a surrogate pair must not be split");
 });
 
-test("YouTube API metadata keeps the supplied caption exact and visibility Public", () => {
+test("YouTube API metadata keeps the caption exact, Public, and explicitly not for kids", () => {
   const caption = "Exact caption #tag\nSecond line — unchanged";
   const metadata = youtubeUploadMetadata(caption);
   assert.equal(metadata.snippet.description, caption);
   assert.equal(metadata.snippet.title, "Exact caption #tag");
   assert.equal(metadata.snippet.categoryId, "22");
   assert.equal(metadata.status.privacyStatus, "public");
+  assert.equal(metadata.status.selfDeclaredMadeForKids, false);
+  assert.match(JSON.stringify(metadata), /"selfDeclaredMadeForKids":false/);
 });
 
 test("an over-limit YouTube description fails closed instead of being silently changed", () => {
   assert.throws(() => youtubeUploadMetadata("x".repeat(5001)), /5,000 characters.*nothing was uploaded/i);
 });
 
-test("only a returned public YouTube video id becomes a success receipt", () => {
+test("only a Public, explicitly not-for-kids YouTube video becomes a success receipt", () => {
   assert.equal(
-    youtubePublicReceipt({ id: "AbCdEf12345", status: { privacyStatus: "public" } }),
+    youtubePublicReceipt({
+      id: "AbCdEf12345",
+      status: { privacyStatus: "public", selfDeclaredMadeForKids: false, madeForKids: false },
+    }),
     "https://www.youtube.com/watch?v=AbCdEf12345"
   );
   assert.throws(
-    () => youtubePublicReceipt({ id: "AbCdEf12345", status: { privacyStatus: "private" } }),
+    () =>
+      youtubePublicReceipt({
+        id: "AbCdEf12345",
+        status: { privacyStatus: "private", selfDeclaredMadeForKids: false },
+      }),
     /created .* but reported privacy .*private.*not Public/i
   );
-  assert.throws(() => youtubePublicReceipt({ status: { privacyStatus: "public" } }), /no verified video id/i);
+  assert.throws(
+    () => youtubePublicReceipt({ id: "AbCdEf12345", status: { privacyStatus: "public" } }),
+    /made for kids.*unconfirmed.*not confirmed as No/i
+  );
+  assert.throws(
+    () =>
+      youtubePublicReceipt({
+        id: "AbCdEf12345",
+        status: { privacyStatus: "public", selfDeclaredMadeForKids: true, madeForKids: true },
+      }),
+    /made for kids.*Yes.*not confirmed as No/i
+  );
+  assert.throws(
+    () => youtubePublicReceipt({ status: { privacyStatus: "public", selfDeclaredMadeForKids: false } }),
+    /no verified video id/i
+  );
 });
 
 test("OAuth implementation has per-account encrypted storage and one-time signed state", () => {
@@ -107,10 +131,16 @@ test("OAuth callback consumes one-time state and stores no plaintext token", asy
       });
     }
     if (String(url).includes("upload_id=opaque")) {
-      return new Response(JSON.stringify({ id: "AbCdEf12345", status: { privacyStatus: "public" } }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
+      return new Response(
+        JSON.stringify({
+          id: "AbCdEf12345",
+          status: { privacyStatus: "public", selfDeclaredMadeForKids: false, madeForKids: false },
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }
+      );
     }
     throw new Error(`unexpected request: ${String(url)}`);
   };
@@ -158,6 +188,7 @@ test("OAuth callback consumes one-time state and stores no plaintext token", asy
   const metadata = JSON.parse(initCall.options.body);
   assert.equal(metadata.snippet.description, caption);
   assert.equal(metadata.status.privacyStatus, "public");
+  assert.equal(metadata.status.selfDeclaredMadeForKids, false);
   assert.equal(initCall.options.headers.authorization, "Bearer plaintext-access-token-must-not-appear-on-disk");
   assert.match(logs.at(-1), /publish confirmed as Public/);
 

@@ -474,10 +474,10 @@ export function youtubeTitle(caption: string): string {
   return Array.from(firstLine || "Posted via ViralDeck").slice(0, 100).join("");
 }
 
-/** Pure metadata policy: exact description, bounded derived title, Public. */
+/** Pure metadata policy: exact description, bounded title, Public, not for kids. */
 export function youtubeUploadMetadata(rawCaption: string): {
   snippet: { title: string; description: string; categoryId: string };
-  status: { privacyStatus: "public" };
+  status: { privacyStatus: "public"; selfDeclaredMadeForKids: false };
 } {
   const caption = rawCaption || "Posted via ViralDeck";
   if (Array.from(caption).length > 5000) {
@@ -485,11 +485,23 @@ export function youtubeUploadMetadata(rawCaption: string): {
   }
   return {
     snippet: { title: youtubeTitle(caption), description: caption, categoryId: "22" },
-    status: { privacyStatus: "public" },
+    // This explicit false is YouTube's API equivalent of selecting
+    // “No, it's not made for kids” in Studio. Omitting it leaves the question
+    // unanswered; false must remain present in the serialized JSON.
+    status: { privacyStatus: "public", selfDeclaredMadeForKids: false },
   };
 }
 
-export function youtubePublicReceipt(result: { id?: unknown; status?: { privacyStatus?: unknown } }): string {
+interface YouTubeVideoReceipt {
+  id?: unknown;
+  status?: {
+    privacyStatus?: unknown;
+    selfDeclaredMadeForKids?: unknown;
+    madeForKids?: unknown;
+  };
+}
+
+export function youtubePublicReceipt(result: YouTubeVideoReceipt): string {
   const videoId = typeof result.id === "string" && /^[a-zA-Z0-9_-]{6,32}$/.test(result.id) ? result.id : "";
   if (!videoId) throw new Error("YouTube returned no verified video id; refusing to claim success.");
   const liveUrl = `https://www.youtube.com/watch?v=${videoId}`;
@@ -498,6 +510,18 @@ export function youtubePublicReceipt(result: { id?: unknown; status?: { privacyS
     throw new Error(
       `YouTube created ${liveUrl} but reported privacy “${privacy}”, not Public. ` +
         "Projects that have not passed YouTube’s API compliance audit can be forced to private; no public success was recorded."
+    );
+  }
+  if (result.status?.selfDeclaredMadeForKids !== false || result.status?.madeForKids === true) {
+    const declared =
+      result.status?.selfDeclaredMadeForKids === false
+        ? "No"
+        : result.status?.selfDeclaredMadeForKids === true
+          ? "Yes"
+          : "unconfirmed";
+    throw new Error(
+      `YouTube created ${liveUrl} but the “made for kids” answer was ${declared}, not confirmed as No. ` +
+        "No success was recorded; review the video's Audience setting in YouTube Studio."
     );
   }
   return liveUrl;
@@ -518,7 +542,7 @@ export async function uploadYouTubeWithOAuth(
   const timeoutRaw = Number(process.env.YOUTUBE_UPLOAD_TIMEOUT_MIN || 15);
   const timeoutMin = Number.isFinite(timeoutRaw) ? Math.max(2, timeoutRaw) : 15;
 
-  log("Uploading through the official YouTube Data API for this named Google account (visibility Public)…");
+  log("Uploading through the official YouTube Data API (Public; Audience: No, it's not made for kids)…");
   for (let authAttempt = 0; authAttempt < 2; authAttempt++) {
     const accessToken = await freshAccessToken(accountId, authAttempt > 0);
     const init = await fetch(
@@ -571,15 +595,15 @@ export async function uploadYouTubeWithOAuth(
     });
     const uploadedText = await uploaded.text();
     if (!uploaded.ok) throw googleError(uploaded.status, uploadedText, "YouTube did not accept the video bytes");
-    let result: { id?: unknown; status?: { privacyStatus?: unknown } };
+    let result: YouTubeVideoReceipt;
     try {
-      result = JSON.parse(uploadedText) as typeof result;
+      result = JSON.parse(uploadedText) as YouTubeVideoReceipt;
     } catch {
       throw new Error("YouTube accepted the transfer but returned no readable publish receipt; refusing to claim success.");
     }
     const liveUrl = youtubePublicReceipt(result);
-    log(`✅ YouTube API publish confirmed as Public: ${liveUrl}`);
-    return { ok: true, message: "YouTube API returned a public video receipt.", liveUrl };
+    log(`✅ YouTube API publish confirmed as Public and not made for kids: ${liveUrl}`);
+    return { ok: true, message: "YouTube API confirmed Public and not made for kids.", liveUrl };
   }
   throw new Error("YouTube rejected both the current and refreshed Google access token. Reconnect this account.");
 }

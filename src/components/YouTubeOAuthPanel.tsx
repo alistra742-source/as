@@ -169,7 +169,8 @@ export function YouTubeOAuthPanel({ room }: { room: Room }) {
           <p className="text-[11px] leading-relaxed text-muted">
             The grant can upload videos only. Refresh/access tokens are encrypted in this account’s worker directory;
             they never enter browser localStorage, WebSocket messages, or logs. Uploads are created as
-            <span className="text-slate-200"> Public</span> and require a returned YouTube video ID before success is shown.
+            <span className="text-slate-200"> Public</span>, explicitly marked <span className="text-slate-200">No, it’s not made for kids</span>,
+            and require both settings in the returned YouTube receipt before success is shown.
           </p>
         </div>
 

@@ -16,7 +16,8 @@ the engine keep the account growing on your rules:
   builds a 1080p CRF-16 master for soft, low-resolution or dark footage (exposure/color recovery,
   mild denoise, Lanczos scaling and sharpening) across TikTok, Instagram and YouTube.
 - Named YouTube accounts can use Google’s official `youtube.upload` OAuth scope. API uploads are
-  Public, require a returned video ID before success, and fall back to the isolated Studio browser
+  Public, explicitly set **“No, it’s not made for kids,”** require both settings in the returned
+  video receipt, and fall back to the isolated Studio browser
   when that named account has not connected Google.
 
 ## Browser engine — Playwright + stock Chromium by default, Clearcote when you need it
@@ -400,7 +401,7 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 
 | Rule | Value | Where |
 | --- | --- | --- |
-| Audience | Everyone (YouTube: visibility **Public**) | `worker/src/uploads.ts` + enforced in UI |
+| Audience | Everyone (YouTube: **Public** and **No, it’s not made for kids**) | API metadata/receipt + fail-closed Studio selection |
 | Cadence | 1 post / 1 hour (slots only ever jittered *longer*) | `worker/src/engine.ts` (also demo engine) |
 | Hit trigger | 3,000+ views in first hour | engine metric pass, editable per room |
 | Discovery floor | 50K+ likes | `scrapeCandidates` filter + Groq judge |
@@ -441,12 +442,14 @@ The YouTube room is fully wired to the same deck flow:
   server-side and AES-GCM-encrypts the refresh token inside that account’s isolated volume directory.
   OAuth codes/tokens are never put in localStorage, WebSocket payloads, URLs shown by the deck, or logs.
 - **Strict official upload**: the worker creates a resumable YouTube Data API upload with the exact
-  caption as its description, a Unicode-safe first-line title (YouTube’s 100-character limit), and
-  visibility **Public**. A success exists only when Google returns a valid video ID and confirms
-  `privacyStatus: public`; the receipt is `https://www.youtube.com/watch?v=<id>`.
+  caption as its description, a Unicode-safe first-line title (YouTube’s 100-character limit),
+  visibility **Public**, and `selfDeclaredMadeForKids: false`. A success exists only when Google
+  returns a valid video ID and confirms both `privacyStatus: public` and the explicit not-for-kids
+  declaration; the receipt is `https://www.youtube.com/watch?v=<id>`.
 - **Browser fallback**: without an OAuth grant, the account’s persistent Chromium starts on
-  youtube.com and uploads through Studio. The dock has one-tap `/shorts` and Studio links. This
-  remains useful for finishing a selector-changing flow by hand.
+  youtube.com and uploads through Studio. Before Publish, it selects the exact **“No, it’s not made
+  for kids”** radio and verifies its checked state; a missing or unconfirmed option stops the upload.
+  The dock also has one-tap `/shorts` and Studio links.
 - A vertical clip under YouTube’s current Shorts duration rules is classified as a Short by YouTube;
   other footage is a regular public video. ViralDeck does not fake that classification.
 - **AI auto-post** uses the same OAuth-first/fallback uploader. Discovery searches YouTube for the
