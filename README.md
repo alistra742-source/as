@@ -120,7 +120,8 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 3. Set `GROQ_API_KEY` (get one at console.groq.com — free tier is plenty) and a long random
    `WORKER_TOKEN` (paste the same worker token in the deck’s Worker card). For official YouTube
    uploads, add these as **four separate Railway variables**: `GOOGLE_CLIENT_ID`,
-   `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI=https://<your-service>/callback`, and
+   `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI=https://<your-service>/callback` (the alias
+   `GOOGLE_REDIRECT_URL` is also accepted), and
    `GOOGLE_SCOPES=https://www.googleapis.com/auth/youtube.upload` (`SCOPES` is accepted too).
    Never paste the client secret into the deck or chat. Optional: `GROQ_MODEL`,
    `GOOGLE_TOKEN_ENCRYPTION_KEY`, `BROWSER_ENGINE` / `BLOCK_TRACKERS` / `CHROME_PATH`, and the

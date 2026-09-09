@@ -202,7 +202,7 @@ export function YouTubeOAuthPanel({ room }: { room: Room }) {
         {!status.configured && (
           <p className="text-[11px] leading-relaxed text-muted">
             Railway needs four separate values: <code>GOOGLE_CLIENT_ID</code>, <code>GOOGLE_CLIENT_SECRET</code>,
-            <code>GOOGLE_REDIRECT_URI</code>, and <code>SCOPES</code> (or <code>GOOGLE_SCOPES</code>).
+            <code>GOOGLE_REDIRECT_URI</code> (or <code>GOOGLE_REDIRECT_URL</code>), and <code>SCOPES</code> (or <code>GOOGLE_SCOPES</code>).
           </p>
         )}
         <p className="text-[11px] leading-relaxed text-muted">

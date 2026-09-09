@@ -60,18 +60,21 @@ test("OAuth callback consumes one-time state and stores no plaintext token", asy
   const old = {
     id: process.env.GOOGLE_CLIENT_ID,
     secret: process.env.GOOGLE_CLIENT_SECRET,
-    redirect: process.env.GOOGLE_REDIRECT_URI,
+    redirectUri: process.env.GOOGLE_REDIRECT_URI,
+    redirectUrl: process.env.GOOGLE_REDIRECT_URL,
     scopes: process.env.GOOGLE_SCOPES,
   };
   process.env.GOOGLE_CLIENT_ID = "test-client.apps.googleusercontent.com";
   process.env.GOOGLE_CLIENT_SECRET = "server-only-test-secret";
-  process.env.GOOGLE_REDIRECT_URI = "https://deck.example/callback";
+  delete process.env.GOOGLE_REDIRECT_URI;
+  process.env.GOOGLE_REDIRECT_URL = "https://deck.example/callback";
   process.env.GOOGLE_SCOPES = "openid profile https://www.googleapis.com/auth/youtube.upload";
   t.after(() => {
     for (const [key, value] of Object.entries({
       GOOGLE_CLIENT_ID: old.id,
       GOOGLE_CLIENT_SECRET: old.secret,
-      GOOGLE_REDIRECT_URI: old.redirect,
+      GOOGLE_REDIRECT_URI: old.redirectUri,
+      GOOGLE_REDIRECT_URL: old.redirectUrl,
       GOOGLE_SCOPES: old.scopes,
     })) {
       if (value === undefined) delete process.env[key];
@@ -125,6 +128,7 @@ test("OAuth callback consumes one-time state and stores no plaintext token", asy
 
   const authorization = new URL(oauth.beginYouTubeOAuth("account-a", "Personal channel"));
   assert.equal(authorization.hostname, "accounts.google.com");
+  assert.equal(authorization.searchParams.get("redirect_uri"), "https://deck.example/callback");
   assert.equal(authorization.searchParams.get("scope"), "https://www.googleapis.com/auth/youtube.upload");
   assert.equal(authorization.searchParams.get("access_type"), "offline");
   assert.equal(authorization.searchParams.get("prompt"), "consent");
