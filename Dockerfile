@@ -37,6 +37,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xz-utils \
     ca-certificates \
     ffmpeg \
+    tesseract-ocr \
     tesseract-ocr-eng \
     tor \
     xvfb \
