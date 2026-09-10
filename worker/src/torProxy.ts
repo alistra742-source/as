@@ -38,6 +38,7 @@ interface BridgeEndpoint extends AccountTorProxy {
   serverHandle: net.Server;
   sockets: Set<net.Socket>;
   verifiedAt: number;
+  lastError: string;
 }
 
 const endpoints = new Map<string, BridgeEndpoint>();
@@ -232,7 +233,12 @@ function proxyFailure(client: net.Socket) {
   );
 }
 
-async function handleProxyClient(client: net.Socket, credentials: IsolationCredentials, sockets: Set<net.Socket>) {
+async function handleProxyClient(
+  client: net.Socket,
+  credentials: IsolationCredentials,
+  sockets: Set<net.Socket>,
+  onError: (message: string) => void
+) {
   client.setTimeout(SOCKET_TIMEOUT_MS, () => client.destroy());
   sockets.add(client);
   client.once("close", () => sockets.delete(client));
@@ -276,7 +282,8 @@ async function handleProxyClient(client: net.Socket, credentials: IsolationCrede
     client.pipe(upstream);
     upstream.pipe(client);
     client.resume();
-  } catch {
+  } catch (error) {
+    onError((error as Error).message || "Tor bridge failed");
     upstream?.destroy();
     proxyFailure(client);
   }
@@ -285,7 +292,12 @@ async function handleProxyClient(client: net.Socket, credentials: IsolationCrede
 async function createBridge(scope: string): Promise<BridgeEndpoint> {
   const credentials = torIsolationCredentials(scope);
   const sockets = new Set<net.Socket>();
-  const serverHandle = net.createServer((client) => void handleProxyClient(client, credentials, sockets));
+  let endpoint: BridgeEndpoint | null = null;
+  const serverHandle = net.createServer((client) =>
+    void handleProxyClient(client, credentials, sockets, (message) => {
+      if (endpoint) endpoint.lastError = message;
+    })
+  );
   serverHandle.on("error", (error) => console.error(`[tor] account bridge error: ${(error as Error).message}`));
   await new Promise<void>((resolve, reject) => {
     const onError = (error: Error) => reject(error);
@@ -300,7 +312,7 @@ async function createBridge(scope: string): Promise<BridgeEndpoint> {
     serverHandle.close();
     throw new Error("Could not allocate the account Tor bridge");
   }
-  return {
+  endpoint = {
     scope,
     server: `http://127.0.0.1:${address.port}`,
     egressIp: "",
@@ -308,7 +320,9 @@ async function createBridge(scope: string): Promise<BridgeEndpoint> {
     serverHandle,
     sockets,
     verifiedAt: 0,
+    lastError: "",
   };
+  return endpoint;
 }
 
 function closeEndpoint(endpoint: BridgeEndpoint) {
@@ -346,6 +360,7 @@ async function readTlsResponse(socket: tls.TLSSocket): Promise<string> {
 
 /** Prove this exact account listener exits through Tor before launching Chrome. */
 async function verifyEndpoint(endpoint: BridgeEndpoint): Promise<string> {
+  endpoint.lastError = "";
   const proxy = new URL(endpoint.server);
   const socket = net.createConnection({ host: proxy.hostname, port: Number(proxy.port) });
   try {
@@ -353,7 +368,9 @@ async function verifyEndpoint(endpoint: BridgeEndpoint): Promise<string> {
     socket.write(`CONNECT ${CHECK_HOST}:443 HTTP/1.1\r\nHost: ${CHECK_HOST}:443\r\nConnection: keep-alive\r\n\r\n`);
     const response = await readUntil(socket, Buffer.from("\r\n\r\n"), 32 * 1024);
     const firstLine = response.value.toString("latin1").split("\r\n", 1)[0];
-    if (!/^HTTP\/1\.[01] 200\b/.test(firstLine)) throw new Error("account bridge could not reach Tor");
+    if (!/^HTTP\/1\.[01] 200\b/.test(firstLine)) {
+      throw new Error(endpoint.lastError || "account bridge could not reach Tor");
+    }
     if (response.rest.length) socket.unshift(response.rest);
     const secure = tls.connect({ socket, servername: CHECK_HOST, ALPNProtocols: ["http/1.1"] });
     await new Promise<void>((resolve, reject) => {
@@ -382,7 +399,11 @@ async function verifyEndpoint(endpoint: BridgeEndpoint): Promise<string> {
   }
 }
 
-async function verifyWithRetry(endpoint: BridgeEndpoint, timeoutMs: number): Promise<void> {
+async function verifyWithRetry(
+  endpoint: BridgeEndpoint,
+  timeoutMs: number,
+  onAttemptError?: (message: string) => void
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   let last = "Tor is not ready";
   do {
@@ -391,6 +412,7 @@ async function verifyWithRetry(endpoint: BridgeEndpoint, timeoutMs: number): Pro
       return;
     } catch (error) {
       last = (error as Error).message || last;
+      onAttemptError?.(last);
       if (Date.now() >= deadline) break;
       await wait(1_000);
     }
@@ -406,7 +428,9 @@ export function warmTor(): Promise<void> {
   warmPromise = (async () => {
     const endpoint = await createBridge("worker-readiness");
     try {
-      await verifyWithRetry(endpoint, env.tor.bootstrapTimeoutMs);
+      await verifyWithRetry(endpoint, env.tor.bootstrapTimeoutMs, (message) => {
+        health = { enabled: true, state: "checking", error: message };
+      });
       health = { enabled: true, state: "ready", error: null };
       console.log(`[tor] ready; verified Tor egress (${endpoint.egressIp})`);
     } finally {
