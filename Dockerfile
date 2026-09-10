@@ -37,6 +37,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xz-utils \
     ca-certificates \
     ffmpeg \
+    tesseract-ocr-eng \
     tor \
     xvfb \
     libnss3 \
@@ -78,10 +79,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-wqy-zenhei \
   && rm -rf /var/lib/apt/lists/*
 
-# Fail the image build—not a user's publish—if Debian ever drops the exact
-# filters/encoders used by the adaptive quality master. This exercises the same
-# denoise → exposure → Lanczos → blur/overlay → H.264/AAC path on two frames.
-RUN ffmpeg -hide_banner -loglevel error \
+# Fail the image build—not a user's publish—if Debian ever drops Tesseract or the
+# exact filters/encoders used by discovery screening and the adaptive quality
+# master. This exercises denoise → exposure → Lanczos → blur/overlay → H.264/AAC.
+RUN tesseract --version >/dev/null && ffmpeg -hide_banner -loglevel error \
     -f lavfi -i "testsrc2=size=540x960:rate=30:duration=0.2" \
     -f lavfi -i "sine=frequency=1000:sample_rate=48000:duration=0.2" \
     -filter_complex "[0:v]hqdn3d=1.0:1.0:3.5:3.5,eq=brightness=0.055:contrast=1.050:saturation=1.080:gamma=1.100,unsharp=5:5:0.72:5:5:0,split=2[base][front];[base]scale=1080:1920:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:1920,gblur=sigma=28[bg];[front]scale=1080:1920:force_original_aspect_ratio=decrease:flags=lanczos[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2:shortest=1,setsar=1,format=yuv420p[v]" \

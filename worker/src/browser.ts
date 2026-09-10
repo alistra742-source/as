@@ -12,6 +12,7 @@ import { asHumanPage, humanTap, humanType, jitter, readingPause, sleep, thinking
 import { describePlan, planSessionCookies } from "./sessionCookie.js";
 import { tiktokSignedInPage } from "./tiktokLogin.js";
 import { accountTorProxy } from "./torProxy.js";
+import { cleanDiscoveryTopic, discoverySearchUrl, isTopicMatch, rankDiscoveryCandidates, topicRelevance } from "./discovery.js";
 import { ensureHumanized, humanizeContext, isHumanized } from "./humanizeAttach.js";
 import {
   CONTAINER_VIEWPORT_RATIO,
@@ -1634,30 +1635,31 @@ export interface Candidate {
 }
 
 const YT_SEARCH_QUERIES: Record<string, string[]> = {
-  stories: ["faceless+storytime+shorts", "faceless+stories+shorts"],
-  scary: ["scary+creepy+stories+shorts", "scary+stories+shorts"],
-  facts: ["mind+blowing+facts+shorts", "amazing+facts+shorts"],
+  stories: ["faceless storytime shorts", "faceless stories shorts"],
+  scary: ["scary creepy stories shorts", "scary stories shorts"],
+  facts: ["mind blowing facts shorts", "amazing facts shorts"],
 };
 
-/** Scan the For You feed (or platform home) for candidate videos. */
+/** Search the exact custom topic, or scan the platform feed for a preset niche. */
 export async function scrapeCandidates(
   page: Page,
   likesFloor: number,
   platform: "tiktok" | "instagram" | "youtube" = "tiktok",
-  niche: string = "stories"
+  niche: string = "stories",
+  rawTopic: string = ""
 ): Promise<Candidate[]> {
-  if (platform === "youtube") return scrapeYouTubeCandidates(page, likesFloor, niche);
-  const url =
-    page.url().includes("tiktok.com")
+  const topic = cleanDiscoveryTopic(rawTopic);
+  if (platform === "youtube") return scrapeYouTubeCandidates(page, likesFloor, niche, topic);
+  const url = topic
+    ? discoverySearchUrl(platform, topic)
+    : platform === "tiktok"
       ? "https://www.tiktok.com/foryou"
-      : page.url().includes("instagram.com")
-        ? "https://www.instagram.com/reels/"
-        : page.url();
+      : "https://www.instagram.com/reels/";
   await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
   await sleep(4000);
 
-  // A human watches the feed before harvesting it: a few small scrolls with
-  // reading pauses so the account's feed behavior matches a real viewer.
+  // A human watches the result surface before harvesting it: small scrolls with
+  // reading pauses make lazy-loaded search cards appear without a broad crawl.
   await page.mouse.wheel(0, Math.round(jitter(300, 700)));
   await readingPause(500, 1600);
   await page.mouse.wheel(0, Math.round(jitter(400, 900)));
@@ -1671,21 +1673,51 @@ export async function scrapeCandidates(
       const href = (a as HTMLAnchorElement).href.split("?")[0];
       if (hrefs.has(href)) continue;
       hrefs.add(href);
-      out.push({ url: href, label: a.getAttribute("aria-label") || a.textContent || "" });
+      const card = a.closest("article") || a.parentElement?.parentElement || a;
+      const label = [a.getAttribute("aria-label"), a.getAttribute("title"), card.textContent]
+        .filter(Boolean)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
+      out.push({ url: href, label: label.slice(0, 600) });
       if (out.length >= 40) break;
     }
     return out;
   });
 
+  const ordered = topic
+    ? items
+        .map((item, index) => ({ item, index, relevance: topicRelevance(topic, item.label, item.url) }))
+        // Search cards may render only a thumbnail/count until opened. Keep them
+        // in this bounded set, then enforce exact relevance on full metadata.
+        .sort((a, b) => b.relevance - a.relevance || a.index - b.index)
+        .map(({ item }) => item)
+    : items;
   const candidates: Candidate[] = [];
-  for (const it of items) {
-    const likes = parseCount(it.label.match(/([\d.,]+[KMB]?)\s*likes?/i)?.[1]);
-    const views = parseCount(it.label.match(/([\d.,]+[KMB]?)\s*views?/i)?.[1]);
-    const comments = parseCount(it.label.match(/([\d.,]+[KMB]?)\s*comments?/i)?.[1]);
-    if (likes && likes >= likesFloor) {
+  for (const it of ordered.slice(0, topic ? 10 : 40)) {
+    let title = it.label.slice(0, 160) || "Untitled clip";
+    let likes = parseCount(it.label.match(/([\d.,]+[KMB]?)\s*likes?/i)?.[1]);
+    let views = parseCount(it.label.match(/([\d.,]+[KMB]?)\s*views?/i)?.[1]);
+    let comments = parseCount(it.label.match(/([\d.,]+[KMB]?)\s*comments?/i)?.[1]);
+    // Search cards often expose views but not likes. Open only the bounded,
+    // relevant set and apply the same account quality floor to real post stats.
+    if (topic) {
+      const stats = await readVideoStats(page, it.url);
+      likes = stats.likes ?? likes;
+      views = stats.views ?? views;
+      comments = stats.comments ?? comments;
+      const detail = await page
+        .evaluate(() => {
+          const meta = document.querySelector('meta[property="og:description"], meta[name="description"]');
+          return (meta?.getAttribute("content") || document.title || "").replace(/\s+/g, " ").trim();
+        })
+        .catch(() => "");
+      if (detail) title = detail.slice(0, 160);
+    }
+    if (likes && likes >= likesFloor && (!topic || isTopicMatch(topic, title, it.url))) {
       candidates.push({
         url: it.url,
-        title: it.label.slice(0, 160) || "Untitled clip",
+        title,
         likes,
         views: views ?? 0,
         comments: comments ?? 0,
@@ -1693,25 +1725,33 @@ export async function scrapeCandidates(
       });
     }
   }
-  return candidates.slice(0, 12);
+  const ranked = rankDiscoveryCandidates(candidates, topic).slice(0, 12);
+  // Instagram/TikTok search markup can be unavailable even to a signed-in
+  // datacenter browser. Cross-source YouTube Shorts are still valid inputs to all
+  // three uploaders and provide an exact-query fallback rather than reverting to
+  // an unrelated personalized feed.
+  if (topic && ranked.length < 4) {
+    const youtube = await scrapeYouTubeCandidates(page, likesFloor, niche, topic);
+    return rankDiscoveryCandidates([...ranked, ...youtube], topic).slice(0, 12);
+  }
+  return ranked;
 }
 
 /**
- * YouTube discovery: search Shorts in the active niche, then open each
- * candidate and read its like count (the 50K floor). Bounded to keep the
- * hourly cycle cheap; YouTube Shorts hide comments behind clicks so the
- * comment sample stays empty and Groq judges on stats + title.
+ * YouTube discovery: exact free-text query when present, otherwise a preset.
+ * Every candidate is opened to enforce the account's likes floor before ranking.
  */
 async function scrapeYouTubeCandidates(
   page: Page,
   likesFloor: number,
-  niche: string
+  niche: string,
+  topic = ""
 ): Promise<Candidate[]> {
-  const queries = YT_SEARCH_QUERIES[niche] ?? YT_SEARCH_QUERIES.stories;
+  const queries = topic ? [topic, `${topic} shorts`] : YT_SEARCH_QUERIES[niche] ?? YT_SEARCH_QUERIES.stories;
   let hrefs: string[] = [];
-  for (const q of queries) {
+  for (const query of queries) {
     await page
-      .goto(`https://www.youtube.com/results?search_query=${q}`, { waitUntil: "domcontentloaded", timeout: 45_000 })
+      .goto(discoverySearchUrl("youtube", query), { waitUntil: "domcontentloaded", timeout: 45_000 })
       .catch(() => undefined);
     await sleep(3500);
     await page.evaluate(() => window.scrollBy(0, 2200)).catch(() => undefined);
@@ -1732,39 +1772,30 @@ async function scrapeYouTubeCandidates(
   }
 
   const candidates: Candidate[] = [];
-  for (const href of hrefs.slice(0, 8)) {
+  for (const href of hrefs.slice(0, 10)) {
     if (candidates.length >= 8) break;
     try {
-      await page.goto(href, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => undefined);
-      await sleep(2400);
-      const s = await page.evaluate(() => {
-        const cnt = (raw: string | null | undefined): number | null => {
-          if (!raw) return null;
-          const m = String(raw).replace(/,/g, "").match(/([\d.]+)\s*([KMB])?/i);
-          if (!m) return null;
-          const n = parseFloat(m[1]);
-          const mult = m[2]?.toUpperCase() === "K" ? 1e3 : m[2]?.toUpperCase() === "M" ? 1e6 : m[2]?.toUpperCase() === "B" ? 1e9 : 1;
-          return Math.round(n * mult);
-        };
-        let likes: number | null = null;
-        for (const btn of Array.from(document.querySelectorAll("button[aria-label]"))) {
-          const label = btn.getAttribute("aria-label") || "";
-          const m = label.match(/along with\s*([\d.,]+\s*[KMB]?)/i);
-          if (/like this video/i.test(label) && m) {
-            likes = cnt(m[1]);
-            break;
-          }
-        }
-        const title = (document.title || "YouTube Short").replace(/\s*-\s*YouTube\s*$/, "").replace(/\s*#?shorts?\s*$/i, "").trim();
-        return { likes, title: title || "YouTube Short" };
-      });
-      if (s.likes && s.likes >= likesFloor) {
+      const stats = await readVideoStats(page, href);
+      const title = await page
+        .evaluate(() => {
+          const meta = document.querySelector('meta[property="og:title"]');
+          return (meta?.getAttribute("content") || document.title || "YouTube Short")
+            .replace(/\s*-\s*YouTube\s*$/, "")
+            .replace(/\s+/g, " ")
+            .trim();
+        })
+        .catch(() => "YouTube Short");
+      if (
+        stats.likes &&
+        stats.likes >= likesFloor &&
+        (!topic || isTopicMatch(topic, title, href))
+      ) {
         candidates.push({
           url: href,
-          title: s.title.slice(0, 160),
-          likes: s.likes,
-          views: 0,
-          comments: 0,
+          title: title.slice(0, 160),
+          likes: stats.likes,
+          views: stats.views ?? 0,
+          comments: stats.comments ?? 0,
           commentSample: "",
         });
       }
@@ -1772,7 +1803,7 @@ async function scrapeYouTubeCandidates(
       /* skip unreadable short */
     }
   }
-  return candidates;
+  return rankDiscoveryCandidates(candidates, topic);
 }
 
 /** Read a few comments off a video page (best effort). */

@@ -1,5 +1,7 @@
 /**
- * Mirrors src/lib/protocol.ts in the frontend. Keep the two in sync.
+ * Wire protocol between the ViralDeck frontend and the automation worker
+ * (deployed on Railway). The implementation in `worker/` mirrors these
+ * messages exactly.
  */
 
 /** What drives the browser on the worker side (shown as a badge in the deck). */
@@ -15,6 +17,7 @@ export interface DriverInfo {
   timezone: string;
 }
 
+/** Raw commands sent from the dock to the remote browser. */
 export type RemoteCmd =
   | { t: "navigate"; url: string }
   | { t: "back" }
@@ -30,8 +33,8 @@ export type RemoteCmd =
    * that instead of making the user wait through a full publish to find out.
    */
   | { t: "check-upload" }
-  | { t: "tap"; x: number; y: number }
-  | { t: "scroll"; dy: number }
+  | { t: "tap"; x: number; y: number } // fraction of the displayed frame 0..1
+  | { t: "scroll"; dy: number } // px, positive = down
   | { t: "type"; text: string }
   | { t: "key"; key: "Backspace" | "Enter" | "Tab" | "Escape" }
   | { t: "ping" };
@@ -41,13 +44,16 @@ export type RemoteCmd =
    * message is added: the deck then tells the user the worker is behind instead
    * of pressing a button whose command the old worker swallows in silence.
    */
-export const PROTOCOL_VERSION = 10;
+export const PROTOCOL_VERSION = 11;
 
 export type ClientMsg =
   | { type: "auth"; token: string; proto?: number }
   | { type: "cmd"; seq: number; cmd: RemoteCmd }
   | { type: "engine"; action: "start" | "stop" }
-  | { type: "post"; url: string; caption: string; requestId?: string }
+  | { type: "engine-config"; topic: string; thresholdViews?: number; likesFloor?: number }
+  | { type: "post"; url: string; caption: string; requestId: string }
+  | { type: "discover-post"; topic: string; caption: string; requestId: string }
+  | { type: "post-status"; requestId: string }
   | { type: "session"; action: "open" | "close" }
   /**
    * Sign the profile in with a session cookie pasted into the deck instead of
@@ -69,12 +75,24 @@ export interface LastPostSnapshot {
   requestId?: string;
   caption: string;
   niche: string;
+  topic?: string;
   source: "manual" | "ai";
   postedAt: number;
   views: number;
   likes: number;
   comments: number;
   verdict: string | null;
+}
+
+export interface ManualPublishResult {
+  requestId: string;
+  status: "accepted" | "succeeded" | "failed";
+  message: string;
+  at: number;
+  postId?: string;
+  postedAt?: number;
+  /** Confirmed destination URL only; omitted when a studio confirms without exposing one. */
+  url?: string;
 }
 
 export interface EngineSnapshot {
@@ -86,15 +104,21 @@ export interface EngineSnapshot {
   cadenceHours: number;
   thresholdViews: number;
   likesFloor: number;
+  /** Account-persisted exact free-text query; blank means cycle the built-in niches. */
+  topic: string;
   loggedIn: boolean;
   /** A user-requested publish is still running on this exact account runtime. */
   manualBusy: boolean;
+  /** Exact active request, so a stale `manualBusy:false` cannot cancel a newer click. */
+  manualRequestId: string | null;
+  /** Last correlated acknowledgement/terminal receipt, persisted for reconnects. */
+  manualResult: ManualPublishResult | null;
   lastPost: LastPostSnapshot | null;
 }
 
 export type ServerMsg =
   | { type: "ready"; sessionId: string; url: string; driver?: DriverInfo; proto?: number }
-  | { type: "frame"; data: string; at: number }
+  | { type: "frame"; data: string; at: number } // JPEG base64
   | { type: "nav"; url: string; title: string }
   | { type: "login"; loggedIn: boolean }
   | { type: "log"; level: string; text: string; at: number }
@@ -113,6 +137,8 @@ export type ServerMsg =
    * inside the browser profile, never in a log line or a toast. */
   | { type: "cookie-state"; appliedAt: number | null; names: string[]; expiresAt?: number | null }
   | { type: "error"; message: string };
+
+export const WS_PING_INTERVAL_MS = 15_000;
 
 export function now(): number {
   return Date.now();

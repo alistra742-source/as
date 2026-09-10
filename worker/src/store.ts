@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { accountDataDir, LEGACY_ACCOUNT_ID } from "./accountScope.js";
 import { env, type EnginePhase, type PlatformKey } from "./config.js";
+import type { ManualPublishResult } from "./protocol.js";
 
 export interface MetricCheck {
   at: number;
@@ -20,6 +21,7 @@ export interface WorkerPost {
   requestId?: string;
   caption: string;
   niche: string;
+  topic?: string;
   source: "manual" | "ai";
   audience: "Everyone";
   postedAt: number;
@@ -37,6 +39,10 @@ export interface EngineRec {
   thresholdViews: number;
   likesFloor: number;
   niche: string;
+  /** Exact account-local search phrase. Blank keeps the built-in niche cycle. */
+  topic: string;
+  /** Correlated manual/discovery acknowledgement survives socket reconnects and restarts. */
+  manualResult: ManualPublishResult | null;
   errorCount: number;
 }
 
@@ -75,6 +81,8 @@ function freshEngine(): EngineRec {
     thresholdViews: 3000,
     likesFloor: 50_000,
     niche: "stories",
+    topic: "",
+    manualResult: null,
     errorCount: 0,
   };
 }
@@ -106,6 +114,20 @@ export class Store {
       for (const p of Object.keys(d.rigs) as PlatformKey[]) {
         d.rigs[p] = { ...d.rigs[p], ...(raw.rigs?.[p] ?? {}) };
         d.engines[p] = { ...freshEngine(), ...(raw.engines?.[p] ?? {}) };
+        d.engines[p].topic =
+          typeof d.engines[p].topic === "string"
+            ? d.engines[p].topic.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 80)
+            : "";
+        const result = d.engines[p].manualResult;
+        if (
+          !result ||
+          typeof result.requestId !== "string" ||
+          !["accepted", "succeeded", "failed"].includes(result.status) ||
+          typeof result.message !== "string" ||
+          !Number.isFinite(result.at)
+        ) {
+          d.engines[p].manualResult = null;
+        }
         d.posts[p] = raw.posts?.[p] ?? [];
       }
       return d;
@@ -118,16 +140,29 @@ export class Store {
     }
   }
 
+  private writeNow() {
+    try {
+      fs.writeFileSync(this.file, JSON.stringify(this.data, null, 2));
+    } catch {
+      /* disk hiccups are non-fatal */
+    }
+  }
+
   save() {
     if (this.saveTimer) return;
     this.saveTimer = setTimeout(() => {
       this.saveTimer = null;
-      try {
-        fs.writeFileSync(this.file, JSON.stringify(this.data, null, 2));
-      } catch {
-        /* disk hiccups are non-fatal */
-      }
+      this.writeNow();
     }, 250);
+  }
+
+  /** Persist an accepted publish before network/browser work can be interrupted. */
+  saveImmediate() {
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    }
+    this.writeNow();
   }
 
   /**

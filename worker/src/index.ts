@@ -526,6 +526,45 @@ wss.on("connection", (ws, req) => {
         else if (msg.action === "stop") engine.stop();
         else send(ws, { type: "error", message: "Invalid engine action" });
         return;
+      case "engine-config":
+        if (
+          typeof msg.topic !== "string" ||
+          msg.topic.length > 500 ||
+          (msg.thresholdViews !== undefined && typeof msg.thresholdViews !== "number") ||
+          (msg.likesFloor !== undefined && typeof msg.likesFloor !== "number")
+        ) {
+          send(ws, { type: "error", message: "Invalid engine configuration" });
+          return;
+        }
+        engine.configure({ topic: msg.topic, thresholdViews: msg.thresholdViews, likesFloor: msg.likesFloor });
+        return;
+      case "post-status":
+        engine.reportManualStatus(msg.requestId);
+        return;
+      case "discover-post": {
+        const requestId =
+          typeof msg.requestId === "string" && /^[a-z0-9][a-z0-9_-]{0,79}$/i.test(msg.requestId)
+            ? msg.requestId
+            : undefined;
+        if (
+          typeof msg.topic !== "string" ||
+          msg.topic.length > 500 ||
+          typeof msg.caption !== "string" ||
+          msg.caption.length > 10_000 ||
+          !requestId
+        ) {
+          send(ws, { type: "post-failed", message: "The topic discovery request was malformed; nothing was uploaded.", requestId });
+          return;
+        }
+        void engine.manualDiscoverPost(msg.topic, msg.caption, requestId).catch((error) => {
+          send(ws, {
+            type: "post-failed",
+            message: `The worker could not start this topic search: ${(error as Error).message}`,
+            requestId,
+          });
+        });
+        return;
+      }
       case "post": {
         const requestId =
           typeof msg.requestId === "string" && /^[a-z0-9][a-z0-9_-]{0,79}$/i.test(msg.requestId)

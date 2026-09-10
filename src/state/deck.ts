@@ -17,6 +17,7 @@ import type { EngineSnapshot } from "../lib/protocol";
 import { uid } from "../lib/format";
 import { accountNameTaken, accountRoomKey, cleanAccountName, withoutAccount } from "../lib/accounts";
 import { disconnectLive, isLiveConnected, sendBusRaw } from "../lib/liveBus";
+import { resolveManualSnapshot } from "./manualPublish";
 import { DEMO_CANDIDATES } from "../data/demo";
 import {
   aiLog,
@@ -40,6 +41,7 @@ function freshEngine(): EngineState {
     cadenceHours: 1,
     activeNiche: "stories",
     niches: ["stories", "scary", "facts"],
+    searchTopic: "",
     nextRunAt: null,
     lastRunAt: null,
     message: null,
@@ -105,7 +107,12 @@ function normalizeRoom(partial: Partial<Room>): Room {
       ? { ...d.session!, ...partial.session }
       : null,
     composer: { ...d.composer, ...(partial.composer ?? {}) },
-    engine: { ...d.engine, ...(partial.engine ?? {}) },
+    engine: {
+      ...d.engine,
+      ...(partial.engine ?? {}),
+      searchTopic:
+        typeof partial.engine?.searchTopic === "string" ? partial.engine.searchTopic.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 80) : "",
+    },
     posts: partial.posts ?? [],
     log: partial.log && partial.log.length > 0 ? partial.log : d.log,
     live: { ...d.live, ...(partial.live ?? {}) },
@@ -135,6 +142,7 @@ function meaningfulLegacyRoom(room: Room): boolean {
     room.session ||
     room.posts.length ||
     room.engine.running ||
+    room.engine.searchTopic.trim() ||
     room.live.cookieAt ||
     room.live.wsUrl ||
     room.live.token ||
@@ -481,9 +489,10 @@ export const useDeck = create<DeckState>()(
         // Live mode: hand the publish to the Railway worker's real browser.
         if (room.session.mode === "live") {
           const url = c.url.trim();
-          if (!url) {
+          const topic = room.engine.searchTopic.trim();
+          if (!url && !topic) {
             get().setComposer(p, {
-              error: "Live manual posts need a video link. (AI auto-posting runs on the engine's hourly schedule.)",
+              error: "Paste a source video link, or enter what the AI should upload about.",
             });
             return;
           }
@@ -492,61 +501,78 @@ export const useDeck = create<DeckState>()(
             return;
           }
           const now = Date.now();
-          const optimistic: PostRecord = draftPost(
-            p,
-            { url, caption: c.caption.trim() || "Posted via ViralDeck", niche: room.engine.activeNiche, source: "manual" },
-            now
-          );
-          const ok = sendBusRaw(p, room.accountId ?? "default", {
-            type: "post",
-            url,
-            caption: c.caption.trim() || "Posted via ViralDeck",
-            requestId: optimistic.id,
-          });
+          const suppliedCaption = c.caption.trim() ? c.caption : "";
+          const optimistic = url
+            ? draftPost(
+                p,
+                { url, caption: suppliedCaption || "Posted via ViralDeck", niche: room.engine.activeNiche, source: "manual" },
+                now
+              )
+            : null;
+          const requestId = optimistic?.id ?? uid("post");
+          const ok = url
+            ? sendBusRaw(p, room.accountId ?? "default", {
+                type: "post",
+                url,
+                caption: suppliedCaption || "Posted via ViralDeck",
+                requestId,
+              })
+            : sendBusRaw(p, room.accountId ?? "default", {
+                type: "discover-post",
+                topic,
+                caption: suppliedCaption,
+                requestId,
+              });
           if (!ok) {
             get().setComposer(p, { error: "Worker socket not open yet — try again in a second." });
             return;
           }
-          get().setComposer(p, { busy: true, error: null, lastPostedId: optimistic.id });
+          get().setComposer(p, { busy: true, error: null, lastPostedId: requestId });
           set((s) => ({
             rooms: {
               ...s.rooms,
               [p]: {
                 ...s.rooms[p],
-                posts: [...s.rooms[p].posts, optimistic].slice(-MAX_POSTS),
+                posts: optimistic ? [...s.rooms[p].posts, optimistic].slice(-MAX_POSTS) : s.rooms[p].posts,
                 log: [
                   ...s.rooms[p].log,
-                  logEntry("info", `📤 Sending publish to the live browser — caption “${c.caption.trim() || "Posted via ViralDeck"}”, audience Everyone.`),
+                  logEntry(
+                    "info",
+                    url
+                      ? `📤 Sending publish to the live browser — caption “${suppliedCaption || "Posted via ViralDeck"}”, audience Everyone.`
+                      : `🔎 Searching for “${topic}” — relevance, engagement, download quality and visible watermark checks run before publishing.`
+                  ),
                 ].slice(-MAX_LOG),
               },
             },
           }));
-          // Busy stays on until the worker answers (post-ok / post-failed) — a real
-          // grab + TikTok's processing checks can run for several minutes, and a
-          // spinner that stops on its own timer is what makes a working publish
-          // look like nothing happened. This timer only exists so a dead socket
-          // cannot lock the panel forever.
+          // Busy stays tied to this request until a correlated worker answer. A
+          // timer may request status, but elapsed time or an unrelated engine
+          // snapshot is never allowed to manufacture a failure.
           window.setTimeout(() => {
-            const timeoutError =
-              "The worker has not answered in 8 minutes — the browser may be stuck on a challenge. Check the activity log.";
             const current = get();
-            if (current.activeAccountIds[p] === accountId) {
-              if (current.rooms[p].composer.busy) {
-                current.setComposer(p, { busy: false, error: timeoutError });
-              }
+            const activeRoom = current.activeAccountIds[p] === accountId ? current.rooms[p] : null;
+            const savedRoom = activeRoom ?? current.accountRooms[accountRoomKey(p, accountId)];
+            // Never turn elapsed time into a made-up failure. Ask the worker to
+            // answer for this exact id; it replies with its persisted receipt or
+            // an actionable correlated "not received/interrupted" failure.
+            if (!savedRoom?.composer.busy || savedRoom.composer.lastPostedId !== requestId) return;
+            const asked = sendBusRaw(p, accountId, { type: "post-status", requestId });
+            const status = asked
+              ? "This publish is taking longer than expected — asking the worker for its exact request status…"
+              : "This publish is still pending, but the worker connection is offline. Reconnect to recover its receipt.";
+            if (activeRoom) {
+              current.setComposer(p, { error: status });
               return;
             }
-            // The user may have switched from Personal to Brand while Personal's
-            // publish was running. Update only Personal's hidden snapshot; a late
-            // timer is never allowed to put its error on Brand's composer.
             set((s) => {
               const key = accountRoomKey(p, accountId);
               const saved = s.accountRooms[key];
-              if (!saved?.composer.busy) return {};
+              if (!saved || saved.composer.lastPostedId !== requestId) return {};
               return {
                 accountRooms: {
                   ...s.accountRooms,
-                  [key]: { ...saved, composer: { ...saved.composer, busy: false, error: timeoutError } },
+                  [key]: { ...saved, composer: { ...saved.composer, error: status } },
                 },
               };
             });
@@ -555,10 +581,6 @@ export const useDeck = create<DeckState>()(
         }
 
         const url = c.url.trim();
-        if (!url && !c.caption.trim()) {
-          get().setComposer(p, { error: "Paste a video link, or leave both empty and the AI will find + post a video for you." });
-          return;
-        }
         get().setComposer(p, { busy: true, error: null });
 
         window.setTimeout(() => {
@@ -664,6 +686,12 @@ export const useDeck = create<DeckState>()(
             get().addLog(p, [logEntry("err", "Worker not connected — connect it in the Worker card first.")]);
             return;
           }
+          sendBusRaw(p, room.accountId ?? "default", {
+            type: "engine-config",
+            topic: room.engine.searchTopic,
+            thresholdViews: room.engine.thresholdViews,
+            likesFloor: room.engine.likesFloor,
+          });
           sendBusRaw(p, room.accountId ?? "default", { type: "engine", action: "start" });
           set((s) => ({
             rooms: {
@@ -728,6 +756,15 @@ export const useDeck = create<DeckState>()(
             [p]: { ...s.rooms[p], engine: { ...s.rooms[p].engine, ...patch } },
           },
         }));
+        const room = get().rooms[p];
+        if (room.session?.mode === "live" && isLiveConnected(p, room.accountId ?? "default")) {
+          sendBusRaw(p, room.accountId ?? "default", {
+            type: "engine-config",
+            topic: room.engine.searchTopic,
+            thresholdViews: room.engine.thresholdViews,
+            likesFloor: room.engine.likesFloor,
+          });
+        }
       },
 
       toggleNiche: (p, niche) => {
@@ -767,29 +804,25 @@ export const useDeck = create<DeckState>()(
             : "idle";
           let posts = room.posts;
           const last = snap.lastPost;
-          const optimistic = room.composer.lastPostedId
-            ? posts.find((post) => post.id === room.composer.lastPostedId)
-            : undefined;
-          const lastIsOptimistic = !!(
-            optimistic &&
-            last &&
-            last.source === "manual" &&
-            last.requestId === optimistic.id &&
-            optimistic.url === last.sourceUrl &&
-            optimistic.caption === last.caption
-          );
+          const requestId = room.composer.lastPostedId;
+          const optimistic = requestId ? posts.find((post) => post.id === requestId) : undefined;
           if (last) {
             const idx = posts.findIndex(
               (pr) =>
-                (pr.url === last.url || (!!last.sourceUrl && pr.url === last.sourceUrl)) &&
-                pr.caption === last.caption &&
-                Math.abs(pr.postedAt - last.postedAt) < 6 * 3_600_000
+                pr.id === last.requestId ||
+                ((pr.url === last.url || (!!last.sourceUrl && pr.url === last.sourceUrl)) &&
+                  pr.caption === last.caption &&
+                  Math.abs(pr.postedAt - last.postedAt) < 6 * 3_600_000)
             );
+            const builtInNiche = (["stories", "scary", "facts"] as const).includes(last.niche as Niche)
+              ? (last.niche as Niche)
+              : "stories";
             const rec: PostRecord = {
               id: last.id,
               url: last.url,
               caption: last.caption,
-              niche: last.niche as Niche,
+              niche: builtInNiche,
+              topic: last.topic,
               source: last.source,
               audience: "Everyone",
               postedAt: last.postedAt,
@@ -802,20 +835,27 @@ export const useDeck = create<DeckState>()(
               posts = [...posts, rec].slice(-MAX_POSTS);
             }
           }
+
           let composer = room.composer;
-          if (snap.manualBusy === false && room.composer.busy) {
-            if (optimistic && !lastIsOptimistic) {
-              posts = posts.filter((post) => post.id !== optimistic.id);
-            }
+          const resolution = resolveManualSnapshot(requestId, snap);
+          if (resolution.state === "failed") {
+            if (optimistic) posts = posts.filter((post) => post.id !== optimistic.id);
             composer = {
               ...room.composer,
               busy: false,
               lastPostedId: null,
-              error: lastIsOptimistic
-                ? null
-                : room.composer.error || "The worker is no longer publishing this request; no success receipt was returned.",
+              error: resolution.message,
             };
+          } else if (resolution.state === "succeeded") {
+            if (optimistic && resolution.url) {
+              posts = posts.map((post) => (post.id === optimistic.id ? { ...post, url: resolution.url! } : post));
+            }
+            composer = { ...room.composer, busy: false, lastPostedId: null, error: null };
           }
+          // Pending deliberately stays pending even when manualBusy is false: an
+          // older false snapshot may have been in flight before this click. A
+          // correlated status query is ordered after the original command and is
+          // therefore safe both for that race and for reconnect recovery.
           return {
             rooms: {
               ...s.rooms,
@@ -832,6 +872,7 @@ export const useDeck = create<DeckState>()(
                   cadenceHours: snap.cadenceHours,
                   thresholdViews: snap.thresholdViews,
                   likesFloor: snap.likesFloor,
+                  searchTopic: snap.topic || room.engine.searchTopic,
                 },
                 composer,
                 posts,
@@ -839,6 +880,18 @@ export const useDeck = create<DeckState>()(
             },
           };
         });
+        const after = get().rooms[p];
+        const pendingId = after.composer.lastPostedId;
+        if (
+          pendingId &&
+          after.composer.busy &&
+          resolveManualSnapshot(pendingId, snap).state === "pending" &&
+          snap.manualBusy === false &&
+          snap.manualRequestId !== pendingId &&
+          snap.manualResult?.requestId !== pendingId
+        ) {
+          sendBusRaw(p, after.accountId ?? "default", { type: "post-status", requestId: pendingId });
+        }
       },
 
       applyLivePostFailed: (p, message, requestId) => {

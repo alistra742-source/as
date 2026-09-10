@@ -88,9 +88,9 @@ function compact(value: unknown, max = 300): string {
 function oauthConfig(): OAuthConfig | null {
   const clientId = compact(process.env.GOOGLE_CLIENT_ID, 300);
   const clientSecret = compact(process.env.GOOGLE_CLIENT_SECRET, 500);
-  // Railway users commonly name this value URL rather than URI. Support both;
-  // the standards-style URI name wins when both are present.
-  const redirectUri = compact(process.env.GOOGLE_REDIRECT_URI || process.env.GOOGLE_REDIRECT_URL, 1000);
+  // This Railway service uses the URL name. Keep the URI alias for compatibility;
+  // the deployed URL value wins when both are present.
+  const redirectUri = compact(process.env.GOOGLE_REDIRECT_URL || process.env.GOOGLE_REDIRECT_URI, 1000);
   // Least privilege is a product invariant, not an environment preference.
   // Ignore accidental extra scopes in Railway rather than making the UI's
   // “youtube.upload only” promise false.
@@ -112,7 +112,7 @@ function requireConfig(): OAuthConfig {
   const config = oauthConfig();
   if (!config) {
     throw new Error(
-      "YouTube OAuth is not configured. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT_URI (or GOOGLE_REDIRECT_URL) as separate Railway variables."
+      "YouTube OAuth is not configured. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT_URL (or GOOGLE_REDIRECT_URI) as separate Railway variables."
     );
   }
   return config;
@@ -309,7 +309,7 @@ export function youtubeOAuthStatus(accountId: string): YouTubeOAuthStatus {
       connected: false,
       expiresAt: null,
       scope: null,
-      error: "Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT_URI (or GOOGLE_REDIRECT_URL) on Railway.",
+      error: "Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT_URL (or GOOGLE_REDIRECT_URI) on Railway.",
     };
   }
   try {

@@ -50,6 +50,8 @@ export interface PostRecord {
   url: string;
   caption: string;
   niche: Niche;
+  /** Exact custom discovery subject, when this was an AI search rather than a preset. */
+  topic?: string;
   source: "manual" | "ai";
   audience: "Everyone";
   postedAt: number;
@@ -89,6 +91,8 @@ export interface EngineState {
   cadenceHours: number;
   activeNiche: Niche;
   niches: Niche[];
+  /** Per-named-account free-text discovery query; blank cycles the presets. */
+  searchTopic: string;
   nextRunAt: number | null;
   lastRunAt: number | null;
   message: string | null;

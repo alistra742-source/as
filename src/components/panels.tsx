@@ -224,6 +224,7 @@ export function EnginePanel({ room }: { room: Room }) {
 
 export function ComposerPanel({ room }: { room: Room }) {
   const setComposer = useDeck((s) => s.setComposer);
+  const updateEngine = useDeck((s) => s.updateEngine);
   const postNow = useDeck((s) => s.postNow);
   const c = room.composer;
   const oauthReady = room.platform === "youtube" && room.live.youtubeOAuthConnected;
@@ -251,6 +252,27 @@ export function ComposerPanel({ room }: { room: Room }) {
       <div className="space-y-3 p-4">
         <label className="block">
           <span className="mb-1 block text-[11px] font-semibold text-muted uppercase tracking-wider">
+            What to upload about
+          </span>
+          <input
+            value={room.engine.searchTopic}
+            onChange={(e) => updateEngine(room.platform, { searchTopic: e.target.value.slice(0, 80) })}
+            placeholder="e.g. donut smp or drdonutt"
+            maxLength={80}
+            autoComplete="off"
+            className="h-10 w-full rounded-xl border border-signal-500/30 bg-signal-500/5 px-3 text-sm text-slate-100 outline-none transition-colors placeholder:text-faint focus:border-signal-400/70"
+          />
+          <span className="mt-1 block text-[11px] leading-snug text-muted">
+            Saved only for this named account. With no link below, the worker searches this exact topic, ranks relevant high-engagement clips,
+            downloads and inspects the best options, rejects low-quality or detected-watermark sources, then writes a fresh source-inspired caption.
+            The hourly engine also uses this topic until you clear it.
+          </span>
+        </label>
+        <div className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-faint">
+          <span className="h-px flex-1 bg-line" /> or use an exact source <span className="h-px flex-1 bg-line" />
+        </div>
+        <label className="block">
+          <span className="mb-1 block text-[11px] font-semibold text-muted uppercase tracking-wider">
             Source video link — TikTok, Instagram or YouTube
           </span>
           <input
@@ -271,14 +293,18 @@ export function ComposerPanel({ room }: { room: Room }) {
           </span>
         </label>
         <label className="block">
-          <span className="mb-1 block text-[11px] font-semibold text-muted uppercase tracking-wider">Caption</span>
+          <span className="mb-1 block text-[11px] font-semibold text-muted uppercase tracking-wider">
+            Caption {c.url.trim() ? "" : "— optional override"}
+          </span>
           <textarea
             value={c.caption}
             onChange={(e) => setComposer(room.platform, { caption: e.target.value })}
             placeholder={
               room.session?.mode === "demo"
                 ? `e.g. Hello — or leave empty and let Groq write one (${niche} angle)`
-                : "e.g. Hello — posted exactly as written"
+                : c.url.trim()
+                  ? "e.g. Hello — posted exactly as written"
+                  : "Leave empty for a fresh caption inspired by the selected video's title"
             }
             rows={2}
             className="w-full resize-none rounded-xl border border-line bg-ink-900 px-3 py-2.5 text-sm text-slate-200 outline-none transition-colors placeholder:text-faint focus:border-amber-400/60"
@@ -314,8 +340,10 @@ export function ComposerPanel({ room }: { room: Room }) {
             {c.url.trim() ? "" : "Find & post with AI"}
           </Button>
           {!c.url.trim() && (
-            <p className="max-w-[220px] text-[11px] leading-snug text-muted">
-              No link? Groq scans faceless clips with 50K+ likes, reviews comments, and posts the best one — 1/hr.
+            <p className="max-w-[260px] text-[11px] leading-snug text-muted">
+              {room.engine.searchTopic.trim()
+                ? `Search “${room.engine.searchTopic.trim()}” now; only a relevant, quality-approved, watermark-screened clip can be posted.`
+                : "Enter a topic above (for example donut smp) so the AI knows exactly what to search for."}
             </p>
           )}
           {!loggedIn && (
@@ -357,7 +385,7 @@ export function PostsPanel({ room }: { room: Room }) {
                 ) : (
                   <Chip tone="violet">AI PICK</Chip>
                 )}
-                <Chip tone="neutral">{NICHE_LABEL[p.niche]}</Chip>
+                <Chip tone="neutral">{p.topic || NICHE_LABEL[p.niche]}</Chip>
                 <span className="ml-auto text-[10px] text-faint">{timeAgo(p.postedAt)}</span>
                 {isHit && <Chip tone="green">🔥 hit</Chip>}
               </div>

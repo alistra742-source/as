@@ -7,8 +7,8 @@ const source = fs.readFileSync(new URL("../worker/src/mediaEnhance.ts", import.m
 const js = stripTypeScriptTypes(source, { mode: "strip" })
   .replace(/^import[^;]+;\s*/gm, "")
   .replace(/export /g, "");
-const load = new Function(`${js}; return { planVideoEnhancement };`);
-const { planVideoEnhancement } = load();
+const load = new Function(`${js}; return { planVideoEnhancement, discoveryQualityRejection, watermarkFromTsv };`);
+const { planVideoEnhancement, discoveryQualityRejection, watermarkFromTsv } = load();
 
 const probe = (patch = {}) => ({
   width: 1080,
@@ -56,4 +56,21 @@ test("landscape masters retain landscape orientation", () => {
   const plan = planVideoEnhancement(probe({ width: 1280, height: 720 }), 120);
   assert.equal(plan.targetWidth, 1920);
   assert.equal(plan.targetHeight, 1080);
+});
+
+test("AI discovery rejects the old soft 540p source instead of merely upscaling it", () => {
+  const reason = discoveryQualityRejection(probe({ width: 540, height: 960, bitRate: 1_600_000 }), 8_000_000);
+  assert.match(reason, /requires at least 720p-class detail/);
+  assert.equal(discoveryQualityRejection(probe({ width: 720, height: 1280, bitRate: 2_500_000 }), 8_000_000), null);
+});
+
+test("OCR watermark policy catches platform marks and creator handles", () => {
+  const tsv = [
+    "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext",
+    "5\t1\t1\t1\t1\t1\t20\t30\t80\t20\t92\tTikTok",
+  ].join("\n");
+  assert.equal(watermarkFromTsv(tsv), "TikTok");
+  const handle = tsv.replace("TikTok", "@drdonutt");
+  assert.equal(watermarkFromTsv(handle), "@drdonutt");
+  assert.equal(watermarkFromTsv(tsv.replace("TikTok", "Minecraft")), null);
 });

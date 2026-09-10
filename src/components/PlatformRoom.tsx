@@ -126,7 +126,7 @@ function RoomHeader({
           <Radio className="size-3" />
           engine {room.engine.running ? "running" : "idle"}
         </Chip>
-        <Chip tone="amber">{NICHE_LABEL[room.engine.activeNiche]} next</Chip>
+        <Chip tone="amber">{room.engine.searchTopic.trim() || NICHE_LABEL[room.engine.activeNiche]} next</Chip>
         {totalViews > 0 && <Chip tone="violet">👁 {compactNumber(totalViews)} total views</Chip>}
         {hits > 0 && <Chip tone="green">🔥 {hits} hit{hits === 1 ? "" : "s"}</Chip>}
       </div>

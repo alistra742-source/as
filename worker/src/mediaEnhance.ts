@@ -232,6 +232,98 @@ function filterGraph(plan: EnhancementPlan): string {
   );
 }
 
+export function discoveryQualityRejection(probe: VideoProbe, bytes: number): string | null {
+  const shortSide = Math.min(probe.width, probe.height);
+  const longSide = Math.max(probe.width, probe.height);
+  if (bytes < 500_000) return `source is only ${(bytes / 1024).toFixed(0)} KB`;
+  if (shortSide < 700 || longSide < 1200) return `source is ${probe.width}×${probe.height}; discovery requires at least 720p-class detail`;
+  if (probe.duration > 0 && (probe.duration < 2 || probe.duration > 180)) {
+    return `source duration ${probe.duration.toFixed(1)}s is outside the 2–180s short-video quality window`;
+  }
+  if (probe.frameRate > 0 && probe.frameRate < 20) return `source frame rate ${probe.frameRate.toFixed(1)} fps is too low`;
+  if (probe.bitRate > 0 && probe.bitRate < 1_200_000) return `source bitrate ${(probe.bitRate / 1_000_000).toFixed(1)} Mbps is too soft`;
+  return null;
+}
+
+/** Parse Tesseract TSV and identify common platform/creator watermark marks. */
+export function watermarkFromTsv(tsv: string): string | null {
+  const words: string[] = [];
+  for (const line of tsv.split(/\r?\n/).slice(1)) {
+    const cols = line.split("\t");
+    if (cols.length < 12) continue;
+    const confidence = Number(cols[10]);
+    const text = cols.slice(11).join("\t").trim();
+    if (text && (!Number.isFinite(confidence) || confidence >= 25)) words.push(text);
+  }
+  const joined = words.join(" ").replace(/\s+/g, " ").trim();
+  const branded = joined.match(/\b(?:tiktok|capcut|instagram|youtube\s*shorts?|made\s+with)\b/i);
+  if (branded) return branded[0];
+  const handle = joined.match(/(?:^|\s)@\s*[a-z0-9_.-]{3,}/i);
+  if (handle) return handle[0].trim();
+  return null;
+}
+
+async function scanVisibleWatermark(file: string, probe: VideoProbe, dir: string): Promise<string | null> {
+  const duration = probe.duration || 3;
+  const points = [duration * 0.18, duration * 0.51, duration * 0.82];
+  for (let index = 0; index < points.length; index += 1) {
+    const frame = path.join(dir, `watermark-${index}.png`);
+    await run(
+      "ffmpeg",
+      [
+        "-y",
+        "-v",
+        "error",
+        "-ss",
+        points[index].toFixed(3),
+        "-i",
+        file,
+        "-map",
+        "0:v:0",
+        "-frames:v",
+        "1",
+        "-vf",
+        "scale='min(1280,iw)':-2:flags=lanczos",
+        frame,
+      ],
+      { timeoutMs: 45_000 }
+    );
+    const ocr = await run("tesseract", [frame, "stdout", "-l", "eng", "--psm", "11", "tsv"], {
+      timeoutMs: 45_000,
+      captureStdout: true,
+      maxStdout: 2_000_000,
+    });
+    const mark = watermarkFromTsv(ocr.stdout.toString("utf8"));
+    if (mark) return mark;
+  }
+  return null;
+}
+
+/**
+ * Discovery is stricter than a user-supplied link: reject soft footage and scan
+ * sampled pixels for platform/creator marks before any caption or upload begins.
+ */
+export async function screenVideoForDiscovery<T extends VideoLike>(video: T, log: StepLog): Promise<VideoProbe> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "viraldeck-screen-"));
+  const input = path.join(dir, "candidate.mp4");
+  try {
+    await fs.writeFile(input, video.buffer);
+    const probe = await probeVideo(input);
+    const quality = discoveryQualityRejection(probe, video.buffer.length);
+    if (quality) throw new Error(`quality screen rejected it: ${quality}`);
+    const watermark = await scanVisibleWatermark(input, probe, dir);
+    if (watermark) throw new Error(`visible watermark screen found “${watermark}”`);
+    log(
+      `✅ Candidate screen passed: ${probe.width}×${probe.height}, ` +
+        `${probe.frameRate ? `${probe.frameRate.toFixed(1)} fps, ` : ""}` +
+        `${probe.bitRate ? `${(probe.bitRate / 1_000_000).toFixed(1)} Mbps, ` : ""}no detected platform/creator watermark.`
+    );
+    return probe;
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
 /**
  * Build a clean 1080p upload master when the source actually needs it. This is
  * deliberately before every platform uploader, so TikTok, Instagram and YouTube

@@ -60,7 +60,7 @@ const { connectLive, disconnectLive, sendBusCmd, isLiveConnected } = load(
   FakeWebSocket,
   fakeWindow,
   accountRoomKey,
-  10,
+  11,
   15_000
 );
 

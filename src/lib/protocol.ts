@@ -44,13 +44,16 @@ export type RemoteCmd =
    * message is added: the deck then tells the user the worker is behind instead
    * of pressing a button whose command the old worker swallows in silence.
    */
-export const PROTOCOL_VERSION = 10;
+export const PROTOCOL_VERSION = 11;
 
 export type ClientMsg =
   | { type: "auth"; token: string; proto?: number }
   | { type: "cmd"; seq: number; cmd: RemoteCmd }
   | { type: "engine"; action: "start" | "stop" }
-  | { type: "post"; url: string; caption: string; requestId?: string }
+  | { type: "engine-config"; topic: string; thresholdViews?: number; likesFloor?: number }
+  | { type: "post"; url: string; caption: string; requestId: string }
+  | { type: "discover-post"; topic: string; caption: string; requestId: string }
+  | { type: "post-status"; requestId: string }
   | { type: "session"; action: "open" | "close" }
   /**
    * Sign the profile in with a session cookie pasted into the deck instead of
@@ -72,12 +75,24 @@ export interface LastPostSnapshot {
   requestId?: string;
   caption: string;
   niche: string;
+  topic?: string;
   source: "manual" | "ai";
   postedAt: number;
   views: number;
   likes: number;
   comments: number;
   verdict: string | null;
+}
+
+export interface ManualPublishResult {
+  requestId: string;
+  status: "accepted" | "succeeded" | "failed";
+  message: string;
+  at: number;
+  postId?: string;
+  postedAt?: number;
+  /** Confirmed destination URL only; omitted when a studio confirms without exposing one. */
+  url?: string;
 }
 
 export interface EngineSnapshot {
@@ -89,9 +104,15 @@ export interface EngineSnapshot {
   cadenceHours: number;
   thresholdViews: number;
   likesFloor: number;
+  /** Account-persisted exact free-text query; blank means cycle the built-in niches. */
+  topic: string;
   loggedIn: boolean;
   /** A user-requested publish is still running on this exact account runtime. */
   manualBusy: boolean;
+  /** Exact active request, so a stale `manualBusy:false` cannot cancel a newer click. */
+  manualRequestId: string | null;
+  /** Last correlated acknowledgement/terminal receipt, persisted for reconnects. */
+  manualResult: ManualPublishResult | null;
   lastPost: LastPostSnapshot | null;
 }
 

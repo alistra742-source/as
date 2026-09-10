@@ -7,9 +7,12 @@ the engine keep the account growing on your rules:
   (YouTube publishes as **Public** — its “Everyone”).
 - After each post, the engine reads views/likes/comments every hour. Crossing **3,000 views in
   the first hour** flips it into *double-down* mode and it posts **similar** content.
-- No link? Groq reviews **faceless videos with 50K+ likes** (captions + comment sentiment) and
-  only posts clips that clear its quality bar.
-- Niches it cycles: **faceless stories · scary stories · fun facts**.
+- No link? Enter **What to upload about** (for example `donut smp` or `drdonutt`). The selected
+  named account searches that exact topic on its platform (with a YouTube Shorts fallback when a TikTok/Instagram result surface is blocked), enforces the
+  50K-like engagement floor, downloads likely picks, rejects sub-720p-class or detected-watermark
+  footage, and publishes with a fresh caption inspired by the selected source title. The topic is
+  persisted per account and also drives its hourly engine.
+- Leave the custom topic blank to cycle: **faceless stories · scary stories · fun facts**.
 - Every platform opens to an **account switchboard**. Press **+**, name the account, then open its
   tile; each tile has its own persistent browser profile, login, engine, composer, posts, log, and
   Tor SOCKS-auth circuit identity. **Delete** closes that runtime and removes only that account's
@@ -140,8 +143,8 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 3. Set `GROQ_API_KEY` (get one at console.groq.com — free tier is plenty) and a long random
    `WORKER_TOKEN` (paste the same worker token in the deck’s Worker card). For official YouTube
    uploads, add these as **four separate Railway variables**: `GOOGLE_CLIENT_ID`,
-   `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI=https://<your-service>/callback` (the alias
-   `GOOGLE_REDIRECT_URL` is also accepted), and
+   `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URL=https://<your-service>/callback` (the
+   `GOOGLE_REDIRECT_URI` alias is also accepted), and
    `GOOGLE_SCOPES=https://www.googleapis.com/auth/youtube.upload` (`SCOPES` is accepted too).
    Never paste the client secret into the deck or chat. Optional: `GROQ_MODEL`,
    `GOOGLE_TOKEN_ENCRYPTION_KEY`, `BROWSER_ENGINE` / `BLOCK_TRACKERS` / `CHROME_PATH`, the `TOR_*`
@@ -263,7 +266,7 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 > (`Tapped "Email" — the pointer press was ignored, the DOM click worked`), because "it worked, but not the
 > way you asked" is the answer a remote control owes you.
 >
-> **Protocol version.** `PROTOCOL_VERSION` (10: OAuth and request-correlated manual-publish reconnect state; 9: isolated
+> **Protocol version.** `PROTOCOL_VERSION` (11: persisted request acknowledgements/status recovery + per-account custom-topic discovery; 10: OAuth and initial manual receipt correlation; 9: isolated
 > named-account scope; 8: Playwright/Clearcote engine identity; 6: a failed publish answers;
 > 5: cookie login; 4: label taps and the DOM escalation) travels
 > on `auth` and comes back on `ready`, so a deck newer than the worker warns on connect and an unknown
@@ -313,6 +316,10 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 > generation loss. `VD_VIDEO_ENHANCE=always|adaptive|off` controls this (adaptive is default); enhancement
 > failure stops before upload instead of silently posting the old bad-quality file. This cannot invent
 > detail the source never contained, which is why choosing the highest-resolution CDN candidate happens first.
+> AI discovery is stricter than an exact link supplied by the user: it tries another relevant candidate when
+> the downloaded source is below 720p-class detail, under the bitrate/frame-rate floor, or when Tesseract OCR
+> finds a TikTok/Instagram/YouTube/CapCut mark or creator `@handle` in sampled frames. It never erases a mark;
+> a marked candidate is simply not selected.
 >
 > **A manual upload runs in the tab you are watching; source retrieval does not.** Opening the source in the
 > streamed tab made a failed CDN fetch look like the deck had chosen to watch the video instead of uploading it.
@@ -323,6 +330,14 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 > old path incorrectly broadcast the source URL even when `uploadTikTok` had returned `ok:false`. With no
 > browser tab open the studio falls back to its own page. The hourly engine cycle remains hidden and cannot
 > steal the feed you are browsing.
+>
+> **Manual state is request-correlated, not boolean-correlated.** The worker flushes an `accepted`
+> acknowledgement carrying the exact request id before source/browser work, and snapshots carry both that
+> active id and the last terminal result. A stale `manualBusy:false` snapshot that was already in flight when
+> Post was pressed cannot remove the new optimistic row. Only a matching success/history receipt or matching
+> actionable failure settles it. Reconnects recover the persisted result; a worker restart converts an
+> interrupted acknowledgement into a matching explicit failure, and a long-running request triggers a
+> correlated status query rather than a made-up timeout error.
 >
 > **Studio reachability.** TikTok's upload page has lived at two URLs, so `uploadTikTok` tries `/upload` then
 > `/tiktokstudio/upload`, clicks the "Upload video" trigger if the `<input type=file>` is mounted lazily, and
@@ -427,8 +442,9 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 | Audience | Everyone (YouTube: **Public** and **No, it’s not made for kids**) | API metadata/receipt + fail-closed Studio selection |
 | Cadence | 1 post / 1 hour (slots only ever jittered *longer*) | `worker/src/engine.ts` (also demo engine) |
 | Hit trigger | 3,000+ views in first hour | engine metric pass, editable per room |
-| Discovery floor | 50K+ likes | `scrapeCandidates` filter + Groq judge |
-| Groq roles | captions, candidate review, performance reads | `worker/src/groq.ts` |
+| Discovery floor | 50K+ likes, 720p-class downloadable source, no detected watermark | search/result stats + FFprobe/Tesseract screen + Groq judge |
+| Custom subject | Exact free text, persisted per named account | `engine.topic` + platform search URLs |
+| Groq roles | source-inspired captions, candidate review, performance reads | `worker/src/groq.ts` |
 
 If `GROQ_API_KEY` is missing the worker logs a warning and runs deterministic heuristics so
 nothing silently breaks.
@@ -474,10 +490,12 @@ The YouTube room is fully wired to the same deck flow:
   The dock also has one-tap `/shorts` and Studio links.
 - A vertical clip under YouTube’s current Shorts duration rules is classified as a Short by YouTube;
   other footage is a regular public video. ViralDeck does not fake that classification.
-- **AI auto-post** uses the same OAuth-first/fallback uploader. Discovery searches YouTube for the
-  active niche (`faceless storytime shorts`, `scary stories shorts`, `mind blowing facts shorts`),
-  reads candidate engagement, enforces the 50K floor, then runs Groq review. Cadence and the
-  3K+/hour double-down trigger are unchanged.
+- **AI auto-post** uses the same OAuth-first/fallback uploader. A custom **What to upload about**
+  value becomes the exact YouTube search query (for example `drdonutt`); with it blank, discovery
+  uses the preset queries (`faceless storytime shorts`, `scary stories shorts`, `mind blowing facts
+  shorts`). It reads candidate engagement, enforces the 50K floor plus media/watermark screen, then
+  writes a non-identical source-title-inspired caption. Cadence and the 3K+/hour double-down trigger
+  are unchanged.
 
 The raw Google authorization link is intentionally not used directly: it lacks the app-generated,
 account-bound, one-use state marker. In Google OAuth **Testing** mode, even a persistent encrypted
