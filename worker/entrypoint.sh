@@ -31,14 +31,19 @@ case "${TOR_PROXY_ENABLED:-true}" in
     TOR_DATA_DIR="${TOR_DATA_DIR:-/tmp/viraldeck-tor}"
     rm -rf "${TOR_DATA_DIR}"
     install -d -m 0700 -o debian-tor -g debian-tor "${TOR_DATA_DIR}"
+    TOR_STARTUP_LOG="${TOR_DATA_DIR}/startup.log"
+    : > "${TOR_STARTUP_LOG}"
+    chown debian-tor:debian-tor "${TOR_STARTUP_LOG}"
+    export TOR_STARTUP_LOG
     tor --defaults-torrc /dev/null -f /dev/null \
+      --RunAsDaemon 0 \
       --User debian-tor \
       --ClientOnly 1 \
       --AvoidDiskWrites 1 \
       --SafeSocks 1 \
       --DataDirectory "${TOR_DATA_DIR}" \
       --SocksPort "127.0.0.1:${TOR_PORT} IsolateSOCKSAuth" \
-      --Log "notice stdout" &
+      --Log "notice stdout" >"${TOR_STARTUP_LOG}" 2>&1 &
     TOR_PID=$!
     echo "[viraldeck] Tor starting on 127.0.0.1:${TOR_PORT} (per-account IsolateSOCKSAuth; PID ${TOR_PID})"
     ;;

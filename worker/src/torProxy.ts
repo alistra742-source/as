@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import fs from "node:fs";
 import net from "node:net";
 import tls from "node:tls";
 import { accountScopeKey } from "./accountScope.js";
@@ -159,6 +160,24 @@ function socksError(code: number): string {
   )[code] || `error ${code}`;
 }
 
+function torStartupDetail(): string {
+  const file = process.env.TOR_STARTUP_LOG || "";
+  if (!file) return "";
+  try {
+    const lines = fs
+      .readFileSync(file, "utf8")
+      .split(/\r?\n/)
+      .map((line) => line.replace(/[\u0000-\u001f\u007f]/g, " ").trim())
+      .filter(Boolean)
+      .slice(-4)
+      .join(" | ")
+      .slice(-700);
+    return lines ? `; Tor startup log: ${lines}` : "";
+  } catch {
+    return "";
+  }
+}
+
 /** Open one DNS-safe Tor stream. Only username/password auth is offered. */
 export async function openTorStream(host: string, port: number, credentials: IsolationCredentials): Promise<net.Socket> {
   if (!host || Buffer.byteLength(host, "utf8") > 255 || !Number.isInteger(port) || port < 1 || port > 65_535) {
@@ -205,6 +224,10 @@ export async function openTorStream(host: string, port: number, credentials: Iso
     return socket;
   } catch (error) {
     socket.destroy();
+    const message = (error as Error).message || String(error);
+    if ((error as NodeJS.ErrnoException).code === "ECONNREFUSED") {
+      throw new Error(`${message}${torStartupDetail()}`);
+    }
     throw error;
   }
 }
