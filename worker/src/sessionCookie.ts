@@ -75,7 +75,7 @@ const TABLE: Record<PlatformKey, PlatformCookie> = {
     allow: [".tiktok.com"],
     need: "sessionid",
     twins: ["sessionid_ss"],
-    strict: ["sessionid", "sessionid_ss", "sid_guard", "sid_tt", "uid_tt", ".ttwebid"],
+    strict: ["sessionid", "sessionid_ss", "sid_guard", "sid_tt", "uid_tt", "ttwebid"],
   },
   instagram: {
     domain: ".instagram.com",
@@ -120,15 +120,14 @@ const cookieName = (raw: string) => raw.replace(/^\.+/, "").toLowerCase();
  * seconds>-…`. When it is in the paste, honour it — a cookie installed for a year
  * that the server expired in a month only produces a mysteriously dead session.
  */
-function expiryFromSidGuard(value: string | undefined, nowMs: number): number | null {
+function expiryFromSidGuard(value: string | undefined): number | null {
   if (!value) return null;
-  const m = /(\d{9,11})-(\d{4,9})-/.exec(value);
+  const m = /(?:^|\|)(\d{9,11})-(\d{4,9})-/.exec(value);
   if (!m) return null;
   const issued = Number(m[1]);
   const life = Number(m[2]);
   if (!issued || !life) return null;
-  const at = issued + life;
-  return at * 1000 > nowMs ? at : Math.floor(nowMs / 1000) + 30 * DAY;
+  return issued + life;
 }
 
 /** One parsed cookie, before it is judged against the platform's rules. */
@@ -136,6 +135,8 @@ interface ParsedCookie {
   name: string;
   value: string;
   domain: string | null;
+  /** Keep an exported scope intact; changing `/foo` to `/` can change which duplicate wins. */
+  path: string | null;
   /** Seconds since the epoch, when the paste said so. */
   expires: number | null;
   httpOnly: boolean | null;
@@ -168,9 +169,30 @@ function asExpiry(v: unknown): number | null {
 }
 
 function cleanDomain(v: unknown): string | null {
-  const raw = String(v ?? "").trim().replace(/^#HttpOnly_/, "").toLowerCase();
+  const raw = String(v ?? "")
+    .trim()
+    .replace(/^\uFEFF/, "")
+    .replace(/^#HttpOnly_/, "")
+    .replace(/^https?:\/\//i, "")
+    .split("/")[0]
+    .replace(/:\d+$/, "")
+    .toLowerCase();
   if (!raw) return null;
   return raw.replace(/^\.+/, ".");
+}
+
+function exportDomain(domain: unknown, hostOnly: unknown): string | null {
+  const cleaned = cleanDomain(domain);
+  if (!cleaned) return null;
+  // A leading dot is the actual include-subdomains representation and wins over
+  // contradictory extension metadata. When the dot is absent, `hostOnly:false`
+  // is enough information to restore it.
+  return !cleaned.startsWith(".") && hostOnly === false ? `.${cleaned}` : cleaned;
+}
+
+function cleanPath(v: unknown): string | null {
+  const path = String(v ?? "").trim();
+  return path.startsWith("/") ? path.slice(0, 1024) : null;
 }
 
 /** A cookie-editor export (EditThisCookie, Cookie-Editor, devtools' JSON). */
@@ -192,12 +214,15 @@ function fromJson(text: string): ParsedPaste {
   for (const row of rows) {
     const o = (row ?? {}) as Record<string, unknown>;
     const name = String(o.name ?? o.Name ?? "").trim();
-    const value = String(o.value ?? o.Value ?? "").trim();
+    // JSON exports already delimit the value structurally. Trimming or removing
+    // quote characters mutates a valid opaque token; preserve its bytes exactly.
+    const value = String(o.value ?? o.Value ?? "");
     if (!name || !value || cookies.length >= MAX_COOKIES) continue;
     cookies.push({
       name,
-      value: value.replace(/^"|"$/g, "").slice(0, MAX_VALUE),
-      domain: cleanDomain(o.domain ?? o.Domain),
+      value: value.slice(0, MAX_VALUE),
+      domain: exportDomain(o.domain ?? o.Domain, o.hostOnly ?? o.host_only),
+      path: cleanPath(o.path ?? o.Path),
       expires: asExpiry(o.expirationDate ?? o.expires ?? o.expiry ?? o.max_age),
       httpOnly: typeof o.httpOnly === "boolean" ? o.httpOnly : null,
       secure: typeof o.secure === "boolean" ? o.secure : null,
@@ -210,8 +235,10 @@ function fromJson(text: string): ParsedPaste {
 
 /**
  * `cookies.txt` (Netscape format), the thing `curl` and every downloader writes:
- *   domain  flag  path  expiry  name  value          ← 6 fields
+ *   domain  include-subdomains  path  secure  expiry  name  value  ← 7 fields
  *   # comment / "# Netscape HTTP Cookie File" / "#HttpOnly_.tiktok.com …"
+ * A few browser extensions omit the secure column (legacy 6-field variant), so
+ * that shape remains accepted too.
  */
 function fromNetscape(text: string): ParsedPaste | null {
   // Comments are dropped — except `#HttpOnly_`, which is a real flag Netscape
@@ -222,18 +249,26 @@ function fromNetscape(text: string): ParsedPaste | null {
   if (tableish < Math.max(1, Math.floor(lines.length / 2))) return null;
   const cookies: ParsedCookie[] = [];
   for (const line of lines) {
-    const f = line.split(/\t+/).map((x) => x.trim());
+    const f = line.split("\t").map((x) => x.trim());
     if (f.length < 6) continue;
-    const [domain, , path, expiry, name, value] = f;
+    const standard = f.length >= 7;
+    const domain = f[0];
+    const includeSubdomains = /^true$/i.test(f[1]);
+    const path = f[2];
+    const secure = standard ? /^true$/i.test(f[3]) : null;
+    const expiry = f[standard ? 4 : 3];
+    const name = f[standard ? 5 : 4];
+    const value = f.slice(standard ? 6 : 5).join("\t");
     if (!name || !value || cookies.length >= MAX_COOKIES) continue;
     cookies.push({
       name,
       value: value.slice(0, MAX_VALUE),
-      domain: cleanDomain(domain),
+      domain: exportDomain(domain, !includeSubdomains),
+      path: cleanPath(path),
       expires: asExpiry(expiry),
       httpOnly: line.startsWith("#HttpOnly_") ? true : null,
-      secure: null,
-      sameSite: path === "/" ? null : null,
+      secure,
+      sameSite: null,
     });
   }
   return cookies.length ? { cookies, shape: "netscape" } : null;
@@ -252,7 +287,7 @@ function fromPairs(text: string): ParsedPaste {
       // contain spaces, which is what keeps "my tiktok cookie" from being read as
       // one and installed as a session.
       if (!cookies.length && /^[^\s;,"']{16,}$/.test(token) && !NOT_A_COOKIE.has(cookieName(token))) {
-        cookies.push({ name: "__bare__", value: token, domain: null, expires: null, httpOnly: null, secure: null, sameSite: null });
+        cookies.push({ name: "__bare__", value: token, domain: null, path: null, expires: null, httpOnly: null, secure: null, sameSite: null });
       }
       continue;
     }
@@ -261,7 +296,7 @@ function fromPairs(text: string): ParsedPaste {
     if (!name || !value) continue;
     if (NOT_A_COOKIE.has(cookieName(name))) continue;
     if (cookies.length >= MAX_COOKIES) break;
-    cookies.push({ name, value: value.slice(0, MAX_VALUE), domain: null, expires: null, httpOnly: null, secure: null, sameSite: null });
+    cookies.push({ name, value: value.slice(0, MAX_VALUE), domain: null, path: null, expires: null, httpOnly: null, secure: null, sameSite: null });
   }
   return { cookies, shape: cookies.length ? "pairs" : "empty" };
 }
@@ -296,34 +331,42 @@ export function planSessionCookies(platform: PlatformKey, raw: string, nowMs = D
     return fail("nothing to read — paste the session cookie value (or the whole header)");
   }
 
-  // First name wins, and an entry the paste says belongs to a site we do not
-  // trust for this platform is dropped rather than written into the profile.
-  const kept: ParsedCookie[] = [];
+  // Cookie identity is name + domain + path, not name alone. Cookie-editor
+  // exports can legitimately contain host-only and parent-domain copies of the
+  // same name; dropping the second one changes the Cookie header the working
+  // source browser sent. De-duplicate only an exact exported scope.
+  const accepted: ParsedCookie[] = [];
   const named = new Map<string, ParsedCookie>();
+  const seenScopes = new Set<string>();
   let skipped = 0;
   for (const c of pasted.cookies) {
     if (!c.name || !c.value) continue;
     const key = c.name.toLowerCase();
-    if (named.has(key)) continue;
-    if (c.domain && !spec.allow.some((d) => c.domain === d.slice(1) || c.domain === d || (c.domain || "").endsWith(d))) {
+    const domain = c.domain;
+    if (domain && !spec.allow.some((d) => domain === d.slice(1) || domain === d || domain.endsWith(d))) {
       skipped++;
       continue;
     }
-    named.set(key, c);
-    kept.push(c);
+    const scope = `${key}\u0000${c.domain ?? ""}\u0000${c.path ?? ""}`;
+    if (seenScopes.has(scope)) continue;
+    seenScopes.add(scope);
+    accepted.push(c);
+    if (!named.has(key)) named.set(key, c);
   }
 
   const needle = spec.need.toLowerCase();
   const bare = named.get("__bare__");
+  const nowSec = Math.floor(nowMs / 1000);
+  let sessionCandidates: ParsedCookie[];
   if (bare) {
-    named.delete("__bare__");
-    const rest = Array.from(named.values());
-    named.clear();
     // A lone value: the paste was just the `sessionid` string itself.
-    named.set(needle, { ...bare, name: spec.need });
-    for (const c of rest) named.set(c.name.toLowerCase(), c);
+    sessionCandidates = [{ ...bare, name: spec.need }];
+    named.set(needle, sessionCandidates[0]);
+  } else {
+    sessionCandidates = accepted.filter((c) => c.name.toLowerCase() === needle);
   }
-  const session = named.get(needle);
+  const session =
+    sessionCandidates.find((c) => c.value.length >= 16 && (!c.expires || c.expires > nowSec)) ?? sessionCandidates[0];
   if (!session) {
     const found = Array.from(named.values()).map((c) => c.name);
     return fail(
@@ -335,47 +378,80 @@ export function planSessionCookies(platform: PlatformKey, raw: string, nowMs = D
   if (session.value.length < 16) {
     return fail(`${spec.need} looks truncated (${session.value.length} characters) — copy the whole value`);
   }
-  // The bare-value route leaves everything else out; the named route keeps it.
-  const list = bare ? [session] : Array.from(named.values());
-
-  // TikTok's www origin reads the SameSite twin, so mint it when it is missing.
-  for (const twin of spec.twins) {
-    if (!named.has(twin.toLowerCase())) list.push({ ...session, name: twin });
+  const showExpiry = (seconds: number) => new Date(seconds * 1000).toISOString().slice(0, 10);
+  if (session.expires && session.expires <= nowSec) {
+    return fail(`${spec.need} expired on ${showExpiry(session.expires)} — export it again from a currently signed-in tab`);
+  }
+  const guardExpiry = expiryFromSidGuard(named.get("sid_guard")?.value);
+  if (guardExpiry && guardExpiry <= nowSec) {
+    return fail(`sid_guard says this TikTok session expired on ${showExpiry(guardExpiry)} — export a fresh signed-in session`);
   }
 
-  const guardExpiry = expiryFromSidGuard(named.get("sid_guard")?.value, nowMs);
-  const fromSession = session.expires && session.expires * 1000 > nowMs ? session.expires : null;
-  const raw_expiry = fromSession ?? guardExpiry ?? Math.floor(nowMs / 1000) + 365 * DAY;
-  const expiresSec = Math.max(raw_expiry, Math.floor(nowMs / 1000) + 30 * DAY);
-  const where = fromSession ? "lifetime from the paste" : guardExpiry ? "lifetime from sid_guard" : "kept for 365 days";
+  // The bare-value route leaves everything else out; the named route keeps it.
+  // Expired accessory records are omitted instead of silently extending them:
+  // extending client expiry cannot revive server-side state and can make the
+  // wrong stale cookie win over a valid scoped copy already in the profile.
+  let skippedExpired = 0;
+  const list = (bare ? [session] : accepted).filter((c) => {
+    if (!c.expires || c.expires > nowSec) return true;
+    skippedExpired += 1;
+    return false;
+  });
+
+  // TikTok's www origin reads the SameSite twin, so mint it when no live twin was
+  // supplied. It inherits the primary session's domain/path/lifetime, with the
+  // Secure+SameSite=None semantics that make it the cross-site twin.
+  for (const twin of spec.twins) {
+    if (!list.some((c) => c.name.toLowerCase() === twin.toLowerCase())) {
+      list.push({ ...session, name: twin, sameSite: "None", secure: true });
+    }
+  }
+
+  const authoritative = [
+    ...list.filter((c) => c.name.toLowerCase() === needle).map((c) => c.expires),
+    guardExpiry,
+  ].filter((n): n is number => !!n && n > nowSec);
+  const expiresSec = authoritative.length ? Math.min(...authoritative) : nowSec + 365 * DAY;
+  const where = session.expires
+    ? guardExpiry
+      ? "lifetime from the paste and sid_guard"
+      : "lifetime from the paste"
+    : guardExpiry
+      ? "lifetime from sid_guard"
+      : "kept for 365 days";
 
   const cookies: CookieRecord[] = [];
   for (const c of list) {
     const key = c.name.toLowerCase();
-    const site = spec.allow.find((d) => (c.domain || "").endsWith(d) || c.domain === d.slice(1)) ?? spec.domain;
-    const sameSite = c.sameSite ?? "None";
+    // A validated export's scope is already safe. Preserve it rather than
+    // flattening every host-only cookie onto `.tiktok.com` and every path onto
+    // `/`; cookie ordering and host-only state are part of the browser identity.
+    const site = c.domain ?? spec.domain;
+    // Chrome's effective default for an omitted/"unspecified" SameSite attribute
+    // is Lax. The `_ss` twin is the deliberate cross-site copy and defaults to
+    // None; explicit export metadata always wins.
+    const sameSite = c.sameSite ?? (key.endsWith("_ss") ? "None" : "Lax");
     cookies.push({
       name: c.name,
       value: c.value,
       domain: site,
-      path: "/",
-      expires: c.expires && c.expires * 1000 > nowMs ? c.expires : expiresSec,
+      path: c.path ?? "/",
+      expires: c.expires ?? expiresSec,
       httpOnly: c.httpOnly ?? spec.strict.includes(key),
-      // "None" is what these sites ship their session with, and the profile is
-      // HTTPS-only. An export that says `secure: false` alongside SameSite=None
-      // would be rejected outright by Chromium, so the pair is forced together:
-      // a dropped cookie is a failed login, a slightly-overstated flag is not.
+      // SameSite=None without Secure is refused by Chromium. Preserve every
+      // explicit flag except this mechanically invalid combination.
       secure: sameSite === "None" ? true : (c.secure ?? true),
       sameSite,
     });
   }
   const skippedNote = skipped ? ` · ${skipped} entr${skipped === 1 ? "y" : "ies"} from other sites skipped` : "";
+  const expiredNote = skippedExpired ? ` · ${skippedExpired} expired accessor${skippedExpired === 1 ? "y" : "ies"} skipped` : "";
   return {
     ok: cookies.length > 0,
     sessionName: spec.need,
     detail: `${cookies.length} cookie${cookies.length === 1 ? "" : "s"} for ${spec.domain}${
       pasted.shape === "json" ? " (cookie export)" : pasted.shape === "netscape" ? " (cookies.txt)" : ""
-    } — ${cookies.map((c) => c.name).join(", ")} · ${where}${skippedNote}`,
+    } — ${cookies.map((c) => c.name).join(", ")} · ${where}${skippedNote}${expiredNote}`,
     cookies,
     names: cookies.map((c) => c.name),
     expiresAt: expiresSec * 1000,

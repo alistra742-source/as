@@ -9,8 +9,13 @@ import { PROTOCOL_VERSION, type RemoteCmd, type ServerMsg } from "./protocol.js"
 import { Store } from "./store.js";
 import { checkUploadAccess } from "./uploads.js";
 import { asHumanPage, humanTap, humanType, jitter, readingPause, sleep, thinkingPause } from "./human.js";
-import { describePlan, planSessionCookies } from "./sessionCookie.js";
-import { tiktokSignedInPage } from "./tiktokLogin.js";
+import { describePlan, planSessionCookies, type CookiePlan } from "./sessionCookie.js";
+import {
+  tiktokAccountProbePage,
+  tiktokLoginEvidencePage,
+  type TikTokAccountProbe,
+  type TikTokLoginEvidence,
+} from "./tiktokLogin.js";
 import { accountTorProxy } from "./torProxy.js";
 import { cleanDiscoveryTopic, discoverySearchUrl, isTopicMatch, rankDiscoveryCandidates, topicRelevance } from "./discovery.js";
 import { ensureHumanized, humanizeContext, isHumanized } from "./humanizeAttach.js";
@@ -137,6 +142,47 @@ interface PageMetrics {
 }
 
 const clamp01 = (v: number) => Math.min(1, Math.max(0, v));
+
+interface CookieJarVerdict {
+  expected: number;
+  exact: number;
+  scoped: number;
+  sessionPresent: boolean;
+}
+
+/** Compare in memory only. Values are intentionally absent from the verdict. */
+function cookieJarVerdict(
+  jar: Array<{ name: string; value: string; domain: string; path: string }>,
+  plan: CookiePlan,
+  requireExactValue: boolean
+): CookieJarVerdict {
+  let exact = 0;
+  let scoped = 0;
+  for (const wanted of plan.cookies) {
+    const atScope = jar.find(
+      (actual) => actual.name === wanted.name && actual.domain === wanted.domain && actual.path === wanted.path
+    );
+    if (atScope) scoped += 1;
+    if (atScope && (!requireExactValue || atScope.value === wanted.value)) exact += 1;
+  }
+  const sessionNeedle = (plan.sessionName || "").toLowerCase();
+  return {
+    expected: plan.cookies.length,
+    exact,
+    scoped,
+    sessionPresent: !!sessionNeedle && jar.some((cookie) => cookie.name.toLowerCase() === sessionNeedle),
+  };
+}
+
+/**
+ * Where to land after a jar swap. TikTok's root and For You feed are public;
+ * their generic content cannot prove authentication. `/profile` is a harmless
+ * private-route canary: a valid session resolves to the viewer's profile, while
+ * an anonymous browser is sent to login/For You.
+ */
+function postCookieUrl(platform: PlatformKey): string {
+  return platform === "tiktok" ? "https://www.tiktok.com/profile" : START_URLS[platform];
+}
 
 /**
  * "used/limit MB (N OOM kills)" from the container's cgroup, or "" when not in
@@ -379,6 +425,8 @@ export class Rig {
   /** How many time-spaced looks in a row said "signed out" — see `detectLogin`. */
   private signedOutStreak = 0;
   private lastSignedOutLookAt = 0;
+  /** Freeze ambient login reads while the tab is blanked and its cookie jar is replaced. */
+  private sessionMutation = false;
   /**
    * Set while the worker drives the *visible* tab itself (a manual publish). The
    * ambient loops stand down and login detection pauses for the duration: a page
@@ -1080,14 +1128,26 @@ export class Rig {
     this.broadcast({ type: "toast", text: r.ok ? `Auto-tapped "${label}" — take it from here` : r.toast, tone: r.tone });
   }
 
+  /** Commit strong positive evidence once, shared by DOM and account-endpoint probes. */
+  private acceptSignedInDetection(): void {
+    this.signedOutStreak = 0;
+    this.lastSignedOutLookAt = 0;
+    const rig = this.store.rig(this.platform);
+    if (rig.loggedIn) return;
+    this.store.setLoggedIn(this.platform, true, this.accountName);
+    this.broadcast({ type: "login", loggedIn: true });
+    this.broadcast({ type: "log", level: "ok", text: `✅ Signed in detected on ${this.platform} — the engine may act.`, at: Date.now() });
+  }
+
   /** Best-effort "am I signed in" detection. Engines pause until this is true. */
   async detectLogin(): Promise<boolean> {
     const page = this.control;
     if (this.destroyed) return false;
     if (!page || page.isClosed() || this.detectBusy) return this.store.rig(this.platform).loggedIn;
-    // A publish navigating the visible tab to /upload is not evidence about the
-    // session. Hold the last answer until the tab is ours again.
-    if (this.driving) return this.store.rig(this.platform).loggedIn;
+    // A publish navigating the visible tab to /upload, or an atomic cookie-jar
+    // replacement blanking it for a moment, is not evidence about the session.
+    // Hold the last answer until the tab is ours again.
+    if (this.driving || this.sessionMutation) return this.store.rig(this.platform).loggedIn;
     this.detectBusy = true;
     try {
       let logged = false;
@@ -1099,7 +1159,8 @@ export class Rig {
         .evaluate(() => /login|passport|\/accounts\/|ServiceLogin|signin|challenge/i.test(location.href))
         .catch(() => false);
       if (this.platform === "tiktok") {
-        logged = await page.evaluate(tiktokSignedInPage);
+        const evidence = await page.evaluate(tiktokLoginEvidencePage);
+        logged = evidence.state === "signed-in";
       } else if (this.platform === "instagram") {
         logged = await page.evaluate(() => {
           const u = location.href;
@@ -1130,13 +1191,7 @@ export class Rig {
       const rig = this.store.rig(this.platform);
       const prev = rig.loggedIn;
       if (logged) {
-        this.signedOutStreak = 0;
-        this.lastSignedOutLookAt = 0;
-        if (!prev) {
-          this.store.setLoggedIn(this.platform, true, this.accountName);
-          this.broadcast({ type: "login", loggedIn: true });
-          this.broadcast({ type: "log", level: "ok", text: `✅ Signed in detected on ${this.platform} — the engine may act.`, at: Date.now() });
-        }
+        this.acceptSignedInDetection();
       } else if (!atLoginWall && Date.now() - this.lastSignedOutLookAt < 4000) {
         // Navigation emits several frame events in one render. They are one look,
         // not three independent observations; keep the previous trusted state.
@@ -1221,63 +1276,206 @@ export class Rig {
    *
    * It does not start anything. A signed-in profile only enables the deck's Start
    * button; the engine arms on that press and on nothing else, and this method
-   * never calls into it. The pasted value is never stored, logged or broadcast:
-   * `detail` and the toast speak in cookie names and dates only.
+   * never calls into it. The raw paste is used only to write Chromium's cookie
+   * jar; it is never put in app state, logged, or broadcast back. `detail` and
+   * toasts contain names, counts, dates, and coarse authentication evidence only.
    */
   async applySessionCookie(raw: string): Promise<{ ok: boolean; detail: string }> {
     const plan = planSessionCookies(this.platform, raw);
     if (!plan.ok) {
       this.broadcast({ type: "log", level: "warn", text: `⚠️ Session cookie not applied: ${plan.detail}`, at: Date.now() });
-      this.broadcast({ type: "toast", text: "That is not a session cookie", tone: "warn" });
+      this.broadcast({ type: "toast", text: "That is not a usable session export", tone: "warn" });
       return { ok: false, detail: plan.detail };
     }
+
+    let stage = "starting the account browser";
+    let jarChanged = false;
+    let installed = false;
+    this.sessionMutation = true;
     try {
       const ctx = await this.ensureContext();
-      await ctx.addCookies(
-        plan.cookies.map((c) => ({
-          name: c.name,
-          value: c.value,
-          domain: c.domain,
-          path: c.path,
-          expires: c.expires,
-          httpOnly: c.httpOnly,
-          secure: c.secure,
-          sameSite: c.sameSite,
-        }))
-      );
-      if (this.destroyed) throw new Error("This account runtime was deleted");
-      this.store.setCookie(this.platform, Date.now(), plan.names, plan.expiresAt);
-      this.broadcastCookieState();
-      this.broadcast({ type: "log", level: "info", text: `Session cookie installed — ${plan.detail}`, at: Date.now() });
+      // Applying is initiated from the room, so this normally reuses its visible
+      // tab. Awaiting it here is important: writing while the first TikTok request
+      // is still setting guest cookies lets that response overwrite the import.
+      const page = await this.openControlSession();
+      if (this.destroyed) throw new Error("account runtime deleted");
 
-      // Reload through the command queue, so installing a session can never yank
-      // the page out from under a click that is mid-flight. If the tab is still
-      // coming up because the deck only just connected, wait for that instead of
-      // racing it with a second navigation of the same page.
-      for (let i = 0; i < 40 && (!this.control || this.control.isClosed()); i++) await sleep(250);
-      if (this.control && !this.control.isClosed()) await this.exec({ t: "navigate", url: START_URLS[this.platform] });
-      else await this.openControlSession();
+      let navigationStatus: number | null = null;
+      let navigationSettled = true;
+      await this.withInput(async () => {
+        stage = "pausing the site before the jar swap";
+        await page.goto("about:blank", { waitUntil: "domcontentloaded", timeout: 10_000 });
+
+        stage = "removing stale same-name cookies";
+        // A cookie swap is an identity boundary. Fail closed as soon as jar work
+        // begins; even a later CDP error could occur after one name was removed.
+        jarChanged = true;
+        const wasLoggedIn = this.store.rig(this.platform).loggedIn;
+        this.store.setLoggedIn(this.platform, false);
+        this.signedOutStreak = 0;
+        this.lastSignedOutLookAt = 0;
+        if (wasLoggedIn) this.broadcast({ type: "login", loggedIn: false });
+
+        // `addCookies()` replaces only an exact name+domain+path tuple. A stale
+        // host-only `www.tiktok.com` session can otherwise coexist with a newly
+        // imported `.tiktok.com` session and be sent first. Remove only names the
+        // new plan owns; unrelated device/trust cookies survive a bare paste.
+        for (const name of Array.from(new Set(plan.names))) await ctx.clearCookies({ name });
+
+        stage = "writing the imported cookie scopes";
+        await ctx.addCookies(
+          plan.cookies.map((c) => ({
+            name: c.name,
+            value: c.value,
+            domain: c.domain,
+            path: c.path,
+            expires: c.expires,
+            httpOnly: c.httpOnly,
+            secure: c.secure,
+            sameSite: c.sameSite,
+          }))
+        );
+
+        stage = "verifying Chromium retained the import";
+        const written = cookieJarVerdict(await ctx.cookies(), plan, true);
+        if (written.exact !== written.expected) {
+          // Counts and scopes are safe; never interpolate a value or Playwright's
+          // raw error (validation errors can include the offending cookie object).
+          throw new Error(`Chromium retained ${written.exact}/${written.expected} exact cookie scopes`);
+        }
+        installed = true;
+        if (this.destroyed) throw new Error("account runtime deleted");
+        this.store.setCookie(this.platform, Date.now(), plan.names, plan.expiresAt);
+        this.broadcastCookieState();
+        this.broadcast({ type: "log", level: "info", text: `Session cookie installed — ${plan.detail}`, at: Date.now() });
+
+        stage = "loading the post-install account page";
+        try {
+          const response = await page.goto(postCookieUrl(this.platform), {
+            waitUntil: "domcontentloaded",
+            timeout: 45_000,
+          });
+          navigationStatus = response?.status() ?? null;
+        } catch {
+          // A streaming page can keep loading forever even though its account
+          // header rendered. Continue to evidence checks rather than turn a
+          // navigation timeout into a misleading "browser refused the cookie".
+          navigationSettled = false;
+        }
+      });
+      this.sessionMutation = false;
 
       let logged = false;
-      for (let i = 0; i < 10 && !logged; i++) {
-        await sleep(800); // sites decide "am I known" a beat after first paint
-        logged = await this.detectLogin();
+      let pageEvidence: TikTokLoginEvidence = { state: "unknown", reason: "no-auth-evidence" };
+      let accountProbe: TikTokAccountProbe = { state: "unknown", httpStatus: null };
+      for (let i = 0; i < 12 && !logged; i++) {
+        await sleep(750); // TikTok replaces its SSR/public header after hydration.
+        if (this.platform === "tiktok") {
+          pageEvidence = await page.evaluate(tiktokLoginEvidencePage).catch(() => ({
+            state: "unknown" as const,
+            reason: "no-auth-evidence" as const,
+          }));
+          if (pageEvidence.state === "signed-in") {
+            this.acceptSignedInDetection();
+            logged = true;
+          }
+        } else {
+          logged = await this.detectLogin();
+        }
       }
-      const detail = logged
-        ? `Signed in on ${this.platform} — ${describePlan(plan)}. Automatic posting stays off until Start; manual Post is available now.`
-        : `${plan.detail} — installed, but the site still says signed out. An expired cookie, or one from another account?`;
-      this.broadcast({ type: "log", level: logged ? "ok" : "warn", text: `${logged ? "✅" : "⚠️"} ${detail}`, at: Date.now() });
-      this.broadcast({
-        type: "toast",
-        text: logged ? "Signed in with your cookie — press Start when you want the engine to run" : "Cookie set, but the site still shows you signed out",
-        tone: logged ? "ok" : "warn",
-      });
-      return { ok: logged, detail };
-    } catch (e) {
-      const detail = `could not write cookies: ${(e as Error).message}`;
-      this.broadcast({ type: "log", level: "err", text: `⚠️ ${detail}`, at: Date.now() });
-      this.broadcast({ type: "toast", text: "The browser refused the cookie", tone: "warn" });
+
+      // A current account endpoint separates “new markup fooled our selector”
+      // from “TikTok really rejected this session”. It runs once per paste, never
+      // in the ambient detector, and returns no account payload or identifiers.
+      if (this.platform === "tiktok" && !logged && pageEvidence.state !== "challenge") {
+        accountProbe = await page.evaluate(tiktokAccountProbePage).catch(() => ({
+          state: "unknown" as const,
+          httpStatus: null,
+        }));
+        if (accountProbe.state === "signed-in") {
+          this.acceptSignedInDetection();
+          logged = true;
+        }
+      }
+
+      let privateRouteRejected = false;
+      if (this.platform === "tiktok") {
+        try {
+          const finalPath = new URL(page.url()).pathname.toLowerCase();
+          privateRouteRejected = finalPath === "/foryou" || finalPath.startsWith("/login") || finalPath.startsWith("/signup");
+        } catch {
+          /* an in-flight/blank URL stays inconclusive */
+        }
+      }
+      const retained = cookieJarVerdict(await ctx.cookies(), plan, false);
+      console.log(
+        `[${this.platform}] cookie auth check: page=${pageEvidence.state}/${pageEvidence.reason}, ` +
+          `account=${accountProbe.state}/http-${accountProbe.httpStatus ?? "none"}, ` +
+          `private-route=${privateRouteRejected ? "rejected" : "not-rejected"}, ` +
+          `jar=${retained.scoped}/${retained.expected}, session=${retained.sessionPresent ? "present" : "missing"}, ` +
+          `navigation=${navigationSettled ? navigationStatus ?? "no-response" : "unsettled"}`
+      );
+
+      if (logged) {
+        const detail =
+          `Signed in on ${this.platform} — ${describePlan(plan)}. ` +
+          `Authentication on ${this.platform} was confirmed, not inferred from cookie presence. ` +
+          "Automatic posting stays off until Start; manual Post is available now.";
+        this.broadcast({ type: "log", level: "ok", text: `✅ ${detail}`, at: Date.now() });
+        this.broadcast({
+          type: "toast",
+          text: "Signed in with your cookie — press Start when you want the engine to run",
+          tone: "ok",
+        });
+        return { ok: true, detail };
+      }
+
+      let detail: string;
+      let toast: string;
+      if (!retained.sessionPresent) {
+        detail =
+          `${plan.detail} — Chromium verified the write, but ${this.platform} removed ${plan.sessionName} during the account check. ` +
+          "The service rejected this session for this browser identity. Export a fresh session from a currently signed-in web tab, " +
+          "or sign in once in this account's live browser.";
+        toast = "The site removed the session after import — use a fresh export or sign in here";
+      } else if (pageEvidence.state === "challenge" || accountProbe.state === "challenge" || navigationStatus === 403 || navigationStatus === 429) {
+        detail =
+          `${plan.detail} — the browser retained ${retained.scoped}/${retained.expected} cookie scopes, but ${this.platform} requires a ` +
+          "verification or anti-bot check on this Tor/browser identity. Complete that check in the live browser; pasting again will not solve it.";
+        toast = "The cookie is present, but the site needs verification in the live browser";
+      } else if (pageEvidence.state === "signed-out" || accountProbe.state === "signed-out" || privateRouteRejected) {
+        const endpoint = accountProbe.httpStatus ? `; account check HTTP ${accountProbe.httpStatus}` : "";
+        const pageReason = privateRouteRejected ? "private /profile check redirected to a signed-out route" : pageEvidence.reason;
+        detail =
+          `${plan.detail} — Chromium retained ${retained.scoped}/${retained.expected} cookie scopes, but ${this.platform} returned signed-out evidence ` +
+          `(${pageReason}${endpoint}). The session is revoked, expired server-side, or bound to the source browser/network. ` +
+          "Export it again from a currently signed-in web tab, or sign in once in this account's live browser.";
+        toast = "The site rejected this session on the worker — use a fresh export or sign in here";
+      } else {
+        detail =
+          `${plan.detail} — Chromium retained ${retained.scoped}/${retained.expected} cookie scopes, but ${this.platform} returned no authenticated ` +
+          `account evidence (${pageEvidence.reason}; account check HTTP ${accountProbe.httpStatus ?? "unavailable"}). ` +
+          "The cookie was written, but login is not safe to assume. Check the live browser and complete sign-in there if prompted.";
+        toast = "Cookie retained, but login could not be confirmed — check the live browser";
+      }
+      this.broadcast({ type: "log", level: "warn", text: `⚠️ ${detail}`, at: Date.now() });
+      this.broadcast({ type: "toast", text: toast, tone: "warn" });
       return { ok: false, detail };
+    } catch {
+      // Never surface the raw Playwright exception here. addCookies validation
+      // errors can stringify the supplied cookie object, including its value.
+      this.sessionMutation = false;
+      if (jarChanged && !installed) {
+        this.store.setCookie(this.platform, null, [], null);
+        this.broadcastCookieState();
+      }
+      const detail = `${stage} failed; no cookie value was logged. Re-open the live browser and apply the export again.`;
+      console.warn(`[${this.platform}] cookie install stopped at safe stage: ${stage}`);
+      this.broadcast({ type: "log", level: "err", text: `⚠️ Session cookie not applied: ${detail}`, at: Date.now() });
+      this.broadcast({ type: "toast", text: "The browser could not finish installing this session", tone: "warn" });
+      return { ok: false, detail };
+    } finally {
+      this.sessionMutation = false;
     }
   }
 

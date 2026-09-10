@@ -29,7 +29,7 @@ test("a bare sessionid value becomes a usable TikTok session", () => {
   assert.equal(sid.path, "/");
   assert.equal(sid.secure, true);
   assert.equal(sid.httpOnly, true, "TikTok sends sessionid httpOnly; matching it keeps the jar believable");
-  assert.equal(sid.sameSite, "None", "the same-site XHR that decides 'am I logged in' cannot see a Lax cookie");
+  assert.equal(sid.sameSite, "Lax", "an omitted SameSite attribute has Lax semantics in current Chromium");
   assert.ok(sid.expires * 1000 > NOW, "must not be born expired");
 });
 
@@ -38,6 +38,7 @@ test("www.tiktok.com reads the SameSite twin, so it is minted from the same valu
   const twin = byName(plan, "sessionid_ss");
   assert.ok(twin, "sessionid_ss missing");
   assert.equal(twin.value, SECRET);
+  assert.equal(twin.sameSite, "None", "the _ss twin is TikTok's cross-site copy");
 });
 
 test("a pasted twin is never overwritten", () => {
@@ -117,12 +118,13 @@ test("sid_guard carries the real lifetime, and it is honoured", () => {
   assert.match(plan.detail, /sid_guard/);
 });
 
-test("a guard that already lapsed does not install an expired cookie", () => {
+test("a lapsed sid_guard is rejected instead of cosmetically extending a dead session", () => {
   const issued = Math.floor(NOW / 1000) - 400 * DAY;
   const guard = `hash|${issued}-86400-x`;
   const plan = planSessionCookies("tiktok", `sessionid=${SECRET}; sid_guard=${guard}`, NOW);
-  assert.ok(plan.expiresAt > NOW, "would be born expired");
-  assert.ok(plan.expiresAt <= NOW + 31 * DAY * 1000, "should clamp to a short lease, not a year");
+  assert.equal(plan.ok, false);
+  assert.match(plan.detail, /sid_guard says .* expired/);
+  assert.ok(!plan.detail.includes(SECRET), "the rejection must stay secret-safe");
 });
 
 test("the secret never appears in anything the deck shows", () => {
@@ -165,6 +167,81 @@ test("a cookie-editor JSON export is understood, expiry and flags included", () 
   assert.ok(!plan.detail.includes(SECRET), "a JSON paste must not echo the value either");
 });
 
+test("cookie-editor host/path scope is preserved instead of flattened", () => {
+  const future = Math.floor(NOW / 1000) + 15 * DAY;
+  const rows = [
+    { name: "sessionid", value: SECRET, domain: ".tiktok.com", hostOnly: false, path: "/", expirationDate: future },
+    {
+      name: "msToken",
+      value: "scope-specific-token-value",
+      domain: "www.tiktok.com",
+      hostOnly: true,
+      path: "/api/",
+      expirationDate: future + DAY,
+      httpOnly: false,
+      secure: true,
+      sameSite: "lax",
+    },
+    {
+      name: "ttwid",
+      value: "domain-cookie-token-value",
+      domain: "tiktok.com",
+      hostOnly: false,
+      path: "/",
+      expirationDate: future + DAY,
+    },
+  ];
+  const plan = planSessionCookies("tiktok", JSON.stringify(rows), NOW);
+  assert.equal(plan.ok, true, plan.detail);
+  assert.equal(byName(plan, "msToken").domain, "www.tiktok.com", "host-only scope changed");
+  assert.equal(byName(plan, "msToken").path, "/api/", "path scope changed");
+  assert.equal(byName(plan, "msToken").sameSite, "Lax");
+  assert.equal(byName(plan, "ttwid").domain, ".tiktok.com", "hostOnly:false should restore the domain-cookie dot");
+});
+
+test("same-name cookies at different exported scopes are both retained", () => {
+  const future = Math.floor(NOW / 1000) + 10 * DAY;
+  const opaque = '  token-with-leading-and-trailing-space="  ';
+  const rows = [
+    { name: "sessionid", value: SECRET, domain: ".tiktok.com", path: "/", expirationDate: future },
+    { name: "msToken", value: opaque, domain: ".tiktok.com", path: "/", expirationDate: future },
+    { name: "msToken", value: "host-copy-token-value", domain: "www.tiktok.com", hostOnly: true, path: "/api/", expirationDate: future },
+  ];
+  const plan = planSessionCookies("tiktok", JSON.stringify(rows), NOW);
+  assert.equal(plan.ok, true, plan.detail);
+  const copies = plan.cookies.filter((cookie) => cookie.name === "msToken");
+  assert.equal(copies.length, 2);
+  assert.equal(copies[0].value, opaque, "JSON cookie value was normalized instead of preserved");
+  assert.deepEqual(
+    copies.map((cookie) => [cookie.domain, cookie.path]),
+    [[".tiktok.com", "/"], ["www.tiktok.com", "/api/"]]
+  );
+});
+
+test("an explicitly expired primary session is rejected and expired accessories are skipped", () => {
+  const stale = Math.floor(NOW / 1000) - DAY;
+  const fresh = Math.floor(NOW / 1000) + 10 * DAY;
+  const dead = planSessionCookies(
+    "tiktok",
+    JSON.stringify([{ name: "sessionid", value: SECRET, domain: ".tiktok.com", expirationDate: stale }]),
+    NOW
+  );
+  assert.equal(dead.ok, false);
+  assert.match(dead.detail, /sessionid expired/);
+
+  const mixed = planSessionCookies(
+    "tiktok",
+    JSON.stringify([
+      { name: "sessionid", value: SECRET, domain: ".tiktok.com", expirationDate: fresh },
+      { name: "msToken", value: "expired-accessory-value", domain: "www.tiktok.com", expirationDate: stale },
+    ]),
+    NOW
+  );
+  assert.equal(mixed.ok, true, mixed.detail);
+  assert.equal(byName(mixed, "msToken"), undefined);
+  assert.match(mixed.detail, /expired accessory skipped/);
+});
+
 test("a { cookies: [...] } wrapper is understood too", () => {
   const plan = planSessionCookies("tiktok", JSON.stringify({ cookies: [{ name: "sessionid", value: SECRET }] }), NOW);
   assert.equal(plan.ok, true, plan.detail);
@@ -201,13 +278,15 @@ test("cookies.txt from curl or a downloader parses", () => {
   const lines = [
     "# Netscape HTTP Cookie File",
     "# https://curl.se/docs/http-cookies.html",
-    ".tiktok.com\tTRUE\t/\t" + future + "\tsessionid\t" + SECRET,
-    "#HttpOnly_.tiktok.com\tTRUE\t/\t0\tttwid\tabc123def456ghi789",
+    ".tiktok.com\tTRUE\t/\tTRUE\t" + future + "\tsessionid\t" + SECRET,
+    "#HttpOnly_.tiktok.com\tTRUE\t/\tTRUE\t0\tttwid\tabc123def456ghi789",
   ].join("\n");
   const plan = planSessionCookies("tiktok", lines, NOW);
   assert.equal(plan.ok, true, plan.detail);
   assert.match(plan.detail, /cookies\.txt/);
   assert.equal(byName(plan, "sessionid").expires, future);
+  assert.equal(byName(plan, "sessionid").secure, true, "the standard secure column was lost");
+  assert.equal(byName(plan, "sessionid").domain, ".tiktok.com");
   assert.ok(byName(plan, "ttwid").httpOnly, "#HttpOnly_ prefix is a real flag");
 });
 
