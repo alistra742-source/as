@@ -32,10 +32,15 @@ case "${TOR_PROXY_ENABLED:-true}" in
     rm -rf "${TOR_DATA_DIR}"
     install -d -m 0700 -o debian-tor -g debian-tor "${TOR_DATA_DIR}"
     TOR_STARTUP_LOG="${TOR_DATA_DIR}/startup.log"
+    TOR_EMPTY_CONFIG="${TOR_DATA_DIR}/empty-torrc"
     : > "${TOR_STARTUP_LOG}"
-    chown debian-tor:debian-tor "${TOR_STARTUP_LOG}"
+    : > "${TOR_EMPTY_CONFIG}"
+    chown debian-tor:debian-tor "${TOR_STARTUP_LOG}" "${TOR_EMPTY_CONFIG}"
+    chmod 0600 "${TOR_EMPTY_CONFIG}"
     export TOR_STARTUP_LOG
-    tor --defaults-torrc /dev/null -f /dev/null \
+    # Tor 0.4.9 requires a regular config file and rejects /dev/null. Use an
+    # owned empty file so Debian's service defaults cannot add sockets/daemonize.
+    tor --defaults-torrc "${TOR_EMPTY_CONFIG}" -f "${TOR_EMPTY_CONFIG}" \
       --RunAsDaemon 0 \
       --User debian-tor \
       --ClientOnly 1 \
