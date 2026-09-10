@@ -37,6 +37,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xz-utils \
     ca-certificates \
     ffmpeg \
+    tor \
     xvfb \
     libnss3 \
     libnspr4 \
@@ -143,6 +144,9 @@ COPY --from=shim-builder /nice-shim.so /app/nice-shim.so
 ENV STORAGE_DIR=/app/data \
     NODE_ENV=production \
     BROWSER_ENGINE=playwright \
+    TOR_PROXY_ENABLED=true \
+    TOR_SOCKS_HOST=127.0.0.1 \
+    TOR_SOCKS_PORT=9050 \
     STEALTH_HEADLESS=false \
     STEALTH_PLATFORM=linux \
     STEALTH_NICE_SHIM=/app/nice-shim.so \

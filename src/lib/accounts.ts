@@ -39,3 +39,22 @@ export function roomForAccount(
     ? activeRoom
     : saved[accountRoomKey(platform, account.id)] ?? null;
 }
+
+/** Pure local-state half of deletion. Call only after the worker acknowledges
+ * that profile/state/OAuth cleanup succeeded. */
+export function withoutAccount(
+  accounts: Record<Platform, ManagedAccount[]>,
+  accountRooms: Record<string, Room>,
+  platform: Platform,
+  accountId: string
+): { accounts: Record<Platform, ManagedAccount[]>; accountRooms: Record<string, Room> } {
+  const nextRooms = { ...accountRooms };
+  delete nextRooms[accountRoomKey(platform, accountId)];
+  return {
+    accounts: {
+      ...accounts,
+      [platform]: accounts[platform].filter((account) => account.id !== accountId),
+    },
+    accountRooms: nextRooms,
+  };
+}

@@ -8,8 +8,8 @@ const source = fs.readFileSync(new URL("../worker/src/accountScope.ts", import.m
 const js = stripTypeScriptTypes(source, { mode: "strip" })
   .replace(/^import[^;]+;\s*/gm, "")
   .replace(/export /g, "");
-const load = new Function("path", `${js}; return { LEGACY_ACCOUNT_ID, validAccountId, accountScopeKey, accountDataDir, accountProfileDir, parseAccountDir };`);
-const { validAccountId, accountScopeKey, accountDataDir, accountProfileDir, parseAccountDir } = load(path);
+const load = new Function("path", `${js}; return { LEGACY_ACCOUNT_ID, validAccountId, accountScopeKey, accountDataDir, accountProfileDir, accountDeletionPlan, parseAccountDir };`);
+const { validAccountId, accountScopeKey, accountDataDir, accountProfileDir, accountDeletionPlan, parseAccountDir } = load(path);
 
 test("account ids accept generated keys and refuse every path traversal shape", () => {
   assert.equal(validAccountId("acct-mk1_ab2"), "acct-mk1_ab2");
@@ -29,4 +29,18 @@ test("only valid persisted account directory names are discovered", () => {
   assert.deepEqual(parseAccountDir("instagram--acct-abc_1"), { platform: "instagram", accountId: "acct-abc_1" });
   assert.equal(parseAccountDir("../../youtube--oops"), null);
   assert.equal(parseAccountDir("unknown--acct-1"), null);
+});
+
+test("deletion plans are account-contained and never target the legacy data root", () => {
+  const named = accountDeletionPlan("/data", "youtube", "acct-one");
+  assert.equal(named.legacy, false);
+  assert.equal(named.accountDir, path.join("/data", "accounts", "youtube--acct-one"));
+  assert.equal(named.profileDir, path.join(named.accountDir, "profile"));
+
+  const legacy = accountDeletionPlan("/data", "tiktok", "default");
+  assert.equal(legacy.legacy, true);
+  assert.equal(legacy.accountDir, null, "the shared /data root is never an rm target");
+  assert.equal(legacy.profileDir, path.join("/data", "profile-tiktok"));
+  assert.throws(() => accountDeletionPlan("/data", "youtube", "../instagram"), /Invalid account id/);
+  assert.throws(() => accountDeletionPlan("/data", "other", "acct-one"), /Invalid account platform/);
 });

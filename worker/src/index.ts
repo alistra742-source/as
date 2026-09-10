@@ -4,8 +4,15 @@ import fs, { promises as fsp } from "node:fs";
 import path from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 import { env, driverInfo, PLATFORMS, START_URLS, stealth, type PlatformKey } from "./config.js";
-import { accountScopeKey, LEGACY_ACCOUNT_ID, parseAccountDir, validAccountId } from "./accountScope.js";
+import {
+  accountDeletionPlan,
+  accountScopeKey,
+  LEGACY_ACCOUNT_ID,
+  parseAccountDir,
+  validAccountId,
+} from "./accountScope.js";
 import { BLOCKED_HOSTS, resolverRules } from "./browserLaunch.js";
+import { closeAccountTorProxy, torHealth, warmTor } from "./torProxy.js";
 import { PROTOCOL_VERSION, type ClientMsg, type ServerMsg } from "./protocol.js";
 import { Store } from "./store.js";
 import { Rig, browserPreflight } from "./browser.js";
@@ -15,12 +22,17 @@ import {
   beginYouTubeOAuth,
   completeYouTubeOAuth,
   disconnectYouTubeOAuth,
+  purgeYouTubeOAuthAccount,
   youtubeOAuthStatus,
 } from "./youtubeOAuth.js";
 
 // Headed-by-default: make sure a display exists before anything touches the
 // browser (starts Xvfb itself if the entrypoint was bypassed).
 ensureDisplay();
+// Begin Tor bootstrap before Railway's first health probe or any account tries
+// to launch Chromium. The proxy module logs the concrete failure; this catch
+// prevents a rejected readiness promise from becoming an unhandled rejection.
+void warmTor().catch(() => undefined);
 
 /** Built frontend lives in dist/ at the repo root (single-service deploy). */
 const DIST = path.resolve("dist");
@@ -101,10 +113,13 @@ interface AccountRuntime {
   store: Store;
   rig: Rig;
   engine: GrowthEngine;
+  deleting: boolean;
 }
 
 const legacyStore = new Store();
 const runtimes = new Map<string, AccountRuntime>();
+const deletingScopes = new Set<string>();
+const deletionJobs = new Map<string, Promise<void>>();
 
 function safeAccountName(raw: string | null | undefined, fallback: string): string {
   return (raw || "")
@@ -116,8 +131,10 @@ function safeAccountName(raw: string | null | undefined, fallback: string): stri
 
 function accountRuntime(platform: PlatformKey, accountId: string, requestedName?: string): AccountRuntime {
   const key = accountScopeKey(platform, accountId);
+  if (deletingScopes.has(key)) throw new Error("This account is being deleted");
   const existing = runtimes.get(key);
   if (existing) {
+    if (existing.deleting) throw new Error("This account is being deleted");
     if (requestedName) existing.rig.setAccountName(safeAccountName(requestedName, existing.rig.accountName));
     return existing;
   }
@@ -126,7 +143,7 @@ function accountRuntime(platform: PlatformKey, accountId: string, requestedName?
   const name = safeAccountName(requestedName || rememberedName, accountId === LEGACY_ACCOUNT_ID ? "Existing account" : "Account");
   const rig = new Rig(platform, store, accountId, name);
   const engine = new GrowthEngine(platform, store, rig);
-  const runtime = { platform, accountId, store, rig, engine };
+  const runtime = { platform, accountId, store, rig, engine, deleting: false };
   runtimes.set(key, runtime);
   engine.resumeFromBoot();
   return runtime;
@@ -146,6 +163,73 @@ try {
   }
 } catch {
   /* no named accounts yet */
+}
+
+class AccountBusyError extends Error {}
+
+function closeAccountSockets(runtime: AccountRuntime) {
+  const clients = [...runtime.rig.clients];
+  runtime.rig.clients.clear();
+  for (const client of clients) {
+    try {
+      (client as { __ws?: WebSocket }).__ws?.close(1001, "Account deleted");
+    } catch {
+      /* an already-closed socket cannot block deletion */
+    }
+  }
+}
+
+/** Stop runtime ownership first, then delete only the validated account scope. */
+async function performAccountDeletion(platform: PlatformKey, accountId: string): Promise<void> {
+  const key = accountScopeKey(platform, accountId);
+  const plan = accountDeletionPlan(env.dataDir, platform, accountId);
+  const runtime = runtimes.get(key);
+
+  // Stop future automatic work immediately. A publish already in flight is not
+  // safe to tear out from under Chromium, so report 409 and require one retry
+  // after it finishes rather than deleting files while they are still in use.
+  runtime?.engine.stop();
+  if (runtime?.engine.isBusy()) {
+    throw new AccountBusyError("That account is finishing a publish. Its engine was stopped; retry Delete when the publish finishes.");
+  }
+
+  deletingScopes.add(key);
+  try {
+    if (runtime) {
+      runtime.deleting = true;
+      closeAccountSockets(runtime);
+      await runtime.rig.destroy();
+      runtimes.delete(key);
+    }
+    closeAccountTorProxy(platform, accountId);
+
+    if (platform === "youtube") await purgeYouTubeOAuthAccount(accountId);
+    if (plan.legacy) {
+      // Never rm(env.dataDir): default runtimes share that root. Reset one slice
+      // and remove only `/data/profile-<platform>`.
+      legacyStore.resetPlatform(platform);
+      await fsp.rm(plan.profileDir, { recursive: true, force: true });
+    } else {
+      await fsp.rm(plan.accountDir as string, { recursive: true, force: true });
+    }
+  } finally {
+    if (runtime && runtimes.get(key) === runtime) runtime.deleting = false;
+    deletingScopes.delete(key);
+  }
+}
+
+function deleteAccount(platform: PlatformKey, accountId: string): Promise<void> {
+  const key = accountScopeKey(platform, accountId);
+  const existing = deletionJobs.get(key);
+  if (existing) return existing;
+  const job = performAccountDeletion(platform, accountId);
+  deletionJobs.set(key, job);
+  void job
+    .finally(() => {
+      if (deletionJobs.get(key) === job) deletionJobs.delete(key);
+    })
+    .catch(() => undefined);
+  return job;
 }
 
 function sendJson(res: http.ServerResponse, status: number, body: unknown) {
@@ -220,7 +304,40 @@ body{margin:0;min-height:100vh;display:grid;place-items:center;background:#090b1
 async function routeHttp(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const url = new URL(req.url ?? "/", "http://localhost");
   if (url.pathname === "/health") {
-    sendJson(res, 200, { ok: true, platforms: PLATFORMS, uptime: process.uptime() });
+    const tor = torHealth();
+    if (tor.enabled && tor.state === "failed") void warmTor().catch(() => undefined);
+    const ready = !tor.enabled || tor.state === "ready";
+    sendJson(res, ready ? 200 : 503, { ok: ready, platforms: PLATFORMS, uptime: process.uptime(), tor });
+    return;
+  }
+
+  if (url.pathname === "/api/accounts/delete") {
+    if (req.method !== "POST") {
+      sendJson(res, 405, { error: "Method not allowed" });
+      return;
+    }
+    if (!authorizedHttp(req)) {
+      sendJson(res, 401, { error: "Bad worker token" });
+      return;
+    }
+    try {
+      const body = await readJson(req);
+      const rawPlatform = typeof body.platform === "string" ? body.platform : "";
+      const platform = PLATFORMS.includes(rawPlatform as PlatformKey) ? (rawPlatform as PlatformKey) : null;
+      const accountId = validAccountId(typeof body.accountId === "string" ? body.accountId : "");
+      if (!platform || !accountId) throw new Error("Invalid account scope");
+      await deleteAccount(platform, accountId);
+      sendJson(res, 200, { ok: true, deleted: { platform, accountId } });
+    } catch (error) {
+      if (error instanceof AccountBusyError) {
+        sendJson(res, 409, { error: error.message });
+      } else if ((error as Error).message === "Invalid account scope") {
+        sendJson(res, 400, { error: "Invalid account scope" });
+      } else {
+        console.error(`[account-delete] failed: ${(error as Error).message || String(error)}`);
+        sendJson(res, 500, { error: "The worker could not safely remove that account's stored data. Nothing was removed from the deck." });
+      }
+    }
     return;
   }
 
@@ -352,7 +469,13 @@ wss.on("connection", (ws, req) => {
       }
       authed = true;
       clearTimeout(authTimer);
-      runtime = accountRuntime(platform, accountId, accountName);
+      try {
+        runtime = accountRuntime(platform, accountId, accountName);
+      } catch (error) {
+        send(ws, { type: "error", message: (error as Error).message || "Account runtime unavailable" });
+        ws.close(1011, "Account runtime unavailable");
+        return;
+      }
       const { rig, engine } = runtime;
       const client = {
         __ws: ws,
@@ -387,7 +510,7 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    if (!runtime) {
+    if (!runtime || runtime.deleting) {
       ws.close(1011, "Account runtime unavailable");
       return;
     }
@@ -471,6 +594,7 @@ wss.on("connection", (ws, req) => {
     // 700 MB Chromium trees alive. Armed/busy accounts stay up; reopening a tile
     // restores the same persistent profile and therefore the same login.
     const hibernate = setTimeout(() => {
+      if (runtime?.deleting || runtimes.get(accountScopeKey(platform, accountId)) !== runtime) return;
       if (rig.clients.size || engine.snapshot().running || engine.isBusy()) return;
       void rig.close().then(() =>
         console.log(`[${platform}/${rig.accountName}] idle browser hibernated; persistent login kept`)
@@ -490,6 +614,11 @@ server.listen(env.port, "0.0.0.0", () => {
   (pre.ok ? console.log : console.error)(`[viraldeck-worker] browser: ${pre.detail}`);
   console.log(
     `[viraldeck-worker] mode: ${stealth.headless ? "headless" : `headed (DISPLAY=${process.env.DISPLAY || "unset!"})`}, profiles in ${env.dataDir}, frame every ${Math.max(400, env.frameIntervalMs)} ms`
+  );
+  console.log(
+    env.tor.enabled
+      ? `[viraldeck-worker] network: Tor required, per-account SOCKS-auth isolation, fail-closed egress checks (${env.tor.socksHost}:${env.tor.socksPort})`
+      : "[viraldeck-worker] network: WARNING — Tor explicitly disabled; browser egress is direct"
   );
   // Printed from driverInfo() — the same object the deck badges — so the deploy
   // log and the UI can never disagree about which browser is actually in use.

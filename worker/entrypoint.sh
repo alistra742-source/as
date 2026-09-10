@@ -9,6 +9,41 @@
 set -e
 cd /app
 
+TOR_PID=""
+XVFB_PID=""
+cleanup() {
+  [ -z "${TOR_PID}" ] || kill "${TOR_PID}" 2>/dev/null || true
+  [ -z "${XVFB_PID}" ] || kill "${XVFB_PID}" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+# One Tor daemon serves SOCKS5 on loopback. Chromium never talks to that port
+# directly: the worker gives every platform/account its own local HTTP CONNECT
+# bridge and supplies a different SOCKS credential pair. IsolateSOCKSAuth makes
+# those pairs hard circuit boundaries. If Tor is unavailable, the worker's
+# egress preflight and every browser launch fail closed.
+case "${TOR_PROXY_ENABLED:-true}" in
+  0|false|FALSE|off|OFF)
+    echo "[viraldeck] WARNING: Tor disabled explicitly; browser traffic will be direct"
+    ;;
+  *)
+    TOR_PORT="${TOR_SOCKS_PORT:-9050}"
+    TOR_DATA_DIR="${TOR_DATA_DIR:-/tmp/viraldeck-tor}"
+    rm -rf "${TOR_DATA_DIR}"
+    install -d -m 0700 -o debian-tor -g debian-tor "${TOR_DATA_DIR}"
+    tor --defaults-torrc /dev/null -f /dev/null \
+      --User debian-tor \
+      --ClientOnly 1 \
+      --AvoidDiskWrites 1 \
+      --SafeSocks 1 \
+      --DataDirectory "${TOR_DATA_DIR}" \
+      --SocksPort "127.0.0.1:${TOR_PORT} IsolateSOCKSAuth" \
+      --Log "notice stdout" &
+    TOR_PID=$!
+    echo "[viraldeck] Tor starting on 127.0.0.1:${TOR_PORT} (per-account IsolateSOCKSAuth; PID ${TOR_PID})"
+    ;;
+esac
+
 if [ "${STEALTH_HEADLESS:-false}" = "true" ]; then
   echo "[viraldeck] stealth headless mode (no Xvfb)"
 else
@@ -20,7 +55,6 @@ else
 
   Xvfb ":${DISPLAY_NUM}" -screen 0 "${SCREEN}" -nolisten tcp >/dev/null 2>&1 &
   XVFB_PID=$!
-  trap 'kill "${XVFB_PID}" 2>/dev/null || true' EXIT
 
   export DISPLAY=":${DISPLAY_NUM}"
   echo "[viraldeck] headed Chromium (${BROWSER_ENGINE:-playwright}) on Xvfb ${DISPLAY} (${SCREEN})"

@@ -11,6 +11,7 @@ import { checkUploadAccess } from "./uploads.js";
 import { asHumanPage, humanTap, humanType, jitter, readingPause, sleep, thinkingPause } from "./human.js";
 import { describePlan, planSessionCookies } from "./sessionCookie.js";
 import { tiktokSignedInPage } from "./tiktokLogin.js";
+import { accountTorProxy } from "./torProxy.js";
 import { ensureHumanized, humanizeContext, isHumanized } from "./humanizeAttach.js";
 import {
   CONTAINER_VIEWPORT_RATIO,
@@ -61,6 +62,10 @@ function launchArgs(profile: string): string[] {
     // No GPU process on Xvfb (llvmpipe is CPU anyway): saves ~80-120 MB and one
     // more process that can be killed. Software compositing stays.
     "--disable-gpu",
+    // Tor carries TCP through the account proxy. Do not let QUIC or WebRTC open
+    // a direct UDP side channel around that fixed proxy.
+    "--disable-quic",
+    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
     // V8's heap ceiling per renderer — see `v8HeapMb()`. Too low and a heavy page
     // aborts its own renderer; too high and the kernel does it more quietly.
     `--js-flags=--max-old-space-size=${v8HeapMb()}`,
@@ -355,6 +360,9 @@ export class Rig {
   private recovering = false;
   /** True only for an intentional hibernate/close; suppresses the crash alarm. */
   private closing = false;
+  /** Account deletion is terminal for this Rig object. Unlike hibernation it
+   * must reject queued work and can never relaunch the removed profile. */
+  private destroyed = false;
   /** A reconnect that lands during hibernation waits for the old profile owner
    * to exit before launching another Chromium against the same disk profile. */
   private closeInFlight: Promise<void> | null = null;
@@ -419,9 +427,11 @@ export class Rig {
   }
 
   async ensureContext(): Promise<BrowserContext> {
+    if (this.destroyed) throw new Error("This account runtime was deleted");
     // Never overlap an intentional close with a relaunch of the same persistent
     // directory: Chromium's singleton lock is an identity boundary, not a retry.
     if (this.closeInFlight) await this.closeInFlight;
+    if (this.destroyed) throw new Error("This account runtime was deleted");
     if (this.context) return this.context;
     if (this.launching) return this.launching;
     this.launching = this.launchContext().finally(() => {
@@ -445,7 +455,7 @@ export class Rig {
    * the engine choice is a launch decision and nothing else. Switching to this
    * engine does not log anything out: the persistent profile is identical.
    */
-  private async launchStockChromium(profile: string, t0: number): Promise<BrowserContext> {
+  private async launchStockChromium(profile: string, t0: number, proxyServer?: string): Promise<BrowserContext> {
     const { width, height } = dockSize();
     try {
       this.context = await launchPlaywrightContext({
@@ -456,6 +466,7 @@ export class Rig {
         width,
         height,
         logFile: path.join(profile, CHROME_LOG),
+        proxyServer,
       });
       await installStealthLite(this.context);
       this.control = null;
@@ -546,6 +557,21 @@ export class Rig {
     }
     this.clearStaleLocks(profile);
     this.lastFatal = null;
+
+    // Resolve and verify the account's Tor bridge BEFORE creating Chromium. If
+    // Tor is down this throws, leaving no browser process that could silently use
+    // the worker host's public IP.
+    this.status("Verifying this account's isolated Tor circuit…");
+    const tor = await accountTorProxy(this.platform, this.accountId);
+    if (tor) {
+      this.status(`Tor circuit verified for this account (egress ${tor.egressIp}).`);
+    } else {
+      const warning = "Tor proxying is explicitly disabled by TOR_PROXY_ENABLED=false; browser traffic is direct.";
+      console.warn(`[${this.platform}/${this.accountName}] ${warning}`);
+      this.status(warning);
+    }
+    if (this.destroyed) throw new Error("This account runtime was deleted during browser startup");
+
     const engine = browserEngine();
     if (engine === "playwright") {
       this.status(`Launching stock Chromium through Playwright (${stealth.headless ? "headless" : "headed on Xvfb"})…`);
@@ -558,7 +584,7 @@ export class Rig {
     }
     const t0 = Date.now();
     if (engine === "playwright") {
-      return this.launchStockChromium(profile, t0);
+      return this.launchStockChromium(profile, t0, tor?.server);
     }
     try {
       this.context = await launchPersistentContext(profile, {
@@ -572,7 +598,16 @@ export class Rig {
         ...(stealth.headless ? { viewport: { width: 1280, height: 900 } } : {}),
         locale: "en-US",
         timezoneId: stealth.timezone,
-        args: launchArgs(profile),
+        args: [
+          ...launchArgs(profile),
+          ...(tor
+            ? [`--proxy-server=${tor.server}`, "--proxy-bypass-list=<-loopback>"]
+            : []),
+        ],
+        // Keep BrowserContext.request (used to retrieve source media) on the
+        // same account bridge too; the explicit Chromium arg above is the
+        // fail-closed belt, this context option is the API-request braces.
+        ...(tor ? { proxy: { server: tor.server, bypass: "" } } : {}),
         // One coherent, seed-stable machine identity per isolated account.
         fingerprint: stealth.seed(this.identitySeed()),
         platform: stealth.platform,
@@ -704,7 +739,7 @@ export class Rig {
    * queued meanwhile wait on `recovering` rather than failing.
    */
   private async recoverFromCrash(dead: Page, url: string) {
-    if (this.recovering) return;
+    if (this.destroyed || this.recovering) return;
     this.recovering = true;
     this.shotSession = null;
     if (this.control === dead) this.control = null;
@@ -732,6 +767,7 @@ export class Rig {
       } else if (this.crashes >= 3) {
         await sleep(4000);
       }
+      if (this.destroyed) return;
       const page = await ctx.newPage();
       await ensureHumanized(page, this.humanizeOpts());
       this.wireControlPage(page);
@@ -775,6 +811,7 @@ export class Rig {
    * the error to THIS socket and retries the launch (nothing else would).
    */
   async openControlSession(): Promise<Page> {
+    if (this.destroyed) throw new Error("This account runtime was deleted");
     if (this.control && !this.control.isClosed()) {
       this.startLoops();
       void this.pushFrame(); // don't make a reconnecting deck wait a full interval
@@ -784,6 +821,7 @@ export class Rig {
       this.broadcast({ type: "error", message: `Browser start failed: ${this.lastFatal} — retrying…` });
     }
     const ctx = await this.ensureContext();
+    if (this.destroyed) throw new Error("This account runtime was deleted during browser startup");
     if (this.control && !this.control.isClosed()) return this.control; // raced with a parallel connect
     // Reuse the page Chromium opens with the profile instead of adding a
     // second one: a persistent context always starts with one (about:blank)
@@ -834,6 +872,7 @@ export class Rig {
     // open a fresh tab at the same URL instead of failing every command with
     // "Target crashed" until someone restarts the service.
     page.on("crash", () => {
+      if (this.destroyed) return;
       const url = this.lastUrl || START_URLS[this.platform];
       const mem = memoryReport();
       const quoted = chromeLogTail(this.profileDir());
@@ -863,7 +902,7 @@ export class Rig {
    */
   async waitForRecovery(maxMs = 25_000): Promise<boolean> {
     const t0 = Date.now();
-    while (Date.now() - t0 < maxMs) {
+    while (!this.destroyed && Date.now() - t0 < maxMs) {
       if (!this.recovering && this.control && !this.control.isClosed()) return true;
       await sleep(400);
     }
@@ -877,6 +916,7 @@ export class Rig {
   }
 
   async newEnginePage(): Promise<Page> {
+    if (this.destroyed) throw new Error("This account runtime was deleted");
     const ctx = await this.ensureContext();
     const page = await ctx.newPage();
     await ensureHumanized(page, this.humanizeOpts());
@@ -1042,6 +1082,7 @@ export class Rig {
   /** Best-effort "am I signed in" detection. Engines pause until this is true. */
   async detectLogin(): Promise<boolean> {
     const page = this.control;
+    if (this.destroyed) return false;
     if (!page || page.isClosed() || this.detectBusy) return this.store.rig(this.platform).loggedIn;
     // A publish navigating the visible tab to /upload is not evidence about the
     // session. Hold the last answer until the tab is ours again.
@@ -1084,6 +1125,7 @@ export class Rig {
           );
         });
       }
+      if (this.destroyed) return false;
       const rig = this.store.rig(this.platform);
       const prev = rig.loggedIn;
       if (logged) {
@@ -1147,6 +1189,7 @@ export class Rig {
    * studio and hit Post is both the reassurance and the debugging tool.
    */
   async withVisibleTab<T>(fn: (page: Page) => Promise<T>): Promise<{ ran: boolean; value?: T }> {
+    if (this.destroyed) return { ran: false };
     const page = this.control;
     if (!page || page.isClosed() || this.driving || this.recovering) return { ran: false };
     this.driving = true;
@@ -1201,6 +1244,7 @@ export class Rig {
           sameSite: c.sameSite,
         }))
       );
+      if (this.destroyed) throw new Error("This account runtime was deleted");
       this.store.setCookie(this.platform, Date.now(), plan.names, plan.expiresAt);
       this.broadcastCookieState();
       this.broadcast({ type: "log", level: "info", text: `Session cookie installed — ${plan.detail}`, at: Date.now() });
@@ -1250,6 +1294,7 @@ export class Rig {
     }
     try {
       await this.context.clearCookies();
+      if (this.destroyed) throw new Error("This account runtime was deleted");
       this.store.setCookie(this.platform, null, [], null);
       this.broadcastCookieState();
       if (this.control && !this.control.isClosed()) {
@@ -1273,6 +1318,7 @@ export class Rig {
    * drag-scrolling stays fluid without breaking the one-at-a-time guarantee.
    */
   exec(cmd: RemoteCmd): Promise<void> {
+    if (this.destroyed) return Promise.reject(new Error("This account runtime was deleted"));
     const last = this.cmdQueue[this.cmdQueue.length - 1];
     if (cmd.t === "scroll" && last && last.cmd.t === "scroll") {
       last.cmd.dy += cmd.dy; // merge into the queued scroll
@@ -1517,6 +1563,21 @@ export class Rig {
         await page.keyboard.press(cmd.key);
         return;
     }
+  }
+
+  /** Terminal close used by account deletion, not idle hibernation. */
+  async destroy(): Promise<void> {
+    if (this.destroyed) {
+      await this.close();
+      return;
+    }
+    this.destroyed = true;
+    const error = new Error("This account runtime was deleted");
+    for (const item of this.cmdQueue.splice(0)) item.reject(error);
+    await this.close();
+    // A command that was already holding the serialized input lock is forced to
+    // fail by context.close(). Join it so no continuation can outlive disk rm.
+    await this.inputTail.catch(() => undefined);
   }
 
   async close(): Promise<void> {

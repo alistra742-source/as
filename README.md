@@ -11,7 +11,9 @@ the engine keep the account growing on your rules:
   only posts clips that clear its quality bar.
 - Niches it cycles: **faceless stories · scary stories · fun facts**.
 - Every platform opens to an **account switchboard**. Press **+**, name the account, then open its
-  tile; each tile has its own persistent browser profile, login, engine, composer, posts and log.
+  tile; each tile has its own persistent browser profile, login, engine, composer, posts, log, and
+  Tor SOCKS-auth circuit identity. **Delete** closes that runtime and removes only that account's
+  profile/state (plus its YouTube OAuth credential, when present) after explicit confirmation.
 - Every source is quality-inspected before upload. The worker prefers 1080p media and adaptively
   builds a 1080p CRF-16 master for soft, low-resolution or dark footage (exposure/color recovery,
   mild denoise, Lanczos scaling and sharpening) across TikTok, Instagram and YouTube.
@@ -44,6 +46,22 @@ On top of the input model, the schedule itself is human-shaped, in either engine
 - **Idle drift** — between deck commands the logged-in session does small ambient cursor motions
   and the occasional micro-scroll, so the account never looks parked.
 
+### Account-isolated Tor, fail closed
+
+The Docker image starts one Tor daemon with `IsolateSOCKSAuth`. Chromium's SOCKS5 implementation
+cannot safely carry username/password credentials, so the worker does **not** put credentials in a
+`--proxy-server=socks5://…` URL. Instead, every `{platform, account id}` receives a different
+loopback HTTP CONNECT bridge. That bridge sends only SOCKS5 username/password auth upstream, with a
+stable pair unique to that account; Tor therefore cannot place two accounts' streams on one
+circuit. Destination hostnames are sent to Tor as SOCKS domain names, and QUIC/non-proxied WebRTC
+UDP are disabled.
+
+Before the service becomes healthy, and again before each account's first Chromium launch, the
+worker checks `check.torproject.org/api/ip` through the relevant bridge and requires `IsTor: true`.
+A dead/unverified proxy aborts browser launch with no direct-network retry. Separate circuits may
+still select the same Tor exit relay by chance; isolation means circuits are not shared, not a
+promise that every account always displays a different public IP.
+
 ### What "loads faster" actually means here
 
 - **Resolver-level tracker blocking** — analytics/ad/consent hosts map to `0.0.0.0`, so no
@@ -57,8 +75,8 @@ On top of the input model, the schedule itself is human-shaped, in either engine
 - **The deck's own assets are `immutable`** — hashed files under `/assets/` were being refetched
   (~317 KB) on every reload because the worker served everything `no-cache`.
 
-Everything is env-configurable — see `worker/env.example` (`BROWSER_ENGINE`, `BLOCK_TRACKERS`,
-`CHROME_PATH`, `STEALTH_*`, `CLEARCOTE_*`). The live dock shows a **⚡ Chromium · human** (or
+Everything is env-configurable — see `worker/env.example` (`BROWSER_ENGINE`, `TOR_*`,
+`BLOCK_TRACKERS`, `CHROME_PATH`, `STEALTH_*`, `CLEARCOTE_*`). The live dock shows a **⚡ Chromium · human** (or
 **🛡 Clearcote · human**) badge whose tooltip is the exact driver config the worker reported on
 `ready`, so what you see is what the container is actually running.
 
@@ -74,7 +92,7 @@ Everything is env-configurable — see `worker/env.example` (`BROWSER_ENGINE`, `
 │      reviews, hourly engine + metrics, login profiles                     │
 │  · Browser: Playwright + stock Chromium (default) or the Clearcote build   │
 │      (BROWSER_ENGINE) — raw CDP, humanized trusted input, one isolated     │
-│      persistent profile per named account                                   │
+│      persistent profile + fail-closed Tor bridge per named account         │
 └──────────────────────────────────────────────────────────────┬─────────────┘
                                                                │ Railway volume
                                                                ▼
@@ -114,7 +132,8 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
    **Playwright installs its Chromium** into `/opt/playwright`, and that is the browser the
    service runs. The Clearcote build is no longer fetched by default (it costs ~150 MB and a
    GitHub round trip): pass `--build-arg WITH_CLEARCOTE=true` to bake it in, then set
-   `BROWSER_ENGINE=clearcote`. Either way the browser runs **headed under Xvfb**
+   `BROWSER_ENGINE=clearcote`. The image also installs/starts Tor and does not pass its healthcheck
+   until Tor egress is confirmed. Either browser runs **headed under Xvfb**
    (`STEALTH_HEADLESS=false` in the image — headed avoids headless-mode tells, and the dock's
    geometry assumes a real window).
 2. Add a **volume** mounted at `/app/data` (keeps your logins + state across restarts).
@@ -125,15 +144,19 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
    `GOOGLE_REDIRECT_URL` is also accepted), and
    `GOOGLE_SCOPES=https://www.googleapis.com/auth/youtube.upload` (`SCOPES` is accepted too).
    Never paste the client secret into the deck or chat. Optional: `GROQ_MODEL`,
-   `GOOGLE_TOKEN_ENCRYPTION_KEY`, `BROWSER_ENGINE` / `BLOCK_TRACKERS` / `CHROME_PATH`, and the
-   stealth knobs in `worker/env.example` (`STEALTH_PLATFORM`, `STEALTH_HEADLESS`,
+   `GOOGLE_TOKEN_ENCRYPTION_KEY`, `BROWSER_ENGINE` / `BLOCK_TRACKERS` / `CHROME_PATH`, the `TOR_*`
+   startup knobs, and the stealth knobs in `worker/env.example` (`STEALTH_PLATFORM`, `STEALTH_HEADLESS`,
    `STEALTH_CADENCE_JITTER_MIN`, …).
 4. Open a platform, press **+**, name the account, then click its tile. That creates a fresh,
    isolated persistent browser profile and streams the *real* platform in its dock. Click, drag
    to scroll, tap **Keyboard** to type with your phone's keyboard, log in, then hit **Start**.
    **All accounts** returns to the switchboard; another **+** creates another clean profile.
-   Idle, closed account browsers hibernate after 30 seconds to save RAM, but their cookie/storage
-   profile remains on the mounted volume and reopens still signed in. Armed engines remain live.
+   **Delete** requires a destructive confirmation, stops/evicts the selected runtime and sockets,
+   then removes only that account's browser profile, cookies, engine/history state and account-bound
+   YouTube OAuth token. The legacy compatibility tile resets only its selected platform and never
+   recursively removes the shared storage root. Idle, closed account browsers hibernate after 30
+   seconds to save RAM, but their cookie/storage profile remains on the mounted volume and reopens
+   still signed in. Armed engines remain live.
    In a YouTube account, **Connect Google** starts the signed one-time OAuth flow; do not reuse a
    hand-built authorization URL because it has no account-bound CSRF state. While the consent
    screen is in Google’s **Testing** mode, test-user refresh grants may expire after seven days and
@@ -414,14 +437,13 @@ nothing silently breaks.
 
 - Automating logins/posting can violate TikTok/Instagram/YouTube terms and may get accounts
   flagged. This tool keeps **your** login in **your** browser profile — no passwords are stored
-  in code. The stealth stack masks automation fingerprints and behaves like a human at the
-  input level, but it cannot change **where your traffic comes from**: a datacenter IP is still
-  the strongest signal platforms have. For real accounts, run the worker on a connection with
-  a residential-grade IP (or put a SOCKS5 proxy in front of it — Clearcote keeps the persona
-  coherent with the proxy region via `geoip`, and `webrtcIp` matches the egress IP). If a
-  platform challenges the session anyway, do the verification manually in the dock; the worker
-  waits for the signed-in state. A named YouTube account with **Connect Google** uses the official
-  Data API instead; without that grant, its isolated YouTube Studio browser remains the fallback.
+  in code. Browser TCP traffic uses account-isolated Tor circuits, but a Tor exit is not a
+  residential IP and many platforms challenge or block Tor exits. Chromium over Tor is also **not
+  Tor Browser**: this design provides account circuit separation and fail-closed routing, not Tor
+  Browser's anonymity/fingerprint guarantees. If a platform challenges the session, do the
+  verification manually in the dock; the worker waits for the signed-in state. A named YouTube
+  account with **Connect Google** uses the official Data API instead; without that grant, its
+  isolated YouTube Studio browser remains the fallback.
 - Humanized input is deliberately slower than raw automation (a 200-char caption types over
   30–60 s, uploads take minutes) — that's the point. Engine-typed captions include the
   occasional auto-corrected typo; keystrokes you type from the deck do not.

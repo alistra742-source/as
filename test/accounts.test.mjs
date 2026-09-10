@@ -7,8 +7,8 @@ const source = fs.readFileSync(new URL("../src/lib/accounts.ts", import.meta.url
 const js = stripTypeScriptTypes(source, { mode: "strip" })
   .replace(/^import[^;]+;\s*/gm, "")
   .replace(/export /g, "");
-const load = new Function(`${js}; return { accountRoomKey, cleanAccountName, accountNameTaken, roomAuthenticated, roomForAccount };`);
-const { accountRoomKey, cleanAccountName, accountNameTaken, roomAuthenticated, roomForAccount } = load();
+const load = new Function(`${js}; return { accountRoomKey, cleanAccountName, accountNameTaken, roomAuthenticated, roomForAccount, withoutAccount };`);
+const { accountRoomKey, cleanAccountName, accountNameTaken, roomAuthenticated, roomForAccount, withoutAccount } = load();
 
 test("account labels are display-only, compact, and control-character free", () => {
   assert.equal(cleanAccountName("  donut\n\t account  "), "donut account");
@@ -43,4 +43,23 @@ test("an open account room wins over its saved menu snapshot", () => {
   const old = { platform: "tiktok", marker: "saved" };
   assert.equal(roomForAccount("tiktok", account, "acct-1", open, { "tiktok:acct-1": old }).marker, "open");
   assert.equal(roomForAccount("tiktok", account, null, open, { "tiktok:acct-1": old }).marker, "saved");
+});
+
+test("acknowledged deletion removes only the selected platform account and room", () => {
+  const one = { id: "same", name: "TikTok", platform: "tiktok" };
+  const two = { id: "keep", name: "Keep", platform: "tiktok" };
+  const youtube = { id: "same", name: "YouTube", platform: "youtube" };
+  const accounts = { tiktok: [one, two], instagram: [], youtube: [youtube] };
+  const rooms = {
+    "tiktok:same": { platform: "tiktok", marker: "delete" },
+    "tiktok:keep": { platform: "tiktok", marker: "keep" },
+    "youtube:same": { platform: "youtube", marker: "other-platform" },
+  };
+  const next = withoutAccount(accounts, rooms, "tiktok", "same");
+  assert.deepEqual(next.accounts.tiktok.map((account) => account.id), ["keep"]);
+  assert.deepEqual(next.accounts.youtube.map((account) => account.id), ["same"]);
+  assert.equal(next.accountRooms["tiktok:same"], undefined);
+  assert.equal(next.accountRooms["tiktok:keep"].marker, "keep");
+  assert.equal(next.accountRooms["youtube:same"].marker, "other-platform");
+  assert.equal(accounts.tiktok.length, 2, "the reducer does not mutate persisted input");
 });

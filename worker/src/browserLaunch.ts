@@ -128,6 +128,10 @@ export function playwrightArgs(opts: { width: number; height: number; v8HeapMb: 
     // Headless/container hygiene: none of this is observable by a page, all of it
     // is a request or a process that a real desktop browser makes and we do not.
     "--disable-background-networking",
+    // Fixed HTTP proxying covers TCP. These close Chromium's two common UDP
+    // side channels so WebRTC/QUIC cannot reveal the worker's host address.
+    "--disable-quic",
+    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
     "--disable-component-update",
     "--disable-default-apps",
     "--disable-extensions",
@@ -187,6 +191,9 @@ export interface PlaywrightLaunchOpts {
   width: number;
   height: number;
   logFile?: string;
+  /** Account-local HTTP CONNECT bridge. Its upstream is Tor; Chromium never
+   * receives SOCKS credentials and has no direct fallback route. */
+  proxyServer?: string;
 }
 
 /** A missing binary is a deploy problem, so it gets a deploy-grade message. */
@@ -236,12 +243,14 @@ export async function launchPlaywrightContext(o: PlaywrightLaunchOpts): Promise<
     diet,
   });
   if (o.logFile) args.push("--enable-logging=file", `--log-file=${o.logFile}`, "--log-level=0");
+  if (o.proxyServer) args.push("--proxy-bypass-list=<-loopback>");
 
   const base = {
     headless: o.headless,
     locale: o.locale,
     timezoneId: o.timezoneId,
     args,
+    ...(o.proxyServer ? { proxy: { server: o.proxyServer, bypass: "" } } : {}),
     // A service worker would answer requests behind our back and make the first
     // load on a fresh profile slower, not faster.
     serviceWorkers: "block" as const,

@@ -10,6 +10,10 @@ const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke";
 const TOKEN_FILE = "youtube-oauth.enc.json";
 const PENDING_MAX_AGE_MS = 15 * 60_000;
+/** Incremented by destructive account deletion. A callback that already claimed
+ * its one-time marker may finish its network request, but can never write a new
+ * credential after that generation changes. */
+const accountGenerations = new Map<string, number>();
 
 interface OAuthConfig {
   clientId: string;
@@ -126,7 +130,6 @@ function accountName(value: string): string {
 
 function tokenPath(accountId: string): string {
   const dir = accountDataDir(env.dataDir, "youtube", requireAccountId(accountId));
-  fs.mkdirSync(dir, { recursive: true });
   return path.join(dir, TOKEN_FILE);
 }
 
@@ -187,6 +190,7 @@ function readToken(accountId: string): StoredToken | null {
 
 function writeToken(accountId: string, token: StoredToken, config: OAuthConfig) {
   const file = tokenPath(accountId);
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const temp = `${file}.${process.pid}.${crypto.randomBytes(5).toString("hex")}.tmp`;
   fs.writeFileSync(temp, JSON.stringify(encryptToken(accountId, token, config)), { mode: 0o600 });
   fs.renameSync(temp, file);
@@ -362,6 +366,7 @@ export async function completeYouTubeOAuth(code: string, state: string): Promise
   if (!code || code.length > 4096) throw new Error("Google did not return a usable authorization code.");
   if (!state || state.length > 4096) throw new Error("Google did not return a usable authorization state.");
   const payload = decodeAndVerifyState(state, config);
+  const generation = accountGenerations.get(payload.accountId) || 0;
   const marker = pendingPath(state);
   const claimedMarker = `${marker}.${process.pid}.${crypto.randomBytes(5).toString("hex")}.claim`;
   let pending: { accountId?: unknown; nonce?: unknown; expiresAt?: unknown };
@@ -415,6 +420,9 @@ export async function completeYouTubeOAuth(code: string, state: string): Promise
     tokenType: compact(response.token_type, 40) || "Bearer",
     connectedAt: Date.now(),
   };
+  if ((accountGenerations.get(payload.accountId) || 0) !== generation) {
+    throw new Error("This YouTube account was deleted while Google authorization was completing. No credential was saved.");
+  }
   writeToken(payload.accountId, token, config);
   return { accountId: payload.accountId, accountName: payload.accountName };
 }
@@ -628,5 +636,35 @@ export async function disconnectYouTubeOAuth(rawAccountId: string): Promise<void
       }).catch(() => undefined);
     }
   }
+  fs.rmSync(tokenPath(accountId), { force: true });
+}
+
+/**
+ * Destructive account cleanup: invalidate callbacks already in flight, remove
+ * every unclaimed/claimed consent marker for this account, revoke the current
+ * grant best-effort, then remove its encrypted token. Nothing here can select a
+ * different account directory because requireAccountId + tokenPath are the same
+ * filesystem boundary used for normal OAuth reads.
+ */
+export async function purgeYouTubeOAuthAccount(rawAccountId: string): Promise<void> {
+  const accountId = requireAccountId(rawAccountId);
+  accountGenerations.set(accountId, (accountGenerations.get(accountId) || 0) + 1);
+  try {
+    for (const entry of fs.readdirSync(pendingDir(), { withFileTypes: true })) {
+      if (!entry.isFile() || !/^[a-f0-9]{64}\.json(?:\.\d+\.[a-f0-9]{10}\.claim)?$/.test(entry.name)) continue;
+      const file = path.join(pendingDir(), entry.name);
+      try {
+        const marker = JSON.parse(fs.readFileSync(file, "utf8")) as { accountId?: unknown };
+        if (marker.accountId === accountId) fs.rmSync(file, { force: true });
+      } catch {
+        /* malformed/stale markers are handled by normal pending cleanup */
+      }
+    }
+  } catch {
+    /* no authorization has ever been started */
+  }
+  await disconnectYouTubeOAuth(accountId);
+  // A callback that had already claimed its marker is generation-gated above;
+  // remove once more after revoke in case an older build raced a write.
   fs.rmSync(tokenPath(accountId), { force: true });
 }

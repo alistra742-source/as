@@ -15,7 +15,7 @@ import type {
 import { PLATFORMS, START_URL, type BrowserSession } from "../lib/types";
 import type { EngineSnapshot } from "../lib/protocol";
 import { uid } from "../lib/format";
-import { accountNameTaken, accountRoomKey, cleanAccountName } from "../lib/accounts";
+import { accountNameTaken, accountRoomKey, cleanAccountName, withoutAccount } from "../lib/accounts";
 import { disconnectLive, isLiveConnected, sendBusRaw } from "../lib/liveBus";
 import { DEMO_CANDIDATES } from "../data/demo";
 import {
@@ -151,6 +151,7 @@ interface DeckState {
   accountRooms: Record<string, Room>;
   activeAccountIds: Record<Platform, string | null>;
   createAccount: (p: Platform, name: string) => { ok: boolean; error?: string; id?: string };
+  deleteAccount: (p: Platform, accountId: string) => Promise<{ ok: boolean; error?: string }>;
   selectAccount: (p: Platform, accountId: string) => boolean;
   leaveAccount: (p: Platform) => void;
   // ---- session / browser ----
@@ -208,6 +209,64 @@ export const useDeck = create<DeckState>()(
           accountRooms: { ...s.accountRooms, [accountRoomKey(p, id)]: room },
         }));
         return { ok: true, id };
+      },
+
+      deleteAccount: async (p, accountId) => {
+        const before = get();
+        const account = before.accounts[p].find((item) => item.id === accountId);
+        if (!account) return { ok: false, error: "That account no longer exists in this deck." };
+        const key = accountRoomKey(p, accountId);
+        const room = before.activeAccountIds[p] === accountId ? before.rooms[p] : before.accountRooms[key];
+        const token = room?.live.token || "public";
+        try {
+          const response = await fetch("/api/accounts/delete", {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${token}`,
+              "content-type": "application/json",
+              accept: "application/json",
+            },
+            body: JSON.stringify({ platform: p, accountId }),
+          });
+          const text = await response.text();
+          let result: { ok?: unknown; deleted?: { platform?: unknown; accountId?: unknown }; error?: unknown } = {};
+          try {
+            result = JSON.parse(text) as typeof result;
+          } catch {
+            return { ok: false, error: `The worker returned an unreadable deletion response (HTTP ${response.status}).` };
+          }
+          if (!response.ok) {
+            const message = typeof result.error === "string" ? result.error : `Worker answered HTTP ${response.status}.`;
+            return {
+              ok: false,
+              error:
+                response.status === 401
+                  ? "The worker token is missing or wrong. Open this account, save the correct Worker token, then try Delete again."
+                  : message,
+            };
+          }
+          if (result.ok !== true || result.deleted?.platform !== p || result.deleted?.accountId !== accountId) {
+            return { ok: false, error: "The worker did not confirm the exact account that was deleted." };
+          }
+
+          // Only a scope-matching server acknowledgement is allowed to erase the
+          // menu tile and its local composer/history snapshot.
+          disconnectLive(p, accountId);
+          set((s) => {
+            const records = withoutAccount(s.accounts, s.accountRooms, p, accountId);
+            const wasActive = s.activeAccountIds[p] === accountId;
+            return {
+              ...records,
+              ...(wasActive ? { rooms: { ...s.rooms, [p]: defaultRoom(p) } } : {}),
+              activeAccountIds: wasActive
+                ? { ...s.activeAccountIds, [p]: null }
+                : s.activeAccountIds,
+            };
+          });
+          return { ok: true };
+        } catch (error) {
+          return { ok: false, error: (error as Error).message || "Could not reach the worker to delete this account." };
+        }
       },
 
       selectAccount: (p, accountId) => {

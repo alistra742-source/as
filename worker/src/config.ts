@@ -10,6 +10,14 @@ export const env = {
   /** Directory for persistent profiles (login cookies) + state. Mount a Railway volume here. */
   dataDir: path.resolve(process.env.STORAGE_DIR || "./data"),
   frameIntervalMs: Number(process.env.FRAME_INTERVAL_MS || 1200),
+  tor: {
+    /** Docker enables this by default. An explicit false is a local-development
+     * escape hatch and is logged loudly; enabled mode always fails closed. */
+    enabled: !/^(?:0|false|off)$/i.test(process.env.TOR_PROXY_ENABLED || "true"),
+    socksHost: process.env.TOR_SOCKS_HOST || "127.0.0.1",
+    socksPort: Math.max(1, Math.min(65_535, Number(process.env.TOR_SOCKS_PORT || 9050) || 9050)),
+    bootstrapTimeoutMs: Math.max(5_000, Number(process.env.TOR_BOOTSTRAP_TIMEOUT_MS || 90_000) || 90_000),
+  },
 } as const;
 
 /**

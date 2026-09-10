@@ -28,6 +28,42 @@ export function accountProfileDir(root: string, platform: PlatformKey, accountId
     : path.join(accountDataDir(root, platform, accountId), "profile");
 }
 
+export interface AccountDeletionPlan {
+  /** Named accounts are removed as one directory. Null for the legacy account,
+   * whose shared data root must never be recursively removed. */
+  accountDir: string | null;
+  profileDir: string;
+  legacy: boolean;
+}
+
+/**
+ * Compute the only paths account deletion may touch. This repeats the containment
+ * check at the destructive boundary instead of trusting a caller's TypeScript
+ * type or a string assembled in an HTTP handler.
+ */
+export function accountDeletionPlan(root: string, platform: PlatformKey, rawAccountId: string): AccountDeletionPlan {
+  if (!/^(?:tiktok|instagram|youtube)$/.test(platform)) throw new Error("Invalid account platform");
+  const accountId = validAccountId(rawAccountId);
+  if (!accountId) throw new Error("Invalid account id");
+  const dataRoot = path.resolve(root);
+  const profileDir = path.resolve(accountProfileDir(dataRoot, platform, accountId));
+  if (accountId === LEGACY_ACCOUNT_ID) {
+    // `/data/state.json` is shared by three compatibility runtimes. The caller
+    // resets only this platform's records and removes only profile-<platform>.
+    if (profileDir === dataRoot || !profileDir.startsWith(dataRoot + path.sep)) throw new Error("Unsafe legacy profile path");
+    return { accountDir: null, profileDir, legacy: true };
+  }
+  const accountsRoot = path.resolve(dataRoot, "accounts");
+  const accountDir = path.resolve(accountDataDir(dataRoot, platform, accountId));
+  if (accountDir === accountsRoot || !accountDir.startsWith(accountsRoot + path.sep)) {
+    throw new Error("Unsafe account deletion path");
+  }
+  if (profileDir === accountDir || !profileDir.startsWith(accountDir + path.sep)) {
+    throw new Error("Unsafe account profile path");
+  }
+  return { accountDir, profileDir, legacy: false };
+}
+
 /** Parse a persisted account directory without ever accepting path syntax. */
 export function parseAccountDir(name: string): { platform: PlatformKey; accountId: string } | null {
   const match = /^(tiktok|instagram|youtube)--([a-z0-9][a-z0-9_-]{0,63})$/i.exec(name);

@@ -130,6 +130,32 @@ export class Store {
     }, 250);
   }
 
+  /**
+   * Legacy compatibility accounts share `/data/state.json`, so deletion must
+   * clear exactly one platform instead of recursively deleting the data root.
+   * Persist synchronously/atomically: the HTTP API must not acknowledge deletion
+   * while an old debounced save can still put the account back.
+   */
+  resetPlatform(p: PlatformKey) {
+    this.data.rigs[p] = blankRig();
+    this.data.posts[p] = [];
+    this.data.engines[p] = freshEngine();
+    if (this.saveTimer) clearTimeout(this.saveTimer);
+    this.saveTimer = null;
+    const temp = `${this.file}.${process.pid}.${Date.now()}.delete.tmp`;
+    try {
+      fs.writeFileSync(temp, JSON.stringify(this.data, null, 2), { mode: 0o600 });
+      fs.renameSync(temp, this.file);
+    } catch (error) {
+      try {
+        fs.rmSync(temp, { force: true });
+      } catch {
+        /* preserve the original persistence error */
+      }
+      throw error;
+    }
+  }
+
   rig(p: PlatformKey): RigRec {
     return this.data.rigs[p];
   }
