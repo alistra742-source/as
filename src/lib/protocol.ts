@@ -47,7 +47,7 @@ export type RemoteCmd =
 export const PROTOCOL_VERSION = 11;
 
 export type ClientMsg =
-  | { type: "auth"; token: string; proto?: number }
+  | { type: "auth"; token: string; proto: number }
   | { type: "cmd"; seq: number; cmd: RemoteCmd }
   | { type: "engine"; action: "start" | "stop" }
   | { type: "engine-config"; topic: string; thresholdViews?: number; likesFloor?: number }

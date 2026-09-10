@@ -467,6 +467,17 @@ wss.on("connection", (ws, req) => {
         ws.close();
         return;
       }
+      if (msg.proto !== PROTOCOL_VERSION) {
+        const deckVersion = typeof msg.proto === "number" ? msg.proto : 0;
+        const message =
+          deckVersion < PROTOCOL_VERSION
+            ? `This deck tab is outdated (protocol v${deckVersion || "unknown"}; worker v${PROTOCOL_VERSION}). Hard-refresh the page before publishing.`
+            : `This worker is outdated (deck protocol v${deckVersion}; worker v${PROTOCOL_VERSION}). Redeploy the service before publishing.`;
+        console.warn(`[worker] ${message}`);
+        send(ws, { type: "error", message });
+        ws.close(1002, "Protocol mismatch — reload or redeploy");
+        return;
+      }
       authed = true;
       clearTimeout(authTimer);
       try {
@@ -489,15 +500,6 @@ wss.on("connection", (ws, req) => {
         driver: driverInfo(),
         proto: PROTOCOL_VERSION,
       });
-      // A deck newer than this worker presses buttons whose commands land in the
-      // `default:` branch of execInner and error out. Say it up front instead.
-      if (msg.type === "auth" && msg.proto && msg.proto !== PROTOCOL_VERSION) {
-        console.warn(`[worker] deck speaks protocol v${msg.proto}, this worker is v${PROTOCOL_VERSION} — redeploy the worker service`);
-        send(ws, {
-          type: "error",
-          message: `Deck protocol v${msg.proto} vs worker v${PROTOCOL_VERSION}: this worker is out of date — redeploy the service.`,
-        });
-      }
       send(ws, { type: "engine", state: engine.snapshot() });
       // The cookie panel must not lie after a reload: say what this profile holds.
       send(ws, { type: "cookie-state", ...rig.cookieState() });
