@@ -611,7 +611,9 @@ export class Rig {
     // Tor is down this throws, leaving no browser process that could silently use
     // the worker host's public IP.
     this.status("Verifying this account's isolated Tor circuit…");
-    const tor = await accountTorProxy(this.platform, this.accountId);
+    const tor = await accountTorProxy(this.platform, this.accountId, (reason) => {
+      this.status(`Tor preflight is rotating a slow circuit and retrying (${reason}).`);
+    });
     if (tor) {
       this.status(`Tor circuit verified for this account (egress ${tor.egressIp}).`);
     } else {

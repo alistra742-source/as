@@ -28,9 +28,15 @@ case "${TOR_PROXY_ENABLED:-true}" in
     ;;
   *)
     TOR_PORT="${TOR_SOCKS_PORT:-9050}"
-    TOR_DATA_DIR="${TOR_DATA_DIR:-/tmp/viraldeck-tor}"
-    rm -rf "${TOR_DATA_DIR}"
+    # Keep Tor's cached consensus/state on the service volume. Wiping a fresh
+    # /tmp DataDirectory on every deploy made cold bootstrap depend on every
+    # directory authority being responsive at that instant. This directory is
+    # shared by the one Tor daemon only; account circuits remain separated by
+    # IsolateSOCKSAuth below.
+    DATA_ROOT="${STORAGE_DIR:-/app/data}"
+    TOR_DATA_DIR="${TOR_DATA_DIR:-${DATA_ROOT}/tor-client}"
     install -d -m 0700 -o debian-tor -g debian-tor "${TOR_DATA_DIR}"
+    chown debian-tor:debian-tor "${TOR_DATA_DIR}"
     TOR_STARTUP_LOG="${TOR_DATA_DIR}/startup.log"
     TOR_EMPTY_CONFIG="${TOR_DATA_DIR}/empty-torrc"
     : > "${TOR_STARTUP_LOG}"
@@ -44,7 +50,7 @@ case "${TOR_PROXY_ENABLED:-true}" in
       --RunAsDaemon 0 \
       --User debian-tor \
       --ClientOnly 1 \
-      --AvoidDiskWrites 1 \
+      --AvoidDiskWrites 0 \
       --SafeSocks 1 \
       --DataDirectory "${TOR_DATA_DIR}" \
       --SocksPort "127.0.0.1:${TOR_PORT} IsolateSOCKSAuth" \

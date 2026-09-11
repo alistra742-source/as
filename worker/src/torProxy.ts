@@ -38,6 +38,9 @@ interface BridgeEndpoint extends AccountTorProxy {
   scope: string;
   serverHandle: net.Server;
   sockets: Set<net.Socket>;
+  /** Mutable only before browser launch, so a failed Tor circuit can be replaced. */
+  credentials: IsolationCredentials;
+  circuitGeneration: number;
   verifiedAt: number;
   lastError: string;
 }
@@ -49,10 +52,29 @@ let health: TorHealth = env.tor.enabled
   ? { enabled: true, state: "checking", error: null }
   : { enabled: false, state: "disabled", error: null };
 
-const CHECK_HOST = "check.torproject.org";
-const CHECK_PATH = "/api/ip";
+interface EgressCheck {
+  host: string;
+  path: string;
+  kind: "tor-project" | "json-ip" | "cloudflare-trace";
+}
+
+const OFFICIAL_CHECK: EgressCheck = {
+  host: "check.torproject.org",
+  path: "/api/ip",
+  kind: "tor-project",
+};
+// check.torproject.org is an attestation service, not part of Tor transport. It
+// can be slow or rate-limit a busy exit while Tor itself is healthy. These are
+// connectivity witnesses only: every byte still travels through this module's
+// authenticated SOCKS stream to the locally started Tor daemon; there is no
+// direct-network implementation to fall back to.
+const CONNECTIVITY_CHECKS: EgressCheck[] = [
+  { host: "api.ipify.org", path: "/?format=json", kind: "json-ip" },
+  { host: "www.cloudflare.com", path: "/cdn-cgi/trace", kind: "cloudflare-trace" },
+];
 const VERIFY_MAX_AGE_MS = 5 * 60_000;
 const SOCKET_TIMEOUT_MS = 30_000;
+const EGRESS_PROBE_TIMEOUT_MS = 12_000;
 
 function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -179,11 +201,19 @@ function torStartupDetail(): string {
 }
 
 /** Open one DNS-safe Tor stream. Only username/password auth is offered. */
-export async function openTorStream(host: string, port: number, credentials: IsolationCredentials): Promise<net.Socket> {
+export async function openTorStream(
+  host: string,
+  port: number,
+  credentials: IsolationCredentials,
+  signal?: AbortSignal
+): Promise<net.Socket> {
   if (!host || Buffer.byteLength(host, "utf8") > 255 || !Number.isInteger(port) || port < 1 || port > 65_535) {
     throw new Error("invalid proxy destination");
   }
+  if (signal?.aborted) throw new Error("Tor stream cancelled");
   const socket = net.createConnection({ host: env.tor.socksHost, port: env.tor.socksPort });
+  const onAbort = () => socket.destroy(new Error("Tor stream cancelled"));
+  signal?.addEventListener("abort", onAbort, { once: true });
   socket.setNoDelay(true);
   socket.setTimeout(SOCKET_TIMEOUT_MS, () => socket.destroy(new Error("Tor SOCKS connection timed out")));
   try {
@@ -229,6 +259,8 @@ export async function openTorStream(host: string, port: number, credentials: Iso
       throw new Error(`${message}${torStartupDetail()}`);
     }
     throw error;
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
   }
 }
 
@@ -264,8 +296,13 @@ async function handleProxyClient(
 ) {
   client.setTimeout(SOCKET_TIMEOUT_MS, () => client.destroy());
   sockets.add(client);
-  client.once("close", () => sockets.delete(client));
+  const abort = new AbortController();
   let upstream: net.Socket | null = null;
+  client.once("close", () => {
+    sockets.delete(client);
+    abort.abort();
+    upstream?.destroy();
+  });
   try {
     const incoming = await readUntil(client, Buffer.from("\r\n\r\n"), 64 * 1024);
     const headerText = incoming.value.toString("latin1");
@@ -278,7 +315,8 @@ async function handleProxyClient(
 
     if (method.toUpperCase() === "CONNECT") {
       const target = parseProxyAuthority(requestTarget, 443);
-      upstream = await openTorStream(target.host, target.port, credentials);
+      upstream = await openTorStream(target.host, target.port, credentials, abort.signal);
+      if (client.destroyed) throw new Error("proxy client closed before Tor connected");
       sockets.add(upstream);
       upstream.once("close", () => sockets.delete(upstream as net.Socket));
       client.write("HTTP/1.1 200 Connection Established\r\nProxy-Agent: ViralDeck-Tor\r\n\r\n");
@@ -289,7 +327,8 @@ async function handleProxyClient(
       const target = new URL(requestTarget);
       if (target.protocol !== "http:" || target.username || target.password) throw new Error("unsupported proxy request");
       const port = target.port ? Number(target.port) : 80;
-      upstream = await openTorStream(target.hostname, port, credentials);
+      upstream = await openTorStream(target.hostname, port, credentials, abort.signal);
+      if (client.destroyed) throw new Error("proxy client closed before Tor connected");
       sockets.add(upstream);
       upstream.once("close", () => sockets.delete(upstream as net.Socket));
       const origin = `${target.pathname || "/"}${target.search}`;
@@ -313,11 +352,11 @@ async function handleProxyClient(
 }
 
 async function createBridge(scope: string): Promise<BridgeEndpoint> {
-  const credentials = torIsolationCredentials(scope);
+  const initialCredentials = torIsolationCredentials(scope);
   const sockets = new Set<net.Socket>();
   let endpoint: BridgeEndpoint | null = null;
   const serverHandle = net.createServer((client) =>
-    void handleProxyClient(client, credentials, sockets, (message) => {
+    void handleProxyClient(client, endpoint?.credentials ?? initialCredentials, sockets, (message) => {
       if (endpoint) endpoint.lastError = message;
     })
   );
@@ -342,6 +381,8 @@ async function createBridge(scope: string): Promise<BridgeEndpoint> {
     isolated: true,
     serverHandle,
     sockets,
+    credentials: initialCredentials,
+    circuitGeneration: 0,
     verifiedAt: 0,
     lastError: "",
   };
@@ -354,11 +395,30 @@ function closeEndpoint(endpoint: BridgeEndpoint) {
   endpoint.sockets.clear();
 }
 
-async function readTlsResponse(socket: tls.TLSSocket): Promise<string> {
+/**
+ * Same account boundary, fresh SOCKS authentication tuple. Tor's
+ * IsolateSOCKSAuth treats it as a new circuit identity. This runs only after a
+ * preflight failed and before Chromium receives the bridge, so an active account
+ * can never jump exits mid-session.
+ */
+function rotateEndpointCircuit(endpoint: BridgeEndpoint): void {
+  for (const socket of endpoint.sockets) socket.destroy();
+  endpoint.sockets.clear();
+  endpoint.circuitGeneration += 1;
+  const nonce = crypto.randomBytes(12).toString("base64url");
+  endpoint.credentials = torIsolationCredentials(
+    `${endpoint.scope}\0retry-${endpoint.circuitGeneration}\0${nonce}`
+  );
+  endpoint.egressIp = "";
+  endpoint.verifiedAt = 0;
+  endpoint.lastError = "";
+}
+
+async function readTlsResponse(socket: tls.TLSSocket, timeoutMs = SOCKET_TIMEOUT_MS): Promise<string> {
   return await new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let total = 0;
-    const timer = setTimeout(() => finish(new Error("Tor egress check timed out")), SOCKET_TIMEOUT_MS);
+    const timer = setTimeout(() => finish(new Error("Tor egress check timed out")), timeoutMs);
     const finish = (error?: Error) => {
       clearTimeout(timer);
       socket.off("data", onData);
@@ -381,45 +441,156 @@ async function readTlsResponse(socket: tls.TLSSocket): Promise<string> {
   });
 }
 
-/** Prove this exact account listener exits through Tor before launching Chrome. */
-async function verifyEndpoint(endpoint: BridgeEndpoint): Promise<string> {
+class NonTorEgressError extends Error {}
+
+function safeProbeError(error: unknown): string {
+  return ((error as Error)?.message || String(error) || "egress check failed")
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 240);
+}
+
+/** Exported so response parsing and the explicit non-Tor fail-closed case are testable. */
+export function parseEgressResponse(
+  kind: EgressCheck["kind"],
+  raw: string
+): { ip: string; torConfirmed: boolean } {
+  if (!/^HTTP\/1\.[01] 200\b/.test(raw)) throw new Error("egress witness returned a non-200 response");
+  if (kind === "tor-project") {
+    if (/"IsTor"\s*:\s*false/i.test(raw)) {
+      // This is qualitatively different from an outage. A reachable official
+      // checker explicitly saying “not Tor” may never be rescued by a fallback.
+      throw new NonTorEgressError("Tor Project reported non-Tor egress; direct-IP fallback remains blocked");
+    }
+    if (!/"IsTor"\s*:\s*true/i.test(raw)) throw new Error("Tor Project response did not contain an egress verdict");
+    const candidate = /"IP"\s*:\s*"([^"\\]{3,64})"/i.exec(raw)?.[1] || "";
+    return { ip: net.isIP(candidate) ? candidate : "Tor-confirmed", torConfirmed: true };
+  }
+
+  const candidate =
+    kind === "json-ip"
+      ? /"ip"\s*:\s*"([^"\\]{3,64})"/i.exec(raw)?.[1] || ""
+      : /^ip=([^\r\n]{3,64})$/im.exec(raw)?.[1]?.trim() || "";
+  if (!net.isIP(candidate)) throw new Error("egress witness did not return a valid IP address");
+  return { ip: candidate, torConfirmed: false };
+}
+
+/** One HTTPS GET through the exact local account bridge, with one total deadline. */
+async function requestThroughEndpoint(
+  endpoint: BridgeEndpoint,
+  check: EgressCheck,
+  timeoutMs: number
+): Promise<string> {
   endpoint.lastError = "";
+  const deadline = Date.now() + timeoutMs;
+  const remaining = (label: string): number => {
+    const left = deadline - Date.now();
+    if (left <= 0) throw new Error(`${label} timed out`);
+    return left;
+  };
   const proxy = new URL(endpoint.server);
   const socket = net.createConnection({ host: proxy.hostname, port: Number(proxy.port) });
+  let secure: tls.TLSSocket | null = null;
   try {
-    await connectSocket(socket);
-    socket.write(`CONNECT ${CHECK_HOST}:443 HTTP/1.1\r\nHost: ${CHECK_HOST}:443\r\nConnection: keep-alive\r\n\r\n`);
-    const response = await readUntil(socket, Buffer.from("\r\n\r\n"), 32 * 1024);
+    await connectSocket(socket, remaining("account bridge connection"));
+    socket.write(
+      `CONNECT ${check.host}:443 HTTP/1.1\r\n` +
+        `Host: ${check.host}:443\r\n` +
+        "Connection: keep-alive\r\n\r\n"
+    );
+    const response = await readUntil(
+      socket,
+      Buffer.from("\r\n\r\n"),
+      32 * 1024,
+      remaining("Tor CONNECT")
+    );
     const firstLine = response.value.toString("latin1").split("\r\n", 1)[0];
     if (!/^HTTP\/1\.[01] 200\b/.test(firstLine)) {
-      throw new Error(endpoint.lastError || "account bridge could not reach Tor");
+      throw new Error(endpoint.lastError || "account bridge could not establish a Tor stream");
     }
     if (response.rest.length) socket.unshift(response.rest);
-    const secure = tls.connect({ socket, servername: CHECK_HOST, ALPNProtocols: ["http/1.1"] });
+    secure = tls.connect({ socket, servername: check.host, ALPNProtocols: ["http/1.1"] });
     await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("Tor TLS check timed out")), SOCKET_TIMEOUT_MS);
-      secure.once("secureConnect", () => {
+      const finish = (error?: Error) => {
         clearTimeout(timer);
-        resolve();
-      });
-      secure.once("error", (error) => {
-        clearTimeout(timer);
-        reject(error);
-      });
+        secure?.off("secureConnect", onConnect);
+        secure?.off("error", onError);
+        if (error) reject(error);
+        else resolve();
+      };
+      const onConnect = () => finish();
+      const onError = (error: Error) => finish(error);
+      const timer = setTimeout(() => finish(new Error("Tor TLS check timed out")), remaining("Tor TLS check"));
+      secure?.once("secureConnect", onConnect);
+      secure?.once("error", onError);
     });
-    secure.write(`GET ${CHECK_PATH} HTTP/1.1\r\nHost: ${CHECK_HOST}\r\nAccept: application/json\r\nConnection: close\r\n\r\n`);
-    const raw = await readTlsResponse(secure);
-    if (!/^HTTP\/1\.[01] 200\b/.test(raw) || !/"IsTor"\s*:\s*true/i.test(raw)) {
-      throw new Error("Tor Project did not confirm this account's egress");
-    }
-    const ip = /"IP"\s*:\s*"([^"\\]{3,64})"/i.exec(raw)?.[1] || "Tor-confirmed";
-    endpoint.egressIp = ip;
-    endpoint.verifiedAt = Date.now();
-    return ip;
+    secure.write(
+      `GET ${check.path} HTTP/1.1\r\n` +
+        `Host: ${check.host}\r\n` +
+        "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131 Safari/537.36\r\n" +
+        "Accept: application/json,text/plain,*/*\r\n" +
+        "Accept-Encoding: identity\r\n" +
+        "Connection: close\r\n\r\n"
+    );
+    return await readTlsResponse(secure, remaining("Tor egress response"));
   } catch (error) {
+    secure?.destroy();
     socket.destroy();
     throw error;
   }
+}
+
+/**
+ * Prove the exact listener can carry authenticated Tor traffic before Chromium
+ * receives it. Prefer Tor Project's explicit attestation. If that independent
+ * website is unavailable, two alternate IP witnesses are tried concurrently;
+ * they are reached only via `openTorStream`, whose sole upstream is the local
+ * authenticated Tor SOCKS port. There is deliberately no direct request path.
+ */
+async function verifyEndpoint(endpoint: BridgeEndpoint, timeoutMs = EGRESS_PROBE_TIMEOUT_MS * 2): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  let officialError = "official Tor check unavailable";
+  try {
+    const raw = await requestThroughEndpoint(
+      endpoint,
+      OFFICIAL_CHECK,
+      Math.max(1_000, Math.min(EGRESS_PROBE_TIMEOUT_MS, deadline - Date.now()))
+    );
+    const verdict = parseEgressResponse(OFFICIAL_CHECK.kind, raw);
+    endpoint.egressIp = verdict.ip;
+    endpoint.verifiedAt = Date.now();
+    return verdict.ip;
+  } catch (error) {
+    if (error instanceof NonTorEgressError) throw error;
+    officialError = safeProbeError(error);
+  }
+
+  const left = deadline - Date.now();
+  if (left < 1_000) throw new Error(`official Tor check failed: ${officialError}`);
+  const fallbackBudget = Math.max(1_000, Math.min(EGRESS_PROBE_TIMEOUT_MS, left));
+  const attempts = await Promise.allSettled(
+    CONNECTIVITY_CHECKS.map(async (check) => {
+      const raw = await requestThroughEndpoint(endpoint, check, fallbackBudget);
+      return parseEgressResponse(check.kind, raw);
+    })
+  );
+  const winner = attempts.find(
+    (attempt): attempt is PromiseFulfilledResult<{ ip: string; torConfirmed: boolean }> => attempt.status === "fulfilled"
+  );
+  if (winner) {
+    endpoint.egressIp = winner.value.ip;
+    endpoint.verifiedAt = Date.now();
+    return winner.value.ip;
+  }
+  const alternateErrors = attempts
+    .map((attempt) => attempt.status === "rejected" ? safeProbeError(attempt.reason) : "")
+    .filter(Boolean)
+    .join("; ")
+    .slice(0, 500);
+  throw new Error(
+    `official Tor check failed: ${officialError}; alternate Tor-stream checks failed: ${alternateErrors || "no response"}`
+  );
 }
 
 async function verifyWithRetry(
@@ -431,16 +602,23 @@ async function verifyWithRetry(
   let last = "Tor is not ready";
   do {
     try {
-      await verifyEndpoint(endpoint);
+      const left = Math.max(1_000, deadline - Date.now());
+      await verifyEndpoint(endpoint, Math.min(EGRESS_PROBE_TIMEOUT_MS * 2, left));
       return;
     } catch (error) {
-      last = (error as Error).message || last;
+      last = safeProbeError(error) || last;
+      if (error instanceof NonTorEgressError || Date.now() >= deadline) break;
       onAttemptError?.(last);
-      if (Date.now() >= deadline) break;
-      await wait(1_000);
+      // Reusing the same SOCKS auth tuple can keep Tor on the same failed exit.
+      // Rotate only during preflight; once verified, the browser keeps one tuple.
+      rotateEndpointCircuit(endpoint);
+      await wait(Math.min(1_000, Math.max(0, deadline - Date.now())));
     }
   } while (Date.now() < deadline);
-  throw new Error(`Tor egress could not be verified (${last}). Browser launch was blocked to prevent direct-IP fallback.`);
+  throw new Error(
+    `Tor egress could not be verified (${last}${torStartupDetail()}). ` +
+      "Browser launch was blocked to prevent direct-IP fallback."
+  );
 }
 
 /** Start deployment readiness. Health stays non-ready until Tor egress is proven. */
@@ -474,14 +652,28 @@ export function torHealth(): TorHealth {
 }
 
 /** Account-specific loopback endpoint. Enabled mode never returns a direct path. */
-export async function accountTorProxy(platform: PlatformKey, accountId: string): Promise<AccountTorProxy | null> {
+export async function accountTorProxy(
+  platform: PlatformKey,
+  accountId: string,
+  onRetry?: (safeReason: string) => void
+): Promise<AccountTorProxy | null> {
   if (!env.tor.enabled) return null;
   await warmTor();
   const scope = accountScopeKey(platform, accountId);
   const existing = endpoints.get(scope);
   if (existing) {
-    if (Date.now() - existing.verifiedAt > VERIFY_MAX_AGE_MS) await verifyEndpoint(existing);
-    return { server: existing.server, egressIp: existing.egressIp, isolated: true };
+    try {
+      if (Date.now() - existing.verifiedAt > VERIFY_MAX_AGE_MS) {
+        await verifyWithRetry(existing, Math.min(env.tor.bootstrapTimeoutMs, 45_000), onRetry);
+      }
+      return { server: existing.server, egressIp: existing.egressIp, isolated: true };
+    } catch (error) {
+      // Do not leave an unverified listener cached. Retry Browser start will build
+      // a clean listener, while this attempt still fails closed.
+      endpoints.delete(scope);
+      closeEndpoint(existing);
+      throw error;
+    }
   }
   const pending = starting.get(scope);
   if (pending) {
@@ -491,7 +683,7 @@ export async function accountTorProxy(platform: PlatformKey, accountId: string):
   const task = (async () => {
     const endpoint = await createBridge(scope);
     try {
-      await verifyWithRetry(endpoint, Math.min(env.tor.bootstrapTimeoutMs, 45_000));
+      await verifyWithRetry(endpoint, Math.min(env.tor.bootstrapTimeoutMs, 45_000), onRetry);
       endpoints.set(scope, endpoint);
       return endpoint;
     } catch (error) {
