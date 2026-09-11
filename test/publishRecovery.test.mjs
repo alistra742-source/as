@@ -55,7 +55,10 @@ test("whole-browser loss relaunches immediately and retries the downloaded uploa
 
 test("session mutation and upload capability controls are locked during engine/publish work", () => {
   const cookiePanel = panels.slice(panels.indexOf("export function SessionCookiePanel"));
-  assert.match(cookiePanel, /disabled=\{!value\.trim\(\) \|\| running \|\| publishing\}/);
-  assert.match(cookiePanel, /disabled=\{!installed \|\| !live\.connected \|\| running \|\| publishing\}/);
-  assert.match(cookiePanel, /disabled=\{!live\.connected \|\| !loggedIn \|\| running \|\| publishing\}/);
+  assert.match(cookiePanel, /disabled=\{!value\.trim\(\) \|\| running \|\| publishing \|\| busy !== null\}/);
+  assert.match(cookiePanel, /disabled=\{!installed \|\| !live\.connected \|\| running \|\| publishing \|\| busy !== null\}/);
+  assert.match(cookiePanel, /disabled=\{!live\.connected \|\| !loggedIn \|\| running \|\| publishing \|\| busy !== null\}/);
+  assert.match(cookiePanel, /loading=\{busy === "check"\}/);
+  assert.match(cookiePanel, /if \(busy\) return;[\s\S]*sendBusCmd\(p, accountId, \{ t: "check-upload" \}\)/);
+  assert.match(cookiePanel, /setBusy\("check"\)/);
 });

@@ -572,12 +572,13 @@ export function SessionCookiePanel({ room }: { room: Room }) {
   const live = room.live;
   const addLog = useDeck((s) => s.addLog);
   const [value, setValue] = useState("");
-  const [busy, setBusy] = useState<"apply" | "clear" | null>(null);
+  const [busy, setBusy] = useState<"apply" | "clear" | "check" | null>(null);
   const hint = COOKIE_FIELD[p];
   const loggedIn = room.session?.state === "logged-in";
   const installed = !!live.cookieAt;
   const running = room.engine.running;
   const publishing = room.composer.busy;
+  const latestLogText = room.log[room.log.length - 1]?.text ?? "";
 
   // The worker answers with cookie-state once the jar is written (and on every
   // connect), so that is the only honest signal that the paste finished.
@@ -585,8 +586,12 @@ export function SessionCookiePanel({ room }: { room: Room }) {
     setBusy(null);
   }, [live.cookieAt, live.cookieNames.join(",")]);
   useEffect(() => {
+    if (busy !== "check") return;
+    if (/Upload access:|Upload access check skipped|Command failed:/i.test(latestLogText)) setBusy(null);
+  }, [busy, latestLogText]);
+  useEffect(() => {
     if (!busy) return;
-    const t = window.setTimeout(() => setBusy(null), 45_000);
+    const t = window.setTimeout(() => setBusy(null), busy === "check" ? 130_000 : 45_000);
     return () => window.clearTimeout(t);
   }, [busy]);
 
@@ -595,7 +600,7 @@ export function SessionCookiePanel({ room }: { room: Room }) {
 
   function apply() {
     const raw = value.trim();
-    if (!raw) return;
+    if (!raw || busy) return;
     if (running) return;
     if (!sendBusCookie(p, accountId, "apply", raw)) {
       log("warn", "No worker socket open — the live browser above has to be connected before there is a profile to sign in.");
@@ -609,6 +614,7 @@ export function SessionCookiePanel({ room }: { room: Room }) {
   }
 
   function clear() {
+    if (busy) return;
     if (!sendBusCookie(p, accountId, "clear")) {
       log("warn", "No worker socket open — nothing to clear.");
       return;
@@ -650,7 +656,7 @@ export function SessionCookiePanel({ room }: { room: Room }) {
             size="sm"
             onClick={apply}
             loading={busy === "apply"}
-            disabled={!value.trim() || running || publishing}
+            disabled={!value.trim() || running || publishing || busy !== null}
             title={
               publishing
                 ? "Wait for the current publish receipt before changing the session"
@@ -666,7 +672,7 @@ export function SessionCookiePanel({ room }: { room: Room }) {
             variant="outline"
             onClick={clear}
             loading={busy === "clear"}
-            disabled={!installed || !live.connected || running || publishing}
+            disabled={!installed || !live.connected || running || publishing || busy !== null}
             title={
               publishing
                 ? "Wait for the current publish receipt before clearing the session"
@@ -682,24 +688,29 @@ export function SessionCookiePanel({ room }: { room: Room }) {
           <Button
             size="sm"
             variant="ghost"
+            loading={busy === "check"}
             onClick={() => {
+              if (busy) return;
               if (!sendBusCmd(p, accountId, { t: "check-upload" })) {
                 log("warn", "No worker socket open — there is no browser to check.");
                 return;
               }
+              setBusy("check");
               log("info", "Asking the upload studio whether this session may post… (it opens in the browser tab)");
             }}
-            disabled={!live.connected || !loggedIn || running || publishing}
+            disabled={!live.connected || !loggedIn || running || publishing || busy !== null}
             title={
-              publishing
-                ? "The publish owns the uploader until its exact receipt returns"
-                : running
-                  ? "Pause the hourly engine before navigating the browser for a capability check"
-                  : !live.connected
-                    ? "Open the live browser first"
-                    : !loggedIn
-                      ? "Sign in first — the studio has to be reached as you"
-                      : "Open the upload page and report whether it lets this session pick a file"
+              busy === "check"
+                ? "Upload access is already being checked"
+                : publishing
+                  ? "The publish owns the uploader until its exact receipt returns"
+                  : running
+                    ? "Pause the hourly engine before navigating the browser for a capability check"
+                    : !live.connected
+                      ? "Open the live browser first"
+                      : !loggedIn
+                        ? "Sign in first — the studio has to be reached as you"
+                        : "Open the upload page and report whether it lets this session pick a file"
             }
           >
             <ShieldCheck className="size-3.5" /> Can it post?
