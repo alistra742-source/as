@@ -9,7 +9,7 @@ const workerIndex = fs.readFileSync(new URL("../worker/src/index.ts", import.met
 test("frontend and worker protocol contracts remain exact mirrors", () => {
   const withoutNow = workerProtocol.replace(/\nexport function now\(\): number \{[\s\S]*$/, "").trim();
   assert.equal(withoutNow, frontend.trim());
-  assert.match(frontend, /PROTOCOL_VERSION = 12/);
+  assert.match(frontend, /PROTOCOL_VERSION = 13/);
 });
 
 test("an outdated open deck is rejected with a refresh instruction before runtime work", () => {

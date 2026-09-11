@@ -18,6 +18,7 @@ import { uid } from "../lib/format";
 import { accountNameTaken, accountRoomKey, cleanAccountName, withoutAccount } from "../lib/accounts";
 import { disconnectLive, isLiveConnected, sendBusRaw } from "../lib/liveBus";
 import { resolveManualSnapshot } from "./manualPublish";
+import { automaticGrowthStartCommands } from "./growthStart";
 import { DEMO_CANDIDATES } from "../data/demo";
 import {
   aiLog,
@@ -687,32 +688,24 @@ export const useDeck = create<DeckState>()(
             get().addLog(p, [logEntry("err", "Worker not connected — connect it in the Worker card first.")]);
             return;
           }
-          if (!sendBusRaw(p, accountId, {
-            type: "engine-config",
+          const [configureCommand, startCommand] = automaticGrowthStartCommands({
             topic: room.engine.searchTopic,
             thresholdViews: room.engine.thresholdViews,
             likesFloor: room.engine.likesFloor,
-          })) {
+          });
+          if (!sendBusRaw(p, accountId, configureCommand)) {
             get().addLog(p, [logEntry("err", "Worker socket closed before the engine configuration could be sent.")]);
             return;
           }
 
-          // Start consumes a prepared first item immediately. Queue it before the
-          // engine command on the same ordered socket: the worker marks the exact
-          // request busy synchronously, Start sees that reservation, and the
-          // hourly automatic pass cannot race or replace it.
-          const hasPreparedFirstPost =
-            !room.composer.busy && (!!room.composer.url.trim() || !!room.engine.searchTopic.trim());
-          let queuedPreparedFirstPost = false;
-          if (hasPreparedFirstPost) {
-            get().postNow(p);
-            queuedPreparedFirstPost = get().rooms[p].composer.busy;
-            if (!queuedPreparedFirstPost) return;
-          }
-          if (!sendBusRaw(p, accountId, { type: "engine", action: "start" })) {
-            get().addLog(p, [logEntry("err", "Worker socket closed before Start arrived. The prepared publish keeps its own receipt, but the hourly engine was not armed.")]);
+          // Growth Start and the manual composer are deliberately separate.
+          // The source URL below may be a draft the user wants to keep; Start
+          // always runs automatic discovery from this account's configured topic.
+          if (!sendBusRaw(p, accountId, startCommand)) {
+            get().addLog(p, [logEntry("err", "Worker socket closed before Start arrived; the hourly engine was not armed.")]);
             return;
           }
+          const topic = room.engine.searchTopic.trim();
           set((s) => ({
             rooms: {
               ...s.rooms,
@@ -721,21 +714,18 @@ export const useDeck = create<DeckState>()(
                 engine: {
                   ...s.rooms[p].engine,
                   running: true,
-                  phase: queuedPreparedFirstPost ? "posting" : "analyzing",
-                  message: queuedPreparedFirstPost
-                    ? "Prepared first publish queued now — after its confirmed receipt, Growth AI waits one full hour."
-                    : "First Growth AI analysis and publish queued now…",
+                  phase: "analyzing",
+                  message: topic
+                    ? `Growth AI is searching “${topic}” now — the manual source link is not used by Start.`
+                    : "First Growth AI analysis and discovery pass queued now…",
                 },
               },
             },
           }));
           return;
         }
-        const hasPreparedFirstPost =
-          !room.composer.busy && (!!room.composer.url.trim() || !!room.engine.searchTopic.trim());
-        if (hasPreparedFirstPost) get().postNow(p);
-        const queuedPreparedFirstPost = hasPreparedFirstPost && get().rooms[p].composer.busy;
         const now = Date.now();
+        const topic = room.engine.searchTopic.trim();
         set((s) => ({
           rooms: {
             ...s.rooms,
@@ -744,18 +734,18 @@ export const useDeck = create<DeckState>()(
               engine: {
                 ...s.rooms[p].engine,
                 running: true,
-                phase: queuedPreparedFirstPost ? "posting" : "analyzing",
+                phase: "analyzing",
                 lastRunAt: now,
                 nextRunAt: null,
-                message: queuedPreparedFirstPost
-                  ? "Prepared first publish queued now — the hourly cycle starts from its receipt."
+                message: topic
+                  ? `Growth AI is searching “${topic}” now — the manual source link is not used by Start.`
                   : "Analyzing account, audience and the algorithm now…",
               },
               log: [
                 ...s.rooms[p].log,
                 aiLog(
-                  queuedPreparedFirstPost
-                    ? "Engine armed. Publishing the prepared first item now; after confirmation, Growth AI waits one full hour."
+                  topic
+                    ? `Engine armed. Searching “${topic}” now; manual composer drafts stay separate.`
                     : "Engine armed. First analysis starts now; after a confirmed post, Growth AI waits one full hour."
                 ),
               ].slice(-MAX_LOG),

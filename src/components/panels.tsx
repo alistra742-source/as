@@ -39,7 +39,6 @@ export function EnginePanel({ room }: { room: Room }) {
   const oauthReady = room.platform === "youtube" && room.live.youtubeOAuthConnected;
   const loggedIn = room.session?.state === "logged-in" || oauthReady;
   const hasSession = !!room.session;
-  const hasPreparedFirstPost = !room.composer.busy && (!!room.composer.url.trim() || !!engine.searchTopic.trim());
 
   useEffect(() => {
     const t = window.setInterval(() => force((n) => n + 1), 500);
@@ -75,10 +74,12 @@ export function EnginePanel({ room }: { room: Room }) {
                     ? room.platform === "youtube"
                       ? "Connect Google or sign in in this account browser first"
                       : "Log in in the browser first"
-                    : ""
+                    : engine.searchTopic.trim()
+                      ? `Start automatic discovery for “${engine.searchTopic.trim()}”; any manual source link below is ignored`
+                      : "Start Growth AI automatic discovery now"
               }
             >
-              <Play className="size-3.5" /> {hasPreparedFirstPost ? "Post & start" : "Start now"}
+              <Play className="size-3.5" /> Start Growth AI
             </Button>
           )
         }
@@ -94,6 +95,12 @@ export function EnginePanel({ room }: { room: Room }) {
           <p className="rounded-lg border border-danger-500/25 bg-danger-500/10 px-3 py-2 text-xs text-danger-400">
             <CircleAlert className="mr-1 inline size-3.5" />
             Not signed in — the engine won't act until you log in in the browser.
+          </p>
+        )}
+        {engine.searchTopic.trim() && (
+          <p className="rounded-lg border border-signal-500/25 bg-signal-500/5 px-3 py-2 text-[11px] leading-snug text-signal-200">
+            <Sparkles className="mr-1 inline size-3.5" />
+            Start Growth AI searches <span className="font-semibold">“{engine.searchTopic.trim()}”</span>. It never consumes the manual source link below.
           </p>
         )}
 
@@ -265,13 +272,13 @@ export function ComposerPanel({ room }: { room: Room }) {
             className="h-10 w-full rounded-xl border border-signal-500/30 bg-signal-500/5 px-3 text-sm text-slate-100 outline-none transition-colors placeholder:text-faint focus:border-signal-400/70 disabled:cursor-not-allowed disabled:opacity-60"
           />
           <span className="mt-1 block text-[11px] leading-snug text-muted">
-            Saved only for this named account. With no link below, the worker searches this exact topic, ranks relevant high-engagement clips,
-            downloads and inspects the best options, rejects low-quality or detected-watermark sources, then writes a fresh source-inspired caption.
-            The hourly engine also uses this topic until you clear it.
+            Saved only for this named account. Start Growth AI always searches this exact topic—even when a manual link is filled below—then ranks
+            relevant high-engagement clips, inspects the best options, rejects low-quality or detected-watermark sources, and writes a fresh
+            source-inspired caption. With no link, Find &amp; post with AI runs the same search once.
           </span>
         </label>
         <div className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-faint">
-          <span className="h-px flex-1 bg-line" /> or use an exact source <span className="h-px flex-1 bg-line" />
+          <span className="h-px flex-1 bg-line" /> manual one-off: use an exact source <span className="h-px flex-1 bg-line" />
         </div>
         <label className="block">
           <span className="mb-1 block text-[11px] font-semibold text-muted uppercase tracking-wider">
@@ -336,14 +343,21 @@ export function ComposerPanel({ room }: { room: Room }) {
                   ? room.platform === "youtube"
                     ? "Connect Google, sign in in the browser, or paste a session cookie first"
                     : "Sign in in the browser (or paste a session cookie) first"
-                  : ""
+                  : c.url.trim()
+                    ? "Manual action: publish this exact source video; it does not run topic discovery"
+                    : "Run one topic-based AI discovery and publish"
             }
             onClick={() => postNow(room.platform)}
           >
-            {c.url.trim() ? (c.busy ? "Grabbing video + publishing…" : "Post video") : <Sparkles className="size-4" />}
+            {c.url.trim() ? (c.busy ? "Grabbing video + publishing…" : "Post exact video") : <Sparkles className="size-4" />}
             {c.url.trim() ? "" : "Find & post with AI"}
           </Button>
-          {!c.url.trim() && (
+          {c.url.trim() ? (
+            <p className="max-w-[330px] text-[11px] leading-snug text-amber-200">
+              Manual source is filled, so this button publishes that exact video. Start Growth AI above ignores this link and searches
+              {room.engine.searchTopic.trim() ? ` “${room.engine.searchTopic.trim()}”.` : " the configured topic."}
+            </p>
+          ) : (
             <p className="max-w-[260px] text-[11px] leading-snug text-muted">
               {room.engine.searchTopic.trim()
                 ? `Search “${room.engine.searchTopic.trim()}” now; only a relevant, quality-approved, watermark-screened clip can be posted.`

@@ -18,6 +18,14 @@ const engineJs = stripTypeScriptTypes(engineSource, { mode: "strip" })
   .replace(/^import[^;]+;\s*/gm, "")
   .replace(/export /g, "");
 
+const growthStartSource = fs.readFileSync(new URL("../src/state/growthStart.ts", import.meta.url), "utf8");
+const growthStartJs = stripTypeScriptTypes(growthStartSource, { mode: "strip" })
+  .replace(/^import[^;]+;\s*/gm, "")
+  .replace(/export /g, "");
+const automaticGrowthStartCommands = new Function(
+  `${growthStartJs}; return automaticGrowthStartCommands;`
+)();
+
 function lifecycle(at = 1_700_000_000_000, posts = []) {
   const rec = {
     running: false,
@@ -202,13 +210,33 @@ test("manual and automatic entry points share the confirmed hourly slot", () => 
   assert.match(body, /one-post\/hour slot is still reserved/);
 });
 
-test("the deck orders a prepared first publish before Start and leaves pause logging to the worker", () => {
+test("Growth Start configures drdonutt discovery without consuming a stale manual URL", () => {
+  const commands = automaticGrowthStartCommands({
+    topic: "drdonutt",
+    thresholdViews: 3_000,
+    likesFloor: 50_000,
+    composerUrl: "https://manual.example/previous-video",
+  });
+  assert.deepEqual(commands, [
+    { type: "engine-config", topic: "drdonutt", thresholdViews: 3_000, likesFloor: 50_000 },
+    { type: "engine", action: "start" },
+  ]);
+  assert.equal(commands.some((command) => command.type === "post" || command.type === "discover-post"), false);
+
   const deck = fs.readFileSync(new URL("../src/state/deck.ts", import.meta.url), "utf8");
   const start = deck.slice(deck.indexOf("startEngine: (p) =>"), deck.indexOf("stopEngine: (p) =>"));
-  const configureAt = start.indexOf('type: "engine-config"');
-  const preparedAt = start.indexOf("get().postNow(p)");
-  const armAt = start.indexOf('type: "engine", action: "start"');
-  assert.ok(configureAt >= 0 && preparedAt > configureAt && armAt > preparedAt);
+  const configureAt = start.indexOf("sendBusRaw(p, accountId, configureCommand)");
+  const armAt = start.indexOf("sendBusRaw(p, accountId, startCommand)");
+  assert.ok(configureAt >= 0 && armAt > configureAt);
+  assert.match(start, /automaticGrowthStartCommands/);
+  assert.doesNotMatch(start, /postNow\(p\)|composer\.url/);
+  assert.match(start, /manual source link is not used by Start/);
+
+  const panels = fs.readFileSync(new URL("../src/components/panels.tsx", import.meta.url), "utf8");
+  assert.match(panels, /<Play className="size-3\.5" \/> Start Growth AI/);
+  assert.match(panels, /Start Growth AI above ignores this link and searches/);
+  assert.match(panels, /Post exact video/);
+  assert.doesNotMatch(panels, /Post & start/);
 
   const stop = deck.slice(deck.indexOf("stopEngine: (p) =>"), deck.indexOf("updateEngine: (p, patch)"));
   const live = stop.slice(stop.indexOf('room.session?.mode === "live"'), stop.indexOf("return;", stop.indexOf('room.session?.mode === "live"')) + 7);

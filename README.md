@@ -43,10 +43,11 @@ humanizer attaches on top and the log line says which one is live.
 
 The product cadence is deterministic while the browser interaction remains human-shaped:
 
-- **Exact engine scheduling** — Start queues the prepared item (or the first discovery pass)
-  immediately. A destination success receipt starts a full one-hour wait; only when that boundary
-  finishes does Growth AI read fresh metrics/content and begin the next publish. Reads and posts
-  never move in front of the confirmed boundary.
+- **Exact engine scheduling** — Start always queues automatic discovery for the account's configured
+  topic immediately; it never consumes a URL waiting in the separate manual composer. A destination
+  success receipt starts a full one-hour wait; only when that boundary finishes does Growth AI read
+  fresh metrics/content and begin the next publish. Reads and posts never move in front of the
+  confirmed boundary.
 - **Human interaction timing** — page reading, review, pointer movement, caption entry and the final
   account-action pause still use bounded human timing; they may finish after a slot opens but never
   make a later slot open early.
