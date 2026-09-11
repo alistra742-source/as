@@ -519,6 +519,18 @@ wss.on("connection", (ws, req) => {
     const { rig, engine } = runtime;
     switch (msg.type) {
       case "cmd":
+        if (msg.cmd.t === "check-upload" && (engine.snapshot().running || engine.isBusy())) {
+          // A capability probe navigates the uploader tab. It must never displace
+          // a request that is downloading, uploading, or waiting for its receipt.
+          send(ws, {
+            type: "log",
+            level: "info",
+            text: "Upload access check skipped — the current publish keeps the browser until its receipt.",
+            at: Date.now(),
+          });
+          send(ws, { type: "toast", text: "Publish in progress — upload access check skipped", tone: "info" });
+          return;
+        }
         rig.exec(msg.cmd).catch((e) =>
           send(ws, { type: "error", message: `Command failed: ${(e as Error).message}` })
         );
@@ -634,13 +646,22 @@ wss.on("connection", (ws, req) => {
     // browser after leaving its room so adding five accounts does not keep five
     // 700 MB Chromium trees alive. Armed/busy accounts stay up; reopening a tile
     // restores the same persistent profile and therefore the same login.
-    const hibernate = setTimeout(() => {
+    const hibernateWhenIdle = () => {
       if (runtime?.deleting || runtimes.get(accountScopeKey(platform, accountId)) !== runtime) return;
-      if (rig.clients.size || engine.snapshot().running || engine.isBusy()) return;
+      if (rig.clients.size || engine.snapshot().running) return;
+      if (rig.hasActiveWork() || engine.isBusy()) {
+        // A socket may disappear while Studio is still returning a publish/check
+        // result. Never close Chromium under that work; try hibernation again once
+        // it has had time to reach its terminal receipt.
+        const retry = setTimeout(hibernateWhenIdle, 30_000);
+        retry.unref?.();
+        return;
+      }
       void rig.close().then(() =>
         console.log(`[${platform}/${rig.accountName}] idle browser hibernated; persistent login kept`)
       );
-    }, 30_000);
+    };
+    const hibernate = setTimeout(hibernateWhenIdle, 30_000);
     hibernate.unref?.();
   });
   ws.on("error", () => {

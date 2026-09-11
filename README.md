@@ -41,11 +41,15 @@ tremor + overshoot, Fitts-scaled speeds, key-hold dwells, eased scrolls with rea
 ~2% auto-corrected fat-finger typos on engine-typed captions only). On Clearcote the SDK's own
 humanizer attaches on top and the log line says which one is live.
 
-On top of the input model, the schedule itself is human-shaped, in either engine:
+The product cadence is deterministic while the browser interaction remains human-shaped:
 
-- **Human scheduling** — the 1-post/hour rule always holds, but every slot gets a random upward
-  jitter (default up to +9 min), the first automatic pass waits a random 0–8 min after arm/boot,
-  and stats reads land a few random minutes after they're due. Nothing happens on a metronome beat.
+- **Exact engine scheduling** — Start queues the prepared item (or the first discovery pass)
+  immediately. A destination success receipt starts a full one-hour wait; only when that boundary
+  finishes does Growth AI read fresh metrics/content and begin the next publish. Reads and posts
+  never move in front of the confirmed boundary.
+- **Human interaction timing** — page reading, review, pointer movement, caption entry and the final
+  account-action pause still use bounded human timing; they may finish after a slot opens but never
+  make a later slot open early.
 - **Idle drift** — between deck commands the logged-in session does small ambient cursor motions
   and the occasional micro-scroll, so the account never looks parked.
 
@@ -148,8 +152,9 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
    `GOOGLE_SCOPES=https://www.googleapis.com/auth/youtube.upload` (`SCOPES` is accepted too).
    Never paste the client secret into the deck or chat. Optional: `GROQ_MODEL`,
    `GOOGLE_TOKEN_ENCRYPTION_KEY`, `BROWSER_ENGINE` / `BLOCK_TRACKERS` / `CHROME_PATH`, the `TOR_*`
-   startup knobs, and the stealth knobs in `worker/env.example` (`STEALTH_PLATFORM`, `STEALTH_HEADLESS`,
-   `STEALTH_CADENCE_JITTER_MIN`, …).
+   startup knobs, and the browser/input knobs in `worker/env.example` (`STEALTH_PLATFORM`,
+   `STEALTH_HEADLESS`, `STEALTH_HUMANIZE`, …). Engine timing is fixed: the first pass is immediate,
+   then each confirmed post opens the next Growth AI analyze-and-post slot exactly one hour later.
 4. Open a platform, press **+**, name the account, then click its tile. That creates a fresh,
    isolated persistent browser profile and streams the *real* platform in its dock. Click, drag
    to scroll, tap **Keyboard** to type with your phone's keyboard, log in, then hit **Start**.
@@ -440,7 +445,7 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 | Rule | Value | Where |
 | --- | --- | --- |
 | Audience | Everyone (YouTube: **Public** and **No, it’s not made for kids**) | API metadata/receipt + fail-closed Studio selection |
-| Cadence | 1 post / 1 hour (slots only ever jittered *longer*) | `worker/src/engine.ts` (also demo engine) |
+| Cadence | First pass immediate; then each slot opens exactly 1 hour after the preceding confirmed post | `worker/src/engineSchedule.ts` + `worker/src/engine.ts` (demo preserves the same ordering) |
 | Hit trigger | 3,000+ views in first hour | engine metric pass, editable per room |
 | Discovery floor | 50K+ likes, 720p-class downloadable source, no detected watermark | search/result stats + FFprobe/Tesseract screen + Groq judge |
 | Custom subject | Exact free text, persisted per named account | `engine.topic` + platform search URLs |

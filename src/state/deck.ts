@@ -621,7 +621,7 @@ export const useDeck = create<DeckState>()(
             );
             logs.push(aiLog(`Manual post logged. Groq will read its first-hour performance and adjust the next discovery pass.`));
             get().finishPost(p, post, logs, consumeHourSlot(fresh.engine, now));
-            get().setComposer(p, { busy: false, lastPostedId: post.id });
+            get().setComposer(p, { url: "", caption: "", busy: false, error: null, lastPostedId: null });
           } else {
             // AI find-and-post path (no manual link provided).
             logs.push(aiLog("No manual link — running AI discovery: faceless clips at 50K+ likes, comments reviewed for quality."));
@@ -638,7 +638,7 @@ export const useDeck = create<DeckState>()(
                 logEntry("ok", `📤 AI pick passed review → posted “${best.title.slice(0, 64)}…” — caption ready, audience Everyone.`)
               );
               get().finishPost(p, post, logs, consumeHourSlot(fresh.engine, now));
-              get().setComposer(p, { busy: false, lastPostedId: post.id });
+              get().setComposer(p, { url: "", caption: "", busy: false, error: null, lastPostedId: null });
             } else {
               logs.push(logEntry("warn", "Discovery found nothing above the 50K quality bar this cycle — nothing posted."));
               get().addLog(p, logs);
@@ -682,17 +682,37 @@ export const useDeck = create<DeckState>()(
           return;
         }
         if (room.session.mode === "live") {
-          if (!isLiveConnected(p, room.accountId ?? "default")) {
+          const accountId = room.accountId ?? "default";
+          if (!isLiveConnected(p, accountId)) {
             get().addLog(p, [logEntry("err", "Worker not connected — connect it in the Worker card first.")]);
             return;
           }
-          sendBusRaw(p, room.accountId ?? "default", {
+          if (!sendBusRaw(p, accountId, {
             type: "engine-config",
             topic: room.engine.searchTopic,
             thresholdViews: room.engine.thresholdViews,
             likesFloor: room.engine.likesFloor,
-          });
-          sendBusRaw(p, room.accountId ?? "default", { type: "engine", action: "start" });
+          })) {
+            get().addLog(p, [logEntry("err", "Worker socket closed before the engine configuration could be sent.")]);
+            return;
+          }
+
+          // Start consumes a prepared first item immediately. Queue it before the
+          // engine command on the same ordered socket: the worker marks the exact
+          // request busy synchronously, Start sees that reservation, and the
+          // hourly automatic pass cannot race or replace it.
+          const hasPreparedFirstPost =
+            !room.composer.busy && (!!room.composer.url.trim() || !!room.engine.searchTopic.trim());
+          let queuedPreparedFirstPost = false;
+          if (hasPreparedFirstPost) {
+            get().postNow(p);
+            queuedPreparedFirstPost = get().rooms[p].composer.busy;
+            if (!queuedPreparedFirstPost) return;
+          }
+          if (!sendBusRaw(p, accountId, { type: "engine", action: "start" })) {
+            get().addLog(p, [logEntry("err", "Worker socket closed before Start arrived. The prepared publish keeps its own receipt, but the hourly engine was not armed.")]);
+            return;
+          }
           set((s) => ({
             rooms: {
               ...s.rooms,
@@ -701,14 +721,20 @@ export const useDeck = create<DeckState>()(
                 engine: {
                   ...s.rooms[p].engine,
                   running: true,
-                  phase: "waiting",
-                  message: "Engine start requested — worker is waking its browser…",
+                  phase: queuedPreparedFirstPost ? "posting" : "analyzing",
+                  message: queuedPreparedFirstPost
+                    ? "Prepared first publish queued now — after its confirmed receipt, Growth AI waits one full hour."
+                    : "First Growth AI analysis and publish queued now…",
                 },
               },
             },
           }));
           return;
         }
+        const hasPreparedFirstPost =
+          !room.composer.busy && (!!room.composer.url.trim() || !!room.engine.searchTopic.trim());
+        if (hasPreparedFirstPost) get().postNow(p);
+        const queuedPreparedFirstPost = hasPreparedFirstPost && get().rooms[p].composer.busy;
         const now = Date.now();
         set((s) => ({
           rooms: {
@@ -718,14 +744,20 @@ export const useDeck = create<DeckState>()(
               engine: {
                 ...s.rooms[p].engine,
                 running: true,
-                phase: "analyzing",
+                phase: queuedPreparedFirstPost ? "posting" : "analyzing",
                 lastRunAt: now,
                 nextRunAt: null,
-                message: "Analyzing account, audience and the algorithm…",
+                message: queuedPreparedFirstPost
+                  ? "Prepared first publish queued now — the hourly cycle starts from its receipt."
+                  : "Analyzing account, audience and the algorithm now…",
               },
               log: [
                 ...s.rooms[p].log,
-                aiLog("Engine armed. Watching account + algorithm, scanning faceless content, posting 1×/hour on Everyone."),
+                aiLog(
+                  queuedPreparedFirstPost
+                    ? "Engine armed. Publishing the prepared first item now; after confirmation, Growth AI waits one full hour."
+                    : "Engine armed. First analysis starts now; after a confirmed post, Growth AI waits one full hour."
+                ),
               ].slice(-MAX_LOG),
             },
           },
@@ -734,15 +766,39 @@ export const useDeck = create<DeckState>()(
 
       stopEngine: (p) => {
         const room = get().rooms[p];
+        if (!room.engine.running) return;
         if (room.session?.mode === "live") {
-          sendBusRaw(p, room.accountId ?? "default", { type: "engine", action: "stop" });
+          const sent = sendBusRaw(p, room.accountId ?? "default", { type: "engine", action: "stop" });
+          if (!sent) {
+            get().addLog(p, [logEntry("err", "Pause was not sent because the worker socket is offline; reconnect and try again.")]);
+            return;
+          }
+          // Optimistically prevent another click in this tab, but let the worker's
+          // single authoritative log/snapshot explain whether a correlated manual
+          // publish is still finishing. This removes the old client+worker double log.
+          set((s) => ({
+            rooms: {
+              ...s.rooms,
+              [p]: {
+                ...s.rooms[p],
+                engine: {
+                  ...s.rooms[p].engine,
+                  running: false,
+                  phase: "paused",
+                  nextRunAt: null,
+                  message: "Pause requested — waiting for the worker acknowledgement…",
+                },
+              },
+            },
+          }));
+          return;
         }
         set((s) => ({
           rooms: {
             ...s.rooms,
             [p]: {
               ...s.rooms[p],
-              engine: { ...s.rooms[p].engine, running: false, phase: "paused", message: "Engine paused." },
+              engine: { ...s.rooms[p].engine, running: false, phase: "paused", nextRunAt: null, message: "Engine paused." },
               log: [...s.rooms[p].log, logEntry("warn", "Engine paused — no posts or checks until resumed.")].slice(-MAX_LOG),
             },
           },
@@ -850,7 +906,7 @@ export const useDeck = create<DeckState>()(
             if (optimistic && resolution.url) {
               posts = posts.map((post) => (post.id === optimistic.id ? { ...post, url: resolution.url! } : post));
             }
-            composer = { ...room.composer, busy: false, lastPostedId: null, error: null };
+            composer = { ...room.composer, url: "", caption: "", busy: false, lastPostedId: null, error: null };
           }
           // Pending deliberately stays pending even when manualBusy is false: an
           // older false snapshot may have been in flight before this click. A
@@ -936,7 +992,7 @@ export const useDeck = create<DeckState>()(
                     ? room.posts.map((post) => (post.id === requestId ? { ...post, url } : post))
                     : room.posts,
                 composer: isCurrent
-                  ? { ...room.composer, busy: false, error: null, lastPostedId: null }
+                  ? { ...room.composer, url: "", caption: "", busy: false, error: null, lastPostedId: null }
                   : room.composer,
                 log: [
                   ...room.log,

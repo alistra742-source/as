@@ -1,4 +1,12 @@
-import { HOUR_MS, stealth, type PlatformKey } from "./config.js";
+import { HOUR_MS, type PlatformKey } from "./config.js";
+import {
+  ENGINE_LOOP_TICK_MS,
+  cadenceDurationMs,
+  initialEngineRunAt,
+  latestConfirmedPostAt,
+  metricsReadDue,
+  nextConfirmedPostAt,
+} from "./engineSchedule.js";
 import type { EngineSnapshot, LastPostSnapshot, ManualPublishResult, ServerMsg } from "./protocol.js";
 import { now } from "./protocol.js";
 import { Store, type WorkerPost } from "./store.js";
@@ -15,24 +23,15 @@ import { screenVideoForDiscovery } from "./mediaEnhance.js";
 import { recoverInterruptedManualResult } from "./manualResult.js";
 
 const uid = () => `wp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
-const LOOP_TICK_MS = 60_000;
-
-/**
- * Humanized cadence: the 1-post/hour rule still holds (slots are never
- * shorter than the cadence), but every scheduled time gets a random upward
- * jitter so posts and checks never land on a metronome beat — a fixed,
- * clock-perfect schedule is a classic bot tell.
- */
-function jitteredCadenceMs(e: ReturnType<Store["engine"]>): number {
-  return e.cadenceHours * HOUR_MS + jitter(0, stealth.cadenceJitterMin * 60_000);
-}
-
-/** Random 0–bootDelayMaxMin minutes before the first engine action. */
-function warmupMs(): number {
-  return jitter(0.5, Math.max(1, stealth.bootDelayMaxMin)) * 60_000;
-}
 
 const NICHE_CYCLE = ["stories", "scary", "facts"];
+
+/** Async browser work can be paused from another websocket while this call is
+ * awaiting. Keep that externally-mutated phase instead of restoring its entry
+ * phase when the exact manual request reaches a terminal receipt. */
+function manualShouldRemainPaused(e: ReturnType<Store["engine"]>, entryPhase: string): boolean {
+  return !e.running && (e.phase === "paused" || entryPhase === "paused");
+}
 
 export class GrowthEngine {
   platform: PlatformKey;
@@ -209,60 +208,135 @@ export class GrowthEngine {
     return this.platform === "youtube" ? "visibility Public (Everyone)" : "audience Everyone";
   }
 
+  /** Manual and automatic entry points share the same confirmed one-post/hour
+   * boundary. A button press is not permission to overlap a still-reserved slot. */
+  private cadenceBlockMessage(e: ReturnType<Store["engine"]>): string | null {
+    const latest = latestConfirmedPostAt(this.store.posts(this.platform));
+    if (latest === null) return null;
+    const opensAt = nextConfirmedPostAt(latest, e.cadenceHours);
+    const remaining = opensAt - now();
+    if (remaining <= 0) return null;
+    const minutes = Math.max(1, Math.ceil(remaining / 60_000));
+    return `The confirmed one-post/hour slot is still reserved for ${minutes} more minute${minutes === 1 ? "" : "s"}. Nothing new was uploaded.`;
+  }
+
   start() {
     const e = this.store.engine(this.platform);
     if (e.running) return;
+    const startedAt = now();
+    const latest = latestConfirmedPostAt(this.store.posts(this.platform));
+    const reservedUntil = latest === null ? null : nextConfirmedPostAt(latest, e.cadenceHours);
+    const resumesReservedSlot = reservedUntil !== null && reservedUntil > startedAt;
     e.running = true;
-    e.phase = "analyzing";
-    // Human stealth: a process that starts posting the instant it is armed is
-    // a bot tell. Warm up for a random 0–N minutes first, then run the first
-    // cycle. (When the user wants an immediate manual post, manualPost still
-    // runs right away — the warm-up only gates *automatic* actions.)
-    e.nextRunAt = now() + warmupMs();
-    e.message = "Engine armed — warming up like a human before the first automatic pass.";
+    e.phase = resumesReservedSlot ? "waiting" : "analyzing";
+    // A genuinely open slot means now. The previous randomized warm-up plus the
+    // first minute-long interval tick could leave a newly armed topic inert for
+    // almost nine minutes. A confirmed, still-active slot is never bypassed.
+    e.nextRunAt = resumesReservedSlot ? reservedUntil : initialEngineRunAt(startedAt);
+    e.message = resumesReservedSlot
+      ? `Engine resumed — the confirmed one-hour wait still has ${Math.max(1, Math.ceil((reservedUntil - startedAt) / 60_000))} min left.`
+      : e.topic
+        ? `Engine armed — starting the first “${e.topic}” analysis and publish now.`
+        : "Engine armed — starting the first account analysis and publish now.";
     e.errorCount = 0;
     this.store.save();
-    this.log("ok", `🛰 Engine armed for ${this.platform} — 1 post/hour, ${this.audienceLabel()}, ${e.thresholdViews.toLocaleString()}+/hr trigger, ${e.likesFloor.toLocaleString()}+ likes discovery floor.`);
+    this.log(
+      "ok",
+      resumesReservedSlot
+        ? `🛰 Engine resumed for ${this.platform} — preserving the confirmed +1h boundary before Growth AI analyzes and posts again.`
+        : `🛰 Engine armed for ${this.platform} — first publish pass queued now; after a confirmed post, Growth AI waits exactly 1h before analyzing and posting again (${this.audienceLabel()}, ${e.thresholdViews.toLocaleString()}+/hr trigger, ${e.likesFloor.toLocaleString()}+ likes discovery floor).`
+    );
     this.pushEngine();
     this.ensureLoop();
+    // Do not make a fresh Start wait for the fallback timer. `inFlight` prevents
+    // this direct call and an interval tick from ever overlapping.
+    void this.runCycle("start");
   }
 
-  stop() {
+  stop(): boolean {
     const e = this.store.engine(this.platform);
-    if (!e.running && e.phase === "idle") return;
+    // Multiple tabs, delayed clicks, and account cleanup may repeat Stop. Once
+    // stopped, another request is a no-op and must not append another pause line.
+    if (!e.running) {
+      if (this.timer) {
+        clearInterval(this.timer);
+        this.timer = null;
+      }
+      this.pushEngine();
+      return false;
+    }
     e.running = false;
     e.phase = "paused";
     e.nextRunAt = null;
-    e.message = "Engine paused.";
+    e.message = this.manualBusy
+      ? "Engine paused — the current publish keeps its exact request until a receipt; future cycles are stopped."
+      : this.inFlight
+        ? "Engine paused — the current automatic pass will stop before upload, or finish its receipt if submission already began."
+        : "Engine paused.";
     this.store.save();
-    this.log("warn", "Engine paused — no posts or checks until resumed.");
+    this.log(
+      "warn",
+      this.manualBusy
+        ? "Engine paused — the in-flight publish will still finish with its correlated receipt; no later posts or checks will start."
+        : this.inFlight
+          ? "Engine paused — the current pass is stopping safely; an already-started destination submission will still return its strict receipt."
+          : "Engine paused — no posts or checks until resumed."
+    );
     this.pushEngine();
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
     }
+    return true;
   }
 
   resumeFromBoot() {
     const e = this.store.engine(this.platform);
-    if (e.running) {
-      this.ensureLoop();
-      // A fresh boot that posts instantly is a tell — but an engine that was
-      // already mid-cadence keeps its existing schedule.
-      if (!e.nextRunAt) {
-        e.nextRunAt = now() + warmupMs();
-        e.message = "Resumed after restart — warming up before the next automatic pass.";
-        this.store.save();
-        this.pushEngine();
-      }
+    if (!e.running) return;
+
+    const resumedAt = now();
+    const latest = latestConfirmedPostAt(this.store.posts(this.platform));
+    const confirmedBoundary = latest === null ? null : nextConfirmedPostAt(latest, e.cadenceHours);
+    const interruptedRequest =
+      e.manualResult?.status === "failed" && /worker restarted before a success receipt/i.test(e.manualResult.message);
+    let changed = false;
+
+    if (interruptedRequest && e.nextRunAt) {
+      // Do not immediately repeat an upload whose process died after acceptance:
+      // the correlated failure must remain visible long enough to inspect.
+    } else if (confirmedBoundary !== null) {
+      // Migrate old +jitter state on boot as well: history is the source of truth.
+      const exactNext = confirmedBoundary > resumedAt ? confirmedBoundary : initialEngineRunAt(resumedAt);
+      e.nextRunAt = exactNext;
+      changed = true;
+      e.phase = confirmedBoundary > resumedAt ? "waiting" : "analyzing";
+      e.message = confirmedBoundary > resumedAt
+        ? "Resumed after restart — preserving the exact confirmed +1h boundary."
+        : "Resumed after restart — the full hour is complete, continuing Growth AI now.";
+    } else if ((!e.nextRunAt || (!e.lastRunAt && e.phase !== "error" && !interruptedRequest))) {
+      // A legacy initial warm-up has no confirmed post and no completed pass. It
+      // is safe—and required—to replace it with an immediate first cycle.
+      e.nextRunAt = initialEngineRunAt(resumedAt);
+      e.phase = "analyzing";
+      e.message = "Resumed after restart — continuing the due Growth AI pass now.";
+      changed = true;
     }
+
+    if (changed) {
+      this.store.save();
+      this.pushEngine();
+    }
+    this.ensureLoop();
+    // A persisted future boundary returns at the schedule gate; a due or
+    // missing boundary resumes immediately instead of waiting for a timer tick.
+    void this.runCycle("boot");
   }
 
   private ensureLoop() {
     if (this.timer) return;
     this.timer = setInterval(() => {
       if (this.store.engine(this.platform).running) void this.runCycle("tick");
-    }, LOOP_TICK_MS);
+    }, ENGINE_LOOP_TICK_MS);
     this.timer.unref?.();
   }
 
@@ -274,32 +348,55 @@ export class GrowthEngine {
     this.inFlight = true;
     try {
       if (!this.publishAuthenticated()) {
+        const message = "Signed in? Waiting for a browser login or YouTube Google connection before the engine acts…";
+        if (e.phase !== "analyzing" || e.message !== message) {
+          e.phase = "analyzing";
+          e.message = message;
+          this.store.save();
+          this.pushEngine();
+        }
+        return;
+      }
+      const cycleAt = now();
+      if (e.nextRunAt !== null && cycleAt < e.nextRunAt) {
+        const waitMs = e.nextRunAt - cycleAt;
+        const waitMin = Math.max(1, Math.ceil(waitMs / 60_000));
+        const message = `Confirmed hourly slot opens in ${waitMin} min — Growth AI will analyze fresh data, then publish.`;
+        // The deck derives its live countdown from nextRunAt. Avoid rewriting the
+        // same account state every ten seconds while the exact boundary is future.
+        if (e.phase !== "waiting" || e.message !== message) {
+          e.phase = "waiting";
+          e.message = message;
+          this.store.save();
+          this.pushEngine();
+        }
+        return;
+      }
+
+      const hourlyBoundaryFinished = e.phase === "waiting" && e.nextRunAt !== null;
+      if (hourlyBoundaryFinished) {
         e.phase = "analyzing";
-        e.message = "Signed in? Waiting for a browser login or YouTube Google connection before the engine acts…";
+        e.message = "The full hour finished — Growth AI is analyzing fresh metrics and content before the next publish.";
         this.store.save();
+        this.log("ai", "🕐 Full one-hour wait finished — analyzing fresh post data and content before publishing the next slot.");
         this.pushEngine();
-        return;
       }
-      // Human stealth: never act before the jittered warm-up / next-slot time.
-      if (e.nextRunAt && now() < e.nextRunAt) {
-        const waitMin = Math.max(1, Math.round((e.nextRunAt - now()) / 60_000));
-        e.phase = "waiting";
-        e.message = e.lastRunAt
-          ? `Next automatic pass in ~${waitMin} min (human-jittered).`
-          : `Warming up — next automatic pass in ~${waitMin} min.`;
-        this.store.save();
-        this.pushEngine();
-        return;
-      }
+
       await this.metricsPass(e);
       if (!e.running) return;
       await this.postingPass(e);
     } catch (err) {
       this.log("err", `Cycle error: ${(err as Error).message}`);
       e.errorCount += 1;
-      e.phase = "error";
-      e.message = `Cycle error — ${(err as Error).message.slice(0, 140)}`;
-      e.nextRunAt = now() + (e.errorCount <= 3 ? 15 * 60_000 : HOUR_MS) + jitter(1, 6) * 60_000;
+      if (e.running) {
+        e.phase = "error";
+        e.message = `Cycle error — ${(err as Error).message.slice(0, 140)}`;
+        e.nextRunAt = now() + (e.errorCount <= 3 ? 15 * 60_000 : HOUR_MS) + jitter(1, 6) * 60_000;
+      } else {
+        e.phase = "paused";
+        e.nextRunAt = null;
+        e.message = `Engine remains paused. The in-flight pass ended with: ${(err as Error).message.slice(0, 120)}`;
+      }
       this.store.save();
       this.pushEngine();
     } finally {
@@ -313,17 +410,11 @@ export class GrowthEngine {
     const nowMs = now();
     for (const post of posts) {
       if (!e.running) return;
-      const age = nowMs - post.postedAt;
       const last = post.checks[post.checks.length - 1];
-      // Human stealth: reads happen a random few minutes AFTER they become due
-      // (a stats check on the exact hour mark every hour is a bot tell).
-      const dueFirst = post.checks.length === 0 && age >= HOUR_MS - jitter(5, 5 + stealth.metricsJitterMin) * 60_000;
-      const dueNext =
-        post.checks.length > 0 &&
-        post.checks.length < 4 &&
-        !!last &&
-        nowMs - last.at >= HOUR_MS - jitter(5, 5 + stealth.metricsJitterMin) * 60_000;
-      if (!dueFirst && !dueNext) continue;
+      // A "first-hour" read must contain a full hour of performance. Humanized
+      // page interaction remains, but schedule jitter may never pull this read
+      // (or a later hourly read) in front of its data boundary.
+      if (post.checks.length >= 4 || !metricsReadDue(post.postedAt, last?.at ?? null, nowMs)) continue;
       this.log("info", `Reading stats for ${post.id.slice(-5)}…`);
       const page = await this.rig.newEnginePage();
       try {
@@ -368,19 +459,17 @@ export class GrowthEngine {
   private async postingPass(e: ReturnType<Store["engine"]>) {
     const nowMs = now();
     const posts = this.store.posts(this.platform);
-    const recent = posts.some((p) => nowMs - p.postedAt < e.cadenceHours * HOUR_MS);
+    const latestPostedAt = latestConfirmedPostAt(posts);
+    const slotOpensAt = latestPostedAt === null ? null : nextConfirmedPostAt(latestPostedAt, e.cadenceHours);
 
-    if (e.nextRunAt && nowMs < e.nextRunAt) {
-      if (recent) {
-        e.message = `Hourly slot used — next auto-post in ${Math.max(1, Math.round(((e.nextRunAt ?? nowMs) - nowMs) / 60_000))} min.`;
-      }
-      this.store.save();
-      this.pushEngine();
-      return;
-    }
-    if (recent) {
-      e.nextRunAt = nowMs + jitteredCadenceMs(e);
-      e.message = "Hourly slot used (manual or auto) — next post scheduled in ~1h (human-jittered).";
+    // History is authoritative even if nextRunAt was lost in a restart. Never
+    // add another hour from "now": preserve the boundary derived from the most
+    // recent destination success receipt.
+    if (slotOpensAt !== null && nowMs < slotOpensAt) {
+      const waitMin = Math.max(1, Math.ceil((slotOpensAt - nowMs) / 60_000));
+      e.phase = "waiting";
+      e.nextRunAt = slotOpensAt;
+      e.message = `Confirmed hourly slot opens in ${waitMin} min — Growth AI will analyze fresh data, then publish.`;
       this.store.save();
       this.pushEngine();
       return;
@@ -406,12 +495,22 @@ export class GrowthEngine {
     const page = await this.rig.newEnginePage();
     try {
       const candidates = await scrapeCandidates(page, e.likesFloor, this.platform, niche, topic);
+      if (!e.running) {
+        e.phase = "paused";
+        e.nextRunAt = null;
+        e.message = "Engine paused before discovery could begin a publish.";
+        this.store.save();
+        this.pushEngine();
+        return;
+      }
       if (candidates.length === 0) {
+        const completedAt = now();
         e.phase = "waiting";
-        e.nextRunAt = now() + HOUR_MS;
+        e.lastRunAt = completedAt;
+        e.nextRunAt = completedAt + cadenceDurationMs(e.cadenceHours);
         e.message = topic
-          ? `No relevant “${topic}” clips above the engagement floor found this pass.`
-          : "No faceless clips above the quality floor found this pass.";
+          ? `No relevant “${topic}” clips above the engagement floor found this pass — analyzing fresh results again in 1h.`
+          : "No faceless clips above the quality floor found this pass — analyzing fresh results again in 1h.";
         this.log("warn", `Discovery found nothing ${topic ? `relevant to “${topic}” ` : ""}above the quality bar — nothing posted (quality first).`);
         this.store.save();
         this.pushEngine();
@@ -427,6 +526,7 @@ export class GrowthEngine {
       let bestTitle = "";
       let bestSourceVideo: Awaited<ReturnType<typeof downloadVideo>> | null = null;
       for (const c of candidates.slice(0, 6)) {
+        if (!e.running) break;
         const watermarkHint = metadataWatermarkRisk(c.title);
         if (watermarkHint) {
           this.log("warn", `Candidate skipped before download: metadata signals “${watermarkHint}”.`);
@@ -455,10 +555,20 @@ export class GrowthEngine {
           this.log("warn", `Candidate rejected after download: ${(error as Error).message}. Trying the next relevant clip.`);
         }
       }
+      if (!e.running) {
+        e.phase = "paused";
+        e.nextRunAt = null;
+        e.message = "Engine paused during review — no automatic upload was started.";
+        this.store.save();
+        this.pushEngine();
+        return;
+      }
       if (!best || !bestSourceVideo) {
+        const completedAt = now();
         e.phase = "waiting";
-        e.nextRunAt = now() + HOUR_MS;
-        e.message = "Review passed nothing — quality bar held.";
+        e.lastRunAt = completedAt;
+        e.nextRunAt = completedAt + cadenceDurationMs(e.cadenceHours);
+        e.message = "Review passed nothing — quality bar held. Growth AI will analyze fresh results again in 1h.";
         this.log("warn", "Groq review passed no candidates this cycle — nothing posted.");
         this.store.save();
         this.pushEngine();
@@ -474,6 +584,14 @@ export class GrowthEngine {
       // A human sits with the chosen clip for a beat before publishing it.
       await thinkingPause(800, 2600);
       const video = await enhanceVideoForUpload(bestSourceVideo, (t) => this.log("info", t));
+      if (!e.running) {
+        e.phase = "paused";
+        e.nextRunAt = null;
+        e.message = "Engine paused before the automatic uploader was opened.";
+        this.store.save();
+        this.pushEngine();
+        return;
+      }
       const result =
         this.platform === "youtube" && youtubeOAuthConnected(this.rig.accountId)
           ? await uploadYouTubeWithOAuth(this.rig.accountId, video, caption, (t) => this.log("info", t))
@@ -497,17 +615,25 @@ export class GrowthEngine {
         verdict: null,
       };
       this.store.addPost(this.platform, post);
-      e.phase = "waiting";
-      e.nextRunAt = now() + jitteredCadenceMs(e);
-      e.lastRunAt = now();
-      e.message = `Posted “${caption.slice(0, 48)}…” — 1 of 1 slot used this hour.`;
+      e.lastRunAt = post.postedAt;
+      if (e.running) {
+        e.phase = "waiting";
+        e.nextRunAt = nextConfirmedPostAt(post.postedAt, e.cadenceHours);
+        e.message = `Posted “${caption.slice(0, 48)}…” — confirmed. Waiting one full hour before Growth AI analyzes and posts again.`;
+      } else {
+        // Once the destination action has started, abandoning it can create an
+        // unknown duplicate. Keep its strict receipt, then honor Pause.
+        e.phase = "paused";
+        e.nextRunAt = null;
+        e.message = `Automatic publish confirmed for “${caption.slice(0, 48)}…”; the engine remains paused.`;
+      }
       e.errorCount = 0;
       e.niche = NICHE_CYCLE[(NICHE_CYCLE.indexOf(niche as never) + 1) % NICHE_CYCLE.length];
       this.hitNiche = null;
       this.store.save();
       this.rig.broadcast({ type: "post-ok", postId: post.id, postedAt: post.postedAt, url: receipt.liveUrl });
       this.toast("Posted — check the live browser for the live link.", "ok");
-      this.log("ok", `📤 Auto-posted (${this.audienceLabel()}). Verdict stored — first read in ~1h.`);
+      this.log("ok", `📤 Auto-posted (${this.audienceLabel()}). Verdict stored — first read starts only after the full 1h boundary.`);
       this.pushEngine();
     } finally {
       await page.close().catch(() => undefined);
@@ -585,6 +711,8 @@ export class GrowthEngine {
     if (!this.publishAuthenticated()) {
       return reject("Not signed in on this account — use the browser, session cookie, or YouTube Connect Google first.");
     }
+    const cadenceBlock = this.cadenceBlockMessage(e);
+    if (cadenceBlock) return reject(cadenceBlock);
 
     const prevPhase = e.phase;
     e.topic = topic;
@@ -722,15 +850,18 @@ export class GrowthEngine {
           receipt.liveUrl ? ` at ${receipt.liveUrl.slice(0, 90)}` : " in Studio"
         }.`
       );
-      e.lastRunAt = now();
+      e.lastRunAt = post.postedAt;
       e.errorCount = 0;
       if (e.running) {
-        e.nextRunAt = now() + jitteredCadenceMs(e);
+        e.nextRunAt = nextConfirmedPostAt(post.postedAt, e.cadenceHours);
         e.phase = "waiting";
-        e.message = `Posted a “${topic}” pick — hourly slot reserved; first metrics read in ~1h.`;
+        e.message = `Posted a “${topic}” pick — confirmed. Waiting one full hour before Growth AI analyzes and posts again.`;
       } else {
-        e.phase = prevPhase === "paused" ? "paused" : "idle";
-        e.message = `Posted a quality-approved “${topic}” video.`;
+        const pausedDuringPublish = manualShouldRemainPaused(e, prevPhase);
+        e.phase = pausedDuringPublish ? "paused" : "idle";
+        e.message = pausedDuringPublish
+          ? `Publish confirmed for “${topic}”; the engine remains paused.`
+          : `Posted a quality-approved “${topic}” video.`;
       }
       this.store.save();
       this.pushEngine();
@@ -742,8 +873,10 @@ export class GrowthEngine {
       this.finishManualRequest(requestId, "failed", message);
       this.rig.broadcast({ type: "post-failed", message, requestId });
       this.toast(`Publish failed: ${message}`, "err");
-      e.phase = prevPhase === "paused" ? "paused" : "idle";
-      e.message = `Nothing posted for “${topic}”: ${message.slice(0, 130)}`;
+      const pausedDuringPublish = manualShouldRemainPaused(e, prevPhase);
+      e.phase = pausedDuringPublish ? "paused" : e.running ? "analyzing" : "idle";
+      if (e.running) e.nextRunAt = initialEngineRunAt(now());
+      e.message = `${pausedDuringPublish ? "Engine remains paused. " : ""}Nothing posted for “${topic}”: ${message.slice(0, 130)}`;
       this.store.save();
       this.pushEngine();
       return false;
@@ -789,6 +922,8 @@ export class GrowthEngine {
         `Manual post needs a real link — got “${String(url).slice(0, 40)}”.`
       );
     }
+    const cadenceBlock = this.cadenceBlockMessage(e);
+    if (cadenceBlock) return reject(cadenceBlock);
     const prevPhase = e.phase;
     e.phase = "posting";
     e.message = `Publishing your link + caption (${this.audienceLabel()})…`;
@@ -858,13 +993,15 @@ export class GrowthEngine {
         `✅ Manual publish verified${receipt.liveUrl ? ` at ${receipt.liveUrl.slice(0, 90)}` : " by the studio"} — ` +
           `${this.audienceLabel()}, caption “${finalCaption.slice(0, 60)}”.`
       );
-      e.lastRunAt = now();
+      e.lastRunAt = post.postedAt;
       if (e.running) {
-        e.nextRunAt = now() + jitteredCadenceMs(e);
+        e.nextRunAt = nextConfirmedPostAt(post.postedAt, e.cadenceHours);
         e.phase = "waiting";
-        e.message = "Manual post logged — hourly slot reserved. Metrics read starts in ~1h.";
+        e.message = "Manual post confirmed — waiting one full hour before Growth AI analyzes and posts again.";
       } else {
-        e.phase = prevPhase === "paused" ? "paused" : "idle";
+        const pausedDuringPublish = manualShouldRemainPaused(e, prevPhase);
+        e.phase = pausedDuringPublish ? "paused" : "idle";
+        e.message = pausedDuringPublish ? "Manual publish confirmed; the engine remains paused." : "Manual publish confirmed.";
       }
       this.store.save();
       this.pushEngine();
@@ -878,7 +1015,12 @@ export class GrowthEngine {
       this.finishManualRequest(requestId, "failed", message);
       this.rig.broadcast({ type: "post-failed", message, requestId });
       this.toast(`Publish failed: ${message}`, "err");
-      e.phase = prevPhase === "paused" ? "paused" : "idle";
+      const pausedDuringPublish = manualShouldRemainPaused(e, prevPhase);
+      e.phase = pausedDuringPublish ? "paused" : e.running ? "analyzing" : "idle";
+      if (e.running) e.nextRunAt = initialEngineRunAt(now());
+      e.message = pausedDuringPublish
+        ? `Engine remains paused. Manual publish failed: ${message.slice(0, 130)}`
+        : `Manual publish failed: ${message.slice(0, 150)}`;
       this.store.save();
       this.pushEngine();
       return false;

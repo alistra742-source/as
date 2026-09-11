@@ -39,6 +39,7 @@ export function EnginePanel({ room }: { room: Room }) {
   const oauthReady = room.platform === "youtube" && room.live.youtubeOAuthConnected;
   const loggedIn = room.session?.state === "logged-in" || oauthReady;
   const hasSession = !!room.session;
+  const hasPreparedFirstPost = !room.composer.busy && (!!room.composer.url.trim() || !!engine.searchTopic.trim());
 
   useEffect(() => {
     const t = window.setInterval(() => force((n) => n + 1), 500);
@@ -77,7 +78,7 @@ export function EnginePanel({ room }: { room: Room }) {
                     : ""
               }
             >
-              <Play className="size-3.5" /> Start
+              <Play className="size-3.5" /> {hasPreparedFirstPost ? "Post & start" : "Start now"}
             </Button>
           )
         }
@@ -260,7 +261,8 @@ export function ComposerPanel({ room }: { room: Room }) {
             placeholder="e.g. donut smp or drdonutt"
             maxLength={80}
             autoComplete="off"
-            className="h-10 w-full rounded-xl border border-signal-500/30 bg-signal-500/5 px-3 text-sm text-slate-100 outline-none transition-colors placeholder:text-faint focus:border-signal-400/70"
+            disabled={c.busy}
+            className="h-10 w-full rounded-xl border border-signal-500/30 bg-signal-500/5 px-3 text-sm text-slate-100 outline-none transition-colors placeholder:text-faint focus:border-signal-400/70 disabled:cursor-not-allowed disabled:opacity-60"
           />
           <span className="mt-1 block text-[11px] leading-snug text-muted">
             Saved only for this named account. With no link below, the worker searches this exact topic, ranks relevant high-engagement clips,
@@ -282,7 +284,8 @@ export function ComposerPanel({ room }: { room: Room }) {
             spellCheck={false}
             autoComplete="off"
             autoCapitalize="off"
-            className="h-10 w-full rounded-xl border border-line bg-ink-900 px-3 font-mono text-xs text-slate-200 outline-none transition-colors placeholder:text-faint focus:border-amber-400/60"
+            disabled={c.busy}
+            className="h-10 w-full rounded-xl border border-line bg-ink-900 px-3 font-mono text-xs text-slate-200 outline-none transition-colors placeholder:text-faint focus:border-amber-400/60 disabled:cursor-not-allowed disabled:opacity-60"
           />
           <span className="mt-1 block text-[11px] leading-snug text-muted">
             The link is where the video is *taken from* — any of the three sites works, and it is published to{" "}
@@ -307,7 +310,8 @@ export function ComposerPanel({ room }: { room: Room }) {
                   : "Leave empty for a fresh caption inspired by the selected video's title"
             }
             rows={2}
-            className="w-full resize-none rounded-xl border border-line bg-ink-900 px-3 py-2.5 text-sm text-slate-200 outline-none transition-colors placeholder:text-faint focus:border-amber-400/60"
+            disabled={c.busy}
+            className="w-full resize-none rounded-xl border border-line bg-ink-900 px-3 py-2.5 text-sm text-slate-200 outline-none transition-colors placeholder:text-faint focus:border-amber-400/60 disabled:cursor-not-allowed disabled:opacity-60"
           />
         </label>
         {c.busy && room.engine.message && (
@@ -573,6 +577,7 @@ export function SessionCookiePanel({ room }: { room: Room }) {
   const loggedIn = room.session?.state === "logged-in";
   const installed = !!live.cookieAt;
   const running = room.engine.running;
+  const publishing = room.composer.busy;
 
   // The worker answers with cookie-state once the jar is written (and on every
   // connect), so that is the only honest signal that the paste finished.
@@ -645,8 +650,14 @@ export function SessionCookiePanel({ room }: { room: Room }) {
             size="sm"
             onClick={apply}
             loading={busy === "apply"}
-            disabled={!value.trim() || running}
-            title={running ? "Pause the engine before changing the session" : "Write it into the browser profile and reload"}
+            disabled={!value.trim() || running || publishing}
+            title={
+              publishing
+                ? "Wait for the current publish receipt before changing the session"
+                : running
+                  ? "Pause the engine before changing the session"
+                  : "Write it into the browser profile and reload"
+            }
           >
             <Check className="size-3.5" /> Apply &amp; sign in
           </Button>
@@ -655,8 +666,16 @@ export function SessionCookiePanel({ room }: { room: Room }) {
             variant="outline"
             onClick={clear}
             loading={busy === "clear"}
-            disabled={!installed || !live.connected}
-            title={live.connected ? "Empty this profile's cookie jar" : "Open the live browser first"}
+            disabled={!installed || !live.connected || running || publishing}
+            title={
+              publishing
+                ? "Wait for the current publish receipt before clearing the session"
+                : running
+                  ? "Pause the engine before clearing the session"
+                  : live.connected
+                    ? "Empty this profile's cookie jar"
+                    : "Open the live browser first"
+            }
           >
             Clear
           </Button>
@@ -670,13 +689,17 @@ export function SessionCookiePanel({ room }: { room: Room }) {
               }
               log("info", "Asking the upload studio whether this session may post… (it opens in the browser tab)");
             }}
-            disabled={!live.connected || !loggedIn}
+            disabled={!live.connected || !loggedIn || running || publishing}
             title={
-              !live.connected
-                ? "Open the live browser first"
-                : !loggedIn
-                  ? "Sign in first — the studio has to be reached as you"
-                  : "Open the upload page and report whether it lets this session pick a file"
+              publishing
+                ? "The publish owns the uploader until its exact receipt returns"
+                : running
+                  ? "Pause the hourly engine before navigating the browser for a capability check"
+                  : !live.connected
+                    ? "Open the live browser first"
+                    : !loggedIn
+                      ? "Sign in first — the studio has to be reached as you"
+                      : "Open the upload page and report whether it lets this session pick a file"
             }
           >
             <ShieldCheck className="size-3.5" /> Can it post?

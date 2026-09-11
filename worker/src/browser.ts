@@ -434,6 +434,9 @@ export class Rig {
    * publish disarmed its own engine.
    */
   private driving = false;
+  /** A Studio capability probe navigates the streamed tab. Coalesce repeated
+   * button presses and freeze ambient login reads until that one probe ends. */
+  private uploadAccessPending = false;
   /** The screen signature we last acted on, so one modal = at most a few presses. */
 
   constructor(
@@ -446,6 +449,12 @@ export class Rig {
     this.accountId = accountId;
     this.accountName = accountName.trim().slice(0, 48) || "Account";
     this.store = store;
+  }
+
+  /** Browser-local work that must finish before an idle socket disconnect may
+   * hibernate Chromium. Engine jobs are tracked separately by GrowthEngine. */
+  hasActiveWork(): boolean {
+    return this.driving || this.sessionMutation || this.uploadAccessPending || this.pendingCmds > 0;
   }
 
   /** The label is display metadata, but a runtime discovered from disk before
@@ -953,11 +962,14 @@ export class Rig {
    */
   async waitForRecovery(maxMs = 25_000): Promise<boolean> {
     const t0 = Date.now();
-    while (!this.destroyed && Date.now() - t0 < maxMs) {
-      if (!this.recovering && this.control && !this.control.isClosed()) return true;
+    // A renderer crash owns a bounded tab-reopen routine; let that finish. If
+    // the whole context vanished, however, nobody is recovering it in place —
+    // launch immediately instead of burning the full 25 seconds first.
+    while (!this.destroyed && this.recovering && Date.now() - t0 < maxMs) {
       await sleep(400);
     }
     if (this.control && !this.control.isClosed()) return true;
+    if (this.destroyed || this.recovering) return false;
     try {
       await this.openControlSession();
       return !!this.control && !this.control.isClosed();
@@ -1190,6 +1202,10 @@ export class Rig {
         });
       }
       if (this.destroyed) return false;
+      // A publish/check can take ownership while the asynchronous DOM probe above
+      // is in flight. Discard that stale look rather than applying uploader
+      // navigation as a logout after `driving` became true.
+      if (this.driving || this.sessionMutation) return this.store.rig(this.platform).loggedIn;
       const rig = this.store.rig(this.platform);
       const prev = rig.loggedIn;
       if (logged) {
@@ -1520,6 +1536,16 @@ export class Rig {
    */
   exec(cmd: RemoteCmd): Promise<void> {
     if (this.destroyed) return Promise.reject(new Error("This account runtime was deleted"));
+    if (cmd.t === "check-upload" && this.uploadAccessPending) {
+      this.broadcast({
+        type: "log",
+        level: "info",
+        text: "Upload access is already being checked — ignored the repeated request.",
+        at: Date.now(),
+      });
+      return Promise.resolve();
+    }
+    if (cmd.t === "check-upload") this.uploadAccessPending = true;
     const last = this.cmdQueue[this.cmdQueue.length - 1];
     if (cmd.t === "scroll" && last && last.cmd.t === "scroll") {
       last.cmd.dy += cmd.dy; // merge into the queued scroll
@@ -1531,6 +1557,7 @@ export class Rig {
       void this.drain();
     }).finally(() => {
       this.pendingCmds -= 1;
+      if (cmd.t === "check-upload") this.uploadAccessPending = false;
     });
   }
 
@@ -1601,22 +1628,37 @@ export class Rig {
         await page.goto(cmd.url, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
         return;
       case "check-upload": {
-        // Ten seconds of truth instead of a 40-second publish that ends in a log
-        // line: does the site let this session upload at all?
-        const r = await checkUploadAccess(this.platform, page, (t) => this.status(t));
-        this.broadcast({
-          type: "log",
-          level: r.ok ? "ok" : "warn",
-          text: `${r.ok ? "✅" : "⚠️"} Upload access: ${r.verdict}`,
-          at: Date.now(),
-        });
-        this.broadcast({
-          type: "toast",
-          text: r.ok
-            ? "This session can post — the studio opened and took the file picker"
-            : "TikTok/site is not letting this session post — see the log",
-          tone: r.ok ? "ok" : "warn",
-        });
+        // This probe navigates the visible tab through Studio. Treat it as worker
+        // driving so a half-loaded /upload page cannot be mistaken for logout.
+        // Repeated presses are coalesced in exec(), above.
+        if (this.driving) {
+          this.broadcast({
+            type: "log",
+            level: "info",
+            text: "Upload access check skipped — a publish is already driving this browser tab.",
+            at: Date.now(),
+          });
+          return;
+        }
+        this.driving = true;
+        try {
+          const r = await checkUploadAccess(this.platform, page, (t) => this.status(t));
+          this.broadcast({
+            type: "log",
+            level: r.ok ? "ok" : "warn",
+            text: `${r.ok ? "✅" : "⚠️"} Upload access: ${r.verdict}`,
+            at: Date.now(),
+          });
+          this.broadcast({
+            type: "toast",
+            text: r.ok
+              ? "This session can post — the studio opened and took the file picker"
+              : "TikTok/site is not letting this session post — see the log",
+            tone: r.ok ? "ok" : "warn",
+          });
+        } finally {
+          this.driving = false;
+        }
         return;
       }
       case "click-label": {

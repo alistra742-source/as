@@ -132,14 +132,6 @@ export const stealth = {
   /** Idle drift: ambient cursor motion + occasional small scrolls on the
    * logged-in session so the account never looks parked. */
   idleDrift: process.env.STEALTH_IDLE_DRIFT !== "false",
-  /** Random up-to-N minutes added on top of the 1-post/hour slot so posts
-   * never land on a metronome beat. */
-  cadenceJitterMin: Math.max(0, Number(process.env.STEALTH_CADENCE_JITTER_MIN || 9)),
-  /** The engine waits a random 0-N minutes after arm/boot before its first
-   * action — a fresh process that instantly posts is a bot tell. */
-  bootDelayMaxMin: Math.max(0, Number(process.env.STEALTH_BOOT_DELAY_MAX_MIN || 8)),
-  /** Random 0-N extra minutes before a metrics read is considered "due". */
-  metricsJitterMin: Math.max(0, Number(process.env.STEALTH_METRICS_JITTER_MIN || 4)),
 } as const;
 
 /**
