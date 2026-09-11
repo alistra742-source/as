@@ -44,7 +44,7 @@ export type RemoteCmd =
    * message is added: the deck then tells the user the worker is behind instead
    * of pressing a button whose command the old worker swallows in silence.
    */
-export const PROTOCOL_VERSION = 11;
+export const PROTOCOL_VERSION = 12;
 
 export type ClientMsg =
   | { type: "auth"; token: string; proto: number }
