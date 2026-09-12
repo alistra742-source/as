@@ -15,6 +15,7 @@ test("frontend and worker protocol contracts remain exact mirrors", () => {
   assert.equal(withoutNow, frontend.trim());
   assert.match(frontend, /PROTOCOL_VERSION = 13/);
   assert.match(workerIndex, /build: BUILD_ID/);
+  assert.match(workerIndex, /Connected to worker build \$\{BUILD_ID\}/);
   assert.match(workerIndex, /protocol: PROTOCOL_VERSION/);
 });
 

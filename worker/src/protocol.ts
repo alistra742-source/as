@@ -117,7 +117,7 @@ export interface EngineSnapshot {
 }
 
 export type ServerMsg =
-  | { type: "ready"; sessionId: string; url: string; driver?: DriverInfo; proto?: number }
+  | { type: "ready"; sessionId: string; url: string; driver?: DriverInfo; proto?: number; build?: string }
   | { type: "frame"; data: string; at: number } // JPEG base64
   | { type: "nav"; url: string; title: string }
   | { type: "login"; loggedIn: boolean }

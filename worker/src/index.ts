@@ -511,6 +511,13 @@ wss.on("connection", (ws, req) => {
         url: START_URLS[platform],
         driver: driverInfo(),
         proto: PROTOCOL_VERSION,
+        build: BUILD_ID,
+      });
+      send(ws, {
+        type: "log",
+        level: "info",
+        text: `Connected to worker build ${BUILD_ID} (protocol v${PROTOCOL_VERSION}).`,
+        at: Date.now(),
       });
       send(ws, { type: "engine", state: engine.snapshot() });
       // The cookie panel must not lie after a reload: say what this profile holds.
