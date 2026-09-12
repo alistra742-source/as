@@ -2,6 +2,7 @@ import { HOUR_MS, type PlatformKey } from "./config.js";
 import {
   ENGINE_LOOP_TICK_MS,
   cadenceDurationMs,
+  discoveryRetryMs,
   initialEngineRunAt,
   latestConfirmedPostAt,
   metricsReadDue,
@@ -313,6 +314,14 @@ export class GrowthEngine {
       e.message = confirmedBoundary > resumedAt
         ? "Resumed after restart — preserving the exact confirmed +1h boundary."
         : "Resumed after restart — the full hour is complete, continuing Growth AI now.";
+    } else if (latest === null && e.lastRunAt !== null && !interruptedRequest) {
+      // A completed discovery with no confirmed post reserved no hourly slot.
+      // Retry immediately after a deploy so scraper repairs take effect now,
+      // rather than preserving an obsolete empty-result delay.
+      e.nextRunAt = initialEngineRunAt(resumedAt);
+      e.phase = "analyzing";
+      e.message = "Resumed after restart — no post was confirmed, so topic discovery is retrying now.";
+      changed = true;
     } else if ((!e.nextRunAt || (!e.lastRunAt && e.phase !== "error" && !interruptedRequest))) {
       // A legacy initial warm-up has no confirmed post and no completed pass. It
       // is safe—and required—to replace it with an immediate first cycle.
@@ -494,7 +503,7 @@ export class GrowthEngine {
     const niche = this.hitNiche && NICHE_CYCLE.includes(this.hitNiche) && !topic ? this.hitNiche : e.niche;
     const page = await this.rig.newEnginePage();
     try {
-      const candidates = await scrapeCandidates(page, e.likesFloor, this.platform, niche, topic);
+      const candidates = await scrapeCandidates(page, e.likesFloor, this.platform, niche, topic, (text) => this.log("info", text));
       if (!e.running) {
         e.phase = "paused";
         e.nextRunAt = null;
@@ -505,13 +514,19 @@ export class GrowthEngine {
       }
       if (candidates.length === 0) {
         const completedAt = now();
+        e.errorCount += 1;
+        const retryMs = discoveryRetryMs(e.errorCount);
+        const retryMinutes = Math.ceil(retryMs / 60_000);
         e.phase = "waiting";
         e.lastRunAt = completedAt;
-        e.nextRunAt = completedAt + cadenceDurationMs(e.cadenceHours);
+        e.nextRunAt = completedAt + retryMs;
         e.message = topic
-          ? `No relevant “${topic}” clips above the engagement floor found this pass — analyzing fresh results again in 1h.`
-          : "No faceless clips above the quality floor found this pass — analyzing fresh results again in 1h.";
-        this.log("warn", `Discovery found nothing ${topic ? `relevant to “${topic}” ` : ""}above the quality bar — nothing posted (quality first).`);
+          ? `No relevant “${topic}” clip cleared the engagement evidence this pass — retrying discovery in ${retryMinutes} min.`
+          : `No faceless clip cleared the quality evidence this pass — retrying discovery in ${retryMinutes} min.`;
+        this.log(
+          "warn",
+          `Discovery found nothing ${topic ? `relevant to “${topic}” ` : ""}above the quality bar — nothing posted; retrying in ${retryMinutes} min.`
+        );
         this.store.save();
         this.pushEngine();
         return;
@@ -565,11 +580,14 @@ export class GrowthEngine {
       }
       if (!best || !bestSourceVideo) {
         const completedAt = now();
+        e.errorCount += 1;
+        const retryMs = discoveryRetryMs(e.errorCount);
+        const retryMinutes = Math.ceil(retryMs / 60_000);
         e.phase = "waiting";
         e.lastRunAt = completedAt;
-        e.nextRunAt = completedAt + cadenceDurationMs(e.cadenceHours);
-        e.message = "Review passed nothing — quality bar held. Growth AI will analyze fresh results again in 1h.";
-        this.log("warn", "Groq review passed no candidates this cycle — nothing posted.");
+        e.nextRunAt = completedAt + retryMs;
+        e.message = `Review passed nothing — quality bar held. Growth AI retries fresh results in ${retryMinutes} min.`;
+        this.log("warn", `Review passed no candidate this cycle — nothing posted; retrying in ${retryMinutes} min.`);
         this.store.save();
         this.pushEngine();
         return;
@@ -740,7 +758,7 @@ export class GrowthEngine {
         | null = null;
       const rejected: string[] = [];
       try {
-        const candidates = await scrapeCandidates(page, e.likesFloor, this.platform, e.niche, topic);
+        const candidates = await scrapeCandidates(page, e.likesFloor, this.platform, e.niche, topic, (text) => this.log("info", text));
         if (!candidates.length) {
           throw new Error(
             `No relevant “${topic}” video exposed at least ${e.likesFloor.toLocaleString()} likes. Nothing was posted; try a broader spelling or lower the discovery floor.`

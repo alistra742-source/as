@@ -10,7 +10,7 @@ const scheduleJs = stripTypeScriptTypes(scheduleSource, { mode: "strip" })
 const HOUR_MS = 3_600_000;
 const schedule = new Function(
   "HOUR_MS",
-  `${scheduleJs}; return { ENGINE_LOOP_TICK_MS, initialEngineRunAt, cadenceDurationMs, nextConfirmedPostAt, metricsReadDue, latestConfirmedPostAt };`
+  `${scheduleJs}; return { ENGINE_LOOP_TICK_MS, DISCOVERY_RETRY_MAX_MS, discoveryRetryMs, initialEngineRunAt, cadenceDurationMs, nextConfirmedPostAt, metricsReadDue, latestConfirmedPostAt };`
 )(HOUR_MS);
 
 const engineSource = fs.readFileSync(new URL("../worker/src/engine.ts", import.meta.url), "utf8");
@@ -57,6 +57,7 @@ function lifecycle(at = 1_700_000_000_000, posts = []) {
     "HOUR_MS",
     "ENGINE_LOOP_TICK_MS",
     "cadenceDurationMs",
+    "discoveryRetryMs",
     "initialEngineRunAt",
     "latestConfirmedPostAt",
     "metricsReadDue",
@@ -68,6 +69,7 @@ function lifecycle(at = 1_700_000_000_000, posts = []) {
     HOUR_MS,
     schedule.ENGINE_LOOP_TICK_MS,
     schedule.cadenceDurationMs,
+    schedule.discoveryRetryMs,
     schedule.initialEngineRunAt,
     schedule.latestConfirmedPostAt,
     schedule.metricsReadDue,
@@ -124,6 +126,15 @@ test("boot migration removes legacy warm-up and cadence jitter", () => {
   assert.equal(first.rec.nextRunAt, at, "an unconfirmed legacy first pass resumes now");
   assert.deepEqual(first.cycleReasons, ["boot"]);
 
+  const empty = lifecycle(at);
+  empty.rec.running = true;
+  empty.rec.phase = "waiting";
+  empty.rec.lastRunAt = at - 30_000;
+  empty.rec.nextRunAt = at + HOUR_MS;
+  empty.engine.resumeFromBoot();
+  assert.equal(empty.rec.nextRunAt, at, "a completed empty search reserves no hourly slot and retries after deployment");
+  assert.match(empty.rec.message, /no post was confirmed.*retrying now/i);
+
   const postedAt = at - 20 * 60_000;
   const existing = lifecycle(at, [{ postedAt, checks: [] }]);
   existing.rec.running = true;
@@ -171,6 +182,13 @@ test("Stop is idempotent and says an in-flight exact publish continues", () => {
   assert.equal(engine.stop(), false);
   const pauses = broadcasts.filter((m) => m.type === "log" && /Engine paused/.test(m.text));
   assert.equal(pauses.length, 1, "repeated Stop requests must produce one authoritative pause log");
+});
+
+test("empty open-slot discoveries retry promptly without weakening confirmed hourly slots", () => {
+  assert.equal(schedule.discoveryRetryMs(1), 60_000);
+  assert.equal(schedule.discoveryRetryMs(2), 120_000);
+  assert.equal(schedule.discoveryRetryMs(99), schedule.DISCOVERY_RETRY_MAX_MS);
+  assert.equal(schedule.DISCOVERY_RETRY_MAX_MS, 5 * 60_000);
 });
 
 test("confirmed post slots are exact and never open a millisecond early", () => {

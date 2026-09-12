@@ -6,6 +6,13 @@ import { HOUR_MS } from "./config.js";
  * timestamp rather than from an interval tick or an analysis start.
  */
 export const ENGINE_LOOP_TICK_MS = 10_000;
+export const DISCOVERY_RETRY_MAX_MS = 5 * 60_000;
+
+/** Before the first confirmed post, transient empty/rejected searches retry soon. */
+export function discoveryRetryMs(failedPasses: number): number {
+  const attempts = Number.isFinite(failedPasses) ? Math.max(1, Math.floor(failedPasses)) : 1;
+  return Math.min(DISCOVERY_RETRY_MAX_MS, attempts * 60_000);
+}
 
 export function initialEngineRunAt(startedAt: number): number {
   return startedAt;

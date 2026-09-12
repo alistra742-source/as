@@ -7,11 +7,13 @@ the engine keep the account growing on your rules:
   (YouTube publishes as **Public** — its “Everyone”).
 - After each post, the engine reads views/likes/comments every hour. Crossing **3,000 views in
   the first hour** flips it into *double-down* mode and it posts **similar** content.
-- No link? Enter **What to upload about** (for example `donut smp` or `drdonutt`). The selected
-  named account searches that exact topic on its platform (with a YouTube Shorts fallback when a TikTok/Instagram result surface is blocked), enforces the
-  50K-like engagement floor, downloads likely picks, rejects sub-720p-class or detected-watermark
-  footage, and publishes with a fresh caption inspired by the selected source title. The topic is
-  persisted per account and also drives its hourly engine.
+- Enter **What to upload about** (for example `donut smp` or `drdonutt`) and Start Growth AI. The
+  selected named account searches that exact topic; a handle-shaped topic also checks its direct creator
+  profile before broader platform results, with YouTube Shorts as a cross-source fallback. Visible post
+  counters, metadata, and current hydration data all enforce the 50K-like engagement floor. Likely picks
+  are downloaded, rejected when sub-720p-class or watermarked, and published with a fresh caption inspired
+  by the selected source title. Empty/rejected open-slot searches retry promptly (1–5 minutes); only a
+  confirmed destination post starts the full hourly wait.
 - Leave the custom topic blank to cycle: **faceless stories · scary stories · fun facts**.
 - Every platform opens to an **account switchboard**. Press **+**, name the account, then open its
   tile; each tile has its own persistent browser profile, login, engine, composer, posts, log, and
@@ -47,7 +49,8 @@ The product cadence is deterministic while the browser interaction remains human
   topic immediately; it never consumes a URL waiting in the separate manual composer. A destination
   success receipt starts a full one-hour wait; only when that boundary finishes does Growth AI read
   fresh metrics/content and begin the next publish. Reads and posts never move in front of the
-  confirmed boundary.
+  confirmed boundary. A still-open protocol-v12 tab is accepted in a narrow growth-only mode: its
+  obsolete composer command is refused while the following Start safely launches topic discovery.
 - **Human interaction timing** — page reading, review, pointer movement, caption entry and the final
   account-action pause still use bounded human timing; they may finish after a slot opens but never
   make a later slot open early.
@@ -272,7 +275,7 @@ Demo mode never touches the network. The banner above the browser says SIMULATED
 > (`Tapped "Email" — the pointer press was ignored, the DOM click worked`), because "it worked, but not the
 > way you asked" is the answer a remote control owes you.
 >
-> **Protocol version.** `PROTOCOL_VERSION` (11: persisted request acknowledgements/status recovery + per-account custom-topic discovery; 10: OAuth and initial manual receipt correlation; 9: isolated
+> **Protocol version.** `PROTOCOL_VERSION` (13: automatic Growth Start/manual-composer separation; 12: publish-safe capability probes and browser recovery; 11: persisted request acknowledgements/status recovery + per-account custom-topic discovery; 10: OAuth and initial manual receipt correlation; 9: isolated
 > named-account scope; 8: Playwright/Clearcote engine identity; 6: a failed publish answers;
 > 5: cookie login; 4: label taps and the DOM escalation) travels
 > on `auth` and comes back on `ready`, so a deck newer than the worker warns on connect and an unknown

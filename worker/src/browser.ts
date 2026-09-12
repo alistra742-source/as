@@ -17,8 +17,17 @@ import {
   type TikTokLoginEvidence,
 } from "./tiktokLogin.js";
 import { accountTorProxy } from "./torProxy.js";
-import { cleanDiscoveryTopic, discoverySearchUrl, isTopicMatch, rankDiscoveryCandidates, topicRelevance } from "./discovery.js";
+import {
+  cleanDiscoveryTopic,
+  directTopicProfileUrl,
+  discoverySearchUrl,
+  isTopicMatch,
+  rankDiscoveryCandidates,
+  topicRelevance,
+  topicSearchAliases,
+} from "./discovery.js";
 import { ensureHumanized, humanizeContext, isHumanized } from "./humanizeAttach.js";
+import { publicVideoStats } from "./videoStats.js";
 import {
   CONTAINER_VIEWPORT_RATIO,
   INTERACTIVE_SEL,
@@ -1888,44 +1897,64 @@ export async function scrapeCandidates(
   likesFloor: number,
   platform: "tiktok" | "instagram" | "youtube" = "tiktok",
   niche: string = "stories",
-  rawTopic: string = ""
+  rawTopic: string = "",
+  log: (text: string) => void = () => undefined
 ): Promise<Candidate[]> {
   const topic = cleanDiscoveryTopic(rawTopic);
   if (platform === "youtube") return scrapeYouTubeCandidates(page, likesFloor, niche, topic);
-  const url = topic
+  const searchUrl = topic
     ? discoverySearchUrl(platform, topic)
     : platform === "tiktok"
       ? "https://www.tiktok.com/foryou"
       : "https://www.instagram.com/reels/";
-  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
-  await sleep(4000);
+  const collectSurface = async (url: string) => {
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
+    await sleep(4000);
 
-  // A human watches the result surface before harvesting it: small scrolls with
-  // reading pauses make lazy-loaded search cards appear without a broad crawl.
-  await page.mouse.wheel(0, Math.round(jitter(300, 700)));
-  await readingPause(500, 1600);
-  await page.mouse.wheel(0, Math.round(jitter(400, 900)));
-  await readingPause(700, 2200);
+    // A human watches the result surface before harvesting it: small scrolls with
+    // reading pauses make lazy-loaded search/profile cards appear without a crawl.
+    await page.mouse.wheel(0, Math.round(jitter(300, 700)));
+    await readingPause(500, 1600);
+    await page.mouse.wheel(0, Math.round(jitter(400, 900)));
+    await readingPause(700, 2200);
 
-  const items = await page.evaluate(() => {
-    const out: { url: string; label: string }[] = [];
-    const hrefs = new Set<string>();
-    const els = document.querySelectorAll("a[href*='/video/'], a[href*='/reel/']");
-    for (const a of els) {
-      const href = (a as HTMLAnchorElement).href.split("?")[0];
-      if (hrefs.has(href)) continue;
-      hrefs.add(href);
-      const card = a.closest("article") || a.parentElement?.parentElement || a;
-      const label = [a.getAttribute("aria-label"), a.getAttribute("title"), card.textContent]
-        .filter(Boolean)
-        .join(" ")
-        .replace(/\s+/g, " ")
-        .trim();
-      out.push({ url: href, label: label.slice(0, 600) });
-      if (out.length >= 40) break;
-    }
-    return out;
-  });
+    return page.evaluate(() => {
+      const out: { url: string; label: string }[] = [];
+      const hrefs = new Set<string>();
+      const els = document.querySelectorAll("a[href*='/video/'], a[href*='/reel/']");
+      for (const a of els) {
+        const href = (a as HTMLAnchorElement).href.split("?")[0];
+        if (hrefs.has(href)) continue;
+        hrefs.add(href);
+        const card = a.closest("article, [data-e2e='user-post-item'], [role='listitem']") || a.parentElement?.parentElement || a;
+        const label = [a.getAttribute("aria-label"), a.getAttribute("title"), card.textContent]
+          .filter(Boolean)
+          .join(" ")
+          .replace(/\s+/g, " ")
+          .trim();
+        out.push({ url: href, label: label.slice(0, 600) });
+        if (out.length >= 40) break;
+      }
+      return out;
+    });
+  };
+
+  // A topic such as `drdonutt` is also a creator handle. Search pages are often
+  // client-rendered or challenge-gated in datacenter Chromium, while the signed-in
+  // creator profile still exposes stable /video/ anchors. Profile results come
+  // first so exact creator clips are inspected before looser keyword matches.
+  const profileUrl = topic ? directTopicProfileUrl(platform, topic) : null;
+  const profileItems = profileUrl ? await collectSurface(profileUrl) : [];
+  const searchItems = profileUrl === searchUrl || profileItems.length >= 10 ? [] : await collectSurface(searchUrl);
+  const items = [...profileItems, ...searchItems].filter(
+    (item, index, all) => all.findIndex((other) => other.url === item.url) === index
+  );
+  if (topic) {
+    log(
+      `Discovery surfaces for “${topic}”: ${profileItems.length} direct-profile link${profileItems.length === 1 ? "" : "s"}` +
+        `${searchItems.length ? ` + ${searchItems.length} search-result link${searchItems.length === 1 ? "" : "s"}` : ""}.`
+    );
+  }
 
   const ordered = topic
     ? items
@@ -1936,7 +1965,11 @@ export async function scrapeCandidates(
         .map(({ item }) => item)
     : items;
   const candidates: Candidate[] = [];
+  let inspected = 0;
+  let readableLikes = 0;
+  let aboveFloor = 0;
   for (const it of ordered.slice(0, topic ? 10 : 40)) {
+    inspected += 1;
     let title = it.label.slice(0, 160) || "Untitled clip";
     let likes = parseCount(it.label.match(/([\d.,]+[KMB]?)\s*likes?/i)?.[1]);
     let views = parseCount(it.label.match(/([\d.,]+[KMB]?)\s*views?/i)?.[1]);
@@ -1950,12 +1983,17 @@ export async function scrapeCandidates(
       comments = stats.comments ?? comments;
       const detail = await page
         .evaluate(() => {
-          const meta = document.querySelector('meta[property="og:description"], meta[name="description"]');
-          return (meta?.getAttribute("content") || document.title || "").replace(/\s+/g, " ").trim();
+          const title = document.querySelector('meta[property="og:title"]')?.getAttribute("content");
+          const description = document
+            .querySelector('meta[property="og:description"], meta[name="description"]')
+            ?.getAttribute("content");
+          return (title || description || document.title || "").replace(/\s+/g, " ").trim();
         })
         .catch(() => "");
       if (detail) title = detail.slice(0, 160);
     }
+    if (likes !== null) readableLikes += 1;
+    if (likes !== null && likes >= likesFloor) aboveFloor += 1;
     if (likes && likes >= likesFloor && (!topic || isTopicMatch(topic, title, it.url))) {
       candidates.push({
         url: it.url,
@@ -1965,7 +2003,15 @@ export async function scrapeCandidates(
         comments: comments ?? 0,
         commentSample: "",
       });
+      if (candidates.length >= 4) break;
     }
+  }
+  if (topic) {
+    log(
+      `Inspected ${inspected} “${topic}” link${inspected === 1 ? "" : "s"}: ` +
+        `${readableLikes} exposed like counts, ${aboveFloor} met the ${likesFloor.toLocaleString()}+ floor, ` +
+        `${candidates.length} also passed exact relevance.`
+    );
   }
   const ranked = rankDiscoveryCandidates(candidates, topic).slice(0, 12);
   // Instagram/TikTok search markup can be unavailable even to a signed-in
@@ -1974,6 +2020,7 @@ export async function scrapeCandidates(
   // an unrelated personalized feed.
   if (topic && ranked.length < 4) {
     const youtube = await scrapeYouTubeCandidates(page, likesFloor, niche, topic);
+    log(`Cross-source YouTube Shorts fallback added ${youtube.length} quality-approved “${topic}” result${youtube.length === 1 ? "" : "s"}.`);
     return rankDiscoveryCandidates([...ranked, ...youtube], topic).slice(0, 12);
   }
   return ranked;
@@ -1989,7 +2036,9 @@ async function scrapeYouTubeCandidates(
   niche: string,
   topic = ""
 ): Promise<Candidate[]> {
-  const queries = topic ? [topic, `${topic} shorts`] : YT_SEARCH_QUERIES[niche] ?? YT_SEARCH_QUERIES.stories;
+  const queries = topic
+    ? Array.from(new Set(topicSearchAliases(topic).flatMap((alias) => [alias, `${alias} shorts`])))
+    : YT_SEARCH_QUERIES[niche] ?? YT_SEARCH_QUERIES.stories;
   let hrefs: string[] = [];
   for (const query of queries) {
     await page
@@ -2078,7 +2127,6 @@ export interface VideoStats {
   comments: number | null;
 }
 
-/** Parse view/like/comment stats from a published video page. */
 export async function readVideoStats(page: Page, url: string): Promise<VideoStats> {
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => undefined);
@@ -2086,6 +2134,74 @@ export async function readVideoStats(page: Page, url: string): Promise<VideoStat
   } catch {
     return { views: null, likes: null, comments: null };
   }
+
+  if (!new URL(page.url()).hostname.endsWith("youtube.com")) {
+    try {
+      const evidence = await page.evaluate(() => {
+        const texts = (selectors: string[]) => {
+          const values: string[] = [];
+          const seen = new Set<Element>();
+          for (const selector of selectors) {
+            for (const element of Array.from(document.querySelectorAll(selector))) {
+              if (seen.has(element)) continue;
+              seen.add(element);
+              const value = [element.getAttribute("aria-label"), element.getAttribute("title"), element.textContent]
+                .filter(Boolean)
+                .join(" ")
+                .replace(/\s+/g, " ")
+                .trim();
+              if (value) values.push(value.slice(0, 240));
+            }
+          }
+          return values;
+        };
+        const jsonTexts: string[] = [];
+        for (const script of Array.from(document.scripts)) {
+          const text = script.textContent || "";
+          if (!/(?:diggCount|playCount|commentCount|likeCount|video_view_count|aweme_id)/.test(text)) continue;
+          if (text.length > 2_500_000) continue;
+          jsonTexts.push(text);
+          if (jsonTexts.length >= 8) break;
+        }
+        return {
+          videoId: location.pathname.match(/\/(?:video|reel|p)\/([a-z0-9_-]+)/i)?.[1] || "",
+          descriptions: Array.from(
+            document.querySelectorAll('meta[property="og:description"], meta[name="description"], meta[property="og:title"]')
+          )
+            .map((meta) => meta.getAttribute("content") || "")
+            .filter(Boolean)
+            .slice(0, 6),
+          bodyText: (document.body?.innerText || "").slice(0, 20_000),
+          likeTexts: texts([
+            '[data-e2e="like-count"]',
+            '[data-e2e="browse-like-count"]',
+            '[data-testid="like-count"]',
+            '[aria-label*=" likes" i]',
+            'button[aria-label*="like" i]',
+          ]),
+          viewTexts: texts([
+            '[data-e2e="video-views"]',
+            '[data-e2e="browse-video-views"]',
+            '[data-e2e="view-count"]',
+            '[aria-label*=" views" i]',
+            '[aria-label*=" plays" i]',
+          ]),
+          commentTexts: texts([
+            '[data-e2e="comment-count"]',
+            '[data-e2e="browse-comment-count"]',
+            '[data-testid="comment-count"]',
+            '[aria-label*=" comments" i]',
+            'button[aria-label*="comment" i]',
+          ]),
+          jsonTexts,
+        };
+      });
+      return publicVideoStats(evidence);
+    } catch {
+      return { views: null, likes: null, comments: null };
+    }
+  }
+
   try {
     return await page.evaluate(() => {
       const cnt = (s: string | null | undefined): number | null => {
@@ -2096,75 +2212,44 @@ export async function readVideoStats(page: Page, url: string): Promise<VideoStat
         const mult = m[2]?.toUpperCase() === "K" ? 1e3 : m[2]?.toUpperCase() === "M" ? 1e6 : m[2]?.toUpperCase() === "B" ? 1e9 : 1;
         return Math.round(n * mult);
       };
-      if (location.hostname.endsWith("youtube.com")) {
-        const yt = { views: null as number | null, likes: null as number | null, comments: null as number | null };
-        for (const s of Array.from(document.querySelectorAll('script[type="application/ld+json"]'))) {
-          try {
-            const data = JSON.parse(s.textContent || "{}") as {
-              interactionStatistic?: { userInteractionCount?: unknown; interactionType?: { type?: string } }[];
-              commentCount?: unknown;
-            };
-            for (const i of data.interactionStatistic ?? []) {
-              const n = Number(i.userInteractionCount);
-              if (!Number.isFinite(n)) continue;
-              const t = String(i.interactionType?.type ?? "").toLowerCase();
-              if (t.includes("watch") || t.includes("view")) yt.views = n;
-            }
-            const cc = Number(data.commentCount);
-            if (Number.isFinite(cc) && cc > 0) yt.comments = cc;
-          } catch {
-            /* continue */
-          }
-        }
-        for (const btn of Array.from(document.querySelectorAll("button[aria-label]"))) {
-          const label = btn.getAttribute("aria-label") || "";
-          const m = label.match(/like this video along with\s*([\d.,]+\s*[KMB]?)/i);
-          if (m) {
-            yt.likes = cnt(m[1]);
-            break;
-          }
-        }
-        if (yt.views == null) {
-          const el = document.querySelector(
-            ".view-count, ytd-watch-metadata #count yt-formatted-string, ytd-video-primary-info-renderer #count"
-          );
-          if (el) yt.views = cnt((el.textContent || "").match(/([\d.,]+\s*[KMB]?)/)?.[1]);
-        }
-        if (yt.comments == null) {
-          const hdr = document.querySelector("ytd-comments-header-renderer #count, #comments-header #count");
-          if (hdr) yt.comments = cnt((hdr.textContent || "").replace(/[^\d.,KMB]/g, ""));
-        }
-        return yt;
-      }
-      const pick = { views: null as number | null, likes: null as number | null, comments: null as number | null };
+      const yt = { views: null as number | null, likes: null as number | null, comments: null as number | null };
       for (const s of Array.from(document.querySelectorAll('script[type="application/ld+json"]'))) {
         try {
-          const data = JSON.parse(s.textContent || "{}") as { interactionStatistic?: unknown };
-          const st = data.interactionStatistic;
-          if (Array.isArray(st)) {
-            for (const i of st as { userInteractionCount?: unknown; interactionType?: unknown }[]) {
-              const n = Number(i.userInteractionCount);
-              if (!Number.isFinite(n)) continue;
-              const t = String(
-                (i.interactionType as { type?: string } | undefined)?.type || i.interactionType || ""
-              ).toLowerCase();
-              if (t.includes("watch") || t.includes("view")) pick.views = n;
-              else if (t.includes("like")) pick.likes = n;
-              else if (t.includes("comment")) pick.comments = n;
-            }
+          const data = JSON.parse(s.textContent || "{}") as {
+            interactionStatistic?: { userInteractionCount?: unknown; interactionType?: { type?: string } }[];
+            commentCount?: unknown;
+          };
+          for (const i of data.interactionStatistic ?? []) {
+            const n = Number(i.userInteractionCount);
+            if (!Number.isFinite(n)) continue;
+            const t = String(i.interactionType?.type ?? "").toLowerCase();
+            if (t.includes("watch") || t.includes("view")) yt.views = n;
           }
+          const cc = Number(data.commentCount);
+          if (Number.isFinite(cc) && cc > 0) yt.comments = cc;
         } catch {
           /* continue */
         }
       }
-      const body = document.body?.innerText?.slice(0, 3000) ?? "";
-      const likes = body.match(/([\d.,]+[KMB]?)\s*likes?/i);
-      const views = body.match(/([\d.,]+[KMB]?)\s*views?/i);
-      const comments = body.match(/([\d.,]+[KMB]?)\s*comments?/i);
-      if (pick.views == null && views) pick.views = cnt(views[1]);
-      if (pick.likes == null && likes) pick.likes = cnt(likes[1]);
-      if (pick.comments == null && comments) pick.comments = cnt(comments[1]);
-      return pick;
+      for (const btn of Array.from(document.querySelectorAll("button[aria-label]"))) {
+        const label = btn.getAttribute("aria-label") || "";
+        const m = label.match(/like this video along with\s*([\d.,]+\s*[KMB]?)/i);
+        if (m) {
+          yt.likes = cnt(m[1]);
+          break;
+        }
+      }
+      if (yt.views == null) {
+        const el = document.querySelector(
+          ".view-count, ytd-watch-metadata #count yt-formatted-string, ytd-video-primary-info-renderer #count"
+        );
+        if (el) yt.views = cnt((el.textContent || "").match(/([\d.,]+\s*[KMB]?)/)?.[1]);
+      }
+      if (yt.comments == null) {
+        const hdr = document.querySelector("ytd-comments-header-renderer #count, #comments-header #count");
+        if (hdr) yt.comments = cnt((hdr.textContent || "").replace(/[^\d.,KMB]/g, ""));
+      }
+      return yt;
     });
   } catch {
     return { views: null, likes: null, comments: null };

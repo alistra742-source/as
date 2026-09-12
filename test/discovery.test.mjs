@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   cleanDiscoveryTopic,
+  directTopicProfileUrl,
   discoverySearchUrl,
   fallbackSourceCaption,
   isTopicMatch,
@@ -9,6 +10,7 @@ import {
   rankDiscoveryCandidates,
   sharesWordRun,
   topicRelevance,
+  topicSearchAliases,
 } from "../worker/src/discovery.ts";
 
 const candidate = (title, likes, url = `https://video.test/${encodeURIComponent(title)}`) => ({
@@ -39,6 +41,15 @@ test("exact handles and multi-word topics rank by relevance before popularity", 
     "donut smp"
   );
   assert.deepEqual(ranked.map((item) => item.title), ["Donut SMP escape"]);
+});
+
+test("drdonutt searches the direct creator profile and accepts the DrDonut display-name spelling", () => {
+  assert.equal(directTopicProfileUrl("tiktok", "drdonutt"), "https://www.tiktok.com/@drdonutt");
+  assert.equal(directTopicProfileUrl("youtube", "@drdonutt"), "https://www.youtube.com/@drdonutt/shorts");
+  assert.equal(directTopicProfileUrl("tiktok", "donut smp"), null);
+  assert.deepEqual(topicSearchAliases("drdonutt"), ["drdonutt", "drdonut"]);
+  assert.equal(isTopicMatch("drdonutt", "DrDonut finds a rare Minecraft base"), true);
+  assert.equal(topicRelevance("drdonutt", "DrDonut finds a rare Minecraft base"), 1);
 });
 
 test("metadata watermark indicators are rejected without treating a creator handle itself as a watermark", () => {

@@ -26,16 +26,39 @@ function searchable(value: string): string {
     .trim();
 }
 
+/** A one-token topic may be a creator handle; direct profiles survive brittle search markup. */
+export function directTopicProfileUrl(
+  platform: "tiktok" | "instagram" | "youtube",
+  rawTopic: string
+): string | null {
+  const handle = cleanDiscoveryTopic(rawTopic).replace(/^@/, "");
+  if (!/^[a-z0-9._]{2,30}$/i.test(handle)) return null;
+  if (platform === "tiktok") return `https://www.tiktok.com/@${handle}`;
+  if (platform === "instagram") return `https://www.instagram.com/${handle}/`;
+  return `https://www.youtube.com/@${handle}/shorts`;
+}
+
+/** Display names often drop a handle's duplicated final letter (`drdonutt` → `DrDonut`). */
+export function topicSearchAliases(topic: string): string[] {
+  const wanted = searchable(cleanDiscoveryTopic(topic));
+  if (!wanted) return [];
+  const aliases = [wanted];
+  if (!wanted.includes(" ") && wanted.length >= 6 && wanted.at(-1) === wanted.at(-2)) aliases.push(wanted.slice(0, -1));
+  return aliases;
+}
+
 /**
  * 0..1 lexical relevance. Handles are treated as one exact token (`drdonutt`),
  * while phrases such as `donut smp` require all meaningful words to score well.
  */
 export function topicRelevance(topic: string, ...evidence: string[]): number {
-  const wanted = searchable(cleanDiscoveryTopic(topic));
+  const aliases = topicSearchAliases(topic);
+  const wanted = aliases[0] ?? "";
   if (!wanted) return 1;
   const text = searchable(evidence.join(" "));
   if (!text) return 0;
   if (text.includes(wanted)) return 1;
+  if (aliases.slice(1).some((alias) => text.includes(alias))) return 1;
   const tokens = Array.from(new Set(wanted.split(" ").filter((token) => token.length > 1)));
   if (!tokens.length) return 0;
   const matched = tokens.filter((token) => text.split(" ").some((word) => word === token || word.includes(token))).length;

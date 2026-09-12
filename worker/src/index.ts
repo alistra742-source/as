@@ -14,6 +14,7 @@ import {
 import { BLOCKED_HOSTS, resolverRules } from "./browserLaunch.js";
 import { closeAccountTorProxy, torHealth, warmTor } from "./torProxy.js";
 import { PROTOCOL_VERSION, type ClientMsg, type ServerMsg } from "./protocol.js";
+import { protocolAccess, type ProtocolAccess } from "./protocolGate.js";
 import { Store } from "./store.js";
 import { Rig, browserPreflight } from "./browser.js";
 import { GrowthEngine } from "./engine.js";
@@ -449,6 +450,8 @@ wss.on("connection", (ws, req) => {
   // until the socket proves it knows the worker token.
   let runtime: AccountRuntime | null = null;
   let authed = false;
+  let clientProtocol = 0;
+  let protocolAccessMode: ProtocolAccess = "reject";
   const authTimer = setTimeout(() => ws.close(1008, "Authentication timed out"), 10_000);
   authTimer.unref?.();
 
@@ -467,15 +470,16 @@ wss.on("connection", (ws, req) => {
         ws.close();
         return;
       }
-      if (msg.proto !== PROTOCOL_VERSION) {
-        const deckVersion = typeof msg.proto === "number" ? msg.proto : 0;
+      clientProtocol = typeof msg.proto === "number" ? msg.proto : 0;
+      protocolAccessMode = protocolAccess(clientProtocol, PROTOCOL_VERSION);
+      if (protocolAccessMode === "reject") {
         const message =
-          deckVersion < PROTOCOL_VERSION
-            ? `This deck tab is outdated (protocol v${deckVersion || "unknown"}; worker v${PROTOCOL_VERSION}). Hard-refresh the page before publishing.`
-            : `This worker is outdated (deck protocol v${deckVersion}; worker v${PROTOCOL_VERSION}). Redeploy the service before publishing.`;
+          clientProtocol < PROTOCOL_VERSION
+            ? `This deck tab is outdated (protocol v${clientProtocol || "unknown"}; worker v${PROTOCOL_VERSION}). Reopen the page before publishing.`
+            : `This worker is outdated (deck protocol v${clientProtocol}; worker v${PROTOCOL_VERSION}). Redeploy the service before publishing.`;
         console.warn(`[worker] ${message}`);
         send(ws, { type: "error", message });
-        ws.close(1002, "Protocol mismatch — reload or redeploy");
+        ws.close(1002, "Protocol mismatch — reopen or redeploy");
         return;
       }
       authed = true;
@@ -503,6 +507,13 @@ wss.on("connection", (ws, req) => {
       send(ws, { type: "engine", state: engine.snapshot() });
       // The cookie panel must not lie after a reload: say what this profile holds.
       send(ws, { type: "cookie-state", ...rig.cookieState() });
+      if (protocolAccessMode === "growth-only") {
+        const text =
+          `Safe compatibility mode for deck v${clientProtocol}: Growth Start works and searches the configured topic; ` +
+          "manual composer publishes are blocked until the page is reopened.";
+        console.warn(`[worker] ${text}`);
+        send(ws, { type: "toast", text, tone: "info" });
+      }
       // Browser-start failures are logged to the console AND the client so the
       // reason is always visible in the deploy log and the deck.
       void rig.openControlSession().catch((e) => {
@@ -517,6 +528,17 @@ wss.on("connection", (ws, req) => {
       return;
     }
     const { rig, engine } = runtime;
+    const rejectGrowthOnlyComposer = (requestId: string) => {
+      const topic = engine.snapshot().topic.trim();
+      const message =
+        `The old tab's composer command was ignored safely. ` +
+        (topic
+          ? `Its Growth Start command will search “${topic}” automatically. `
+          : "Its Growth Start command will run automatic discovery. ") +
+        "Reopen the page before using manual publishing.";
+      send(ws, { type: "post-failed", message, requestId });
+      send(ws, { type: "toast", text: message, tone: "info" });
+    };
     switch (msg.type) {
       case "cmd":
         if (msg.cmd.t === "check-upload" && (engine.snapshot().running || engine.isBusy())) {
@@ -570,6 +592,10 @@ wss.on("connection", (ws, req) => {
           send(ws, { type: "post-failed", message: "The topic discovery request was malformed; nothing was uploaded.", requestId });
           return;
         }
+        if (protocolAccessMode === "growth-only") {
+          rejectGrowthOnlyComposer(requestId);
+          return;
+        }
         void engine.manualDiscoverPost(msg.topic, msg.caption, requestId).catch((error) => {
           send(ws, {
             type: "post-failed",
@@ -592,6 +618,10 @@ wss.on("connection", (ws, req) => {
           !requestId
         ) {
           send(ws, { type: "post-failed", message: "The publish request was malformed; nothing was uploaded.", requestId });
+          return;
+        }
+        if (protocolAccessMode === "growth-only") {
+          rejectGrowthOnlyComposer(requestId);
           return;
         }
         void engine.manualPost(msg.url, msg.caption, requestId).catch((error) => {
