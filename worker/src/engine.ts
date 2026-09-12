@@ -503,7 +503,19 @@ export class GrowthEngine {
     const niche = this.hitNiche && NICHE_CYCLE.includes(this.hitNiche) && !topic ? this.hitNiche : e.niche;
     const page = await this.rig.newEnginePage();
     try {
-      const candidates = await scrapeCandidates(page, e.likesFloor, this.platform, niche, topic, (text) => this.log("info", text));
+      const usedSourceUrls = this.store
+        .posts(this.platform)
+        .map((post) => post.sourceUrl)
+        .filter((url): url is string => typeof url === "string" && url.length > 0);
+      const candidates = await scrapeCandidates(
+        page,
+        e.likesFloor,
+        this.platform,
+        niche,
+        topic,
+        (text) => this.log("info", text),
+        usedSourceUrls
+      );
       if (!e.running) {
         e.phase = "paused";
         e.nextRunAt = null;

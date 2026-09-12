@@ -4,21 +4,27 @@ import test from "node:test";
 import { publicVideoStats, structuredVideoStats } from "../worker/src/videoStats.ts";
 
 const browserSource = fs.readFileSync(new URL("../worker/src/browser.ts", import.meta.url), "utf8");
+const engineSource = fs.readFileSync(new URL("../worker/src/engine.ts", import.meta.url), "utf8");
 const profileSource = fs.readFileSync(new URL("../worker/src/tiktokProfile.ts", import.meta.url), "utf8");
 
 test("topic discovery combines direct creator profiles with current TikTok counter evidence", () => {
   const discovery = browserSource.slice(browserSource.indexOf("export async function scrapeCandidates"), browserSource.indexOf("async function scrapeYouTubeCandidates"));
   assert.match(discovery, /directTopicProfileUrl\(platform, topic\)/);
   assert.match(discovery, /tiktokProfileItemsPage/);
+  assert.match(discovery, /knownTikTokProfileItems\(topic\)/);
+  assert.match(discovery, /immediateKnownBatch = knownEligible\.length >= 4/);
+  assert.match(discovery, /profileUrl && !immediateKnownBatch/);
+  assert.match(discovery, /\.\.\.profileQualifying, \.\.\.knownProfileItems/);
   assert.match(profileSource, /hydratedItems/);
   assert.match(profileSource, /\/api\/post\/item_list\//);
   assert.match(profileSource, /secUid/);
   assert.match(profileSource, /stats\.diggCount/);
-  assert.match(discovery, /const items = \[\.\.\.profileItems, \.\.\.searchItems\]/);
 
   const stats = browserSource.slice(browserSource.indexOf("export async function readVideoStats"));
   assert.match(stats, /data-e2e="like-count"/);
   assert.match(stats, /publicVideoStats\(evidence\)/);
+  assert.match(discovery, /excludedSourceUrls/);
+  assert.match(engineSource, /usedSourceUrls = this\.store[\s\S]{0,80}\.posts\(this\.platform\)/);
 });
 
 test("TikTok visible counters satisfy the configured likes quality floor", () => {

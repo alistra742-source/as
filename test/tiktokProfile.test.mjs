@@ -6,7 +6,9 @@ import { stripTypeScriptTypes } from "node:module";
 
 const source = fs.readFileSync(new URL("../worker/src/tiktokProfile.ts", import.meta.url), "utf8");
 const js = stripTypeScriptTypes(source, { mode: "strip" });
-const { tiktokProfileItemsPage } = await import(`data:text/javascript;base64,${Buffer.from(js).toString("base64")}`);
+const { knownTikTokProfileItems, tiktokProfileItemsPage } = await import(
+  `data:text/javascript;base64,${Buffer.from(js).toString("base64")}`
+);
 
 async function collect(hydration, fetchImpl) {
   const text = JSON.stringify(hydration);
@@ -18,6 +20,16 @@ async function collect(hydration, fetchImpl) {
   const result = await vm.runInNewContext(`(${tiktokProfileItemsPage.toString()})("drdonutt")`, context);
   return JSON.parse(JSON.stringify(result));
 }
+
+test("drdonutt has bounded official-profile seeds above the 50K floor", () => {
+  const items = knownTikTokProfileItems("@DrDonutt");
+  assert.equal(items.length, 4);
+  assert.equal(new Set(items.map((item) => item.url)).size, items.length);
+  assert.ok(items.every((item) => /^https:\/\/www\.tiktok\.com\/@drdonutt\/video\/\d{19}$/.test(item.url)));
+  assert.ok(items.every((item) => (item.likes ?? 0) >= 50_000));
+  assert.ok(items.every((item) => item.label.toLowerCase().includes("drdonutt")));
+  assert.deepEqual(knownTikTokProfileItems("somebodyelse"), []);
+});
 
 test("profile hydration secUid drives a same-origin item_list request and maps exact counters", async () => {
   const requests = [];

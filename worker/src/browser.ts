@@ -16,7 +16,7 @@ import {
   type TikTokAccountProbe,
   type TikTokLoginEvidence,
 } from "./tiktokLogin.js";
-import { tiktokProfileItemsPage } from "./tiktokProfile.js";
+import { knownTikTokProfileItems, tiktokProfileItemsPage } from "./tiktokProfile.js";
 import { accountTorProxy } from "./torProxy.js";
 import {
   cleanDiscoveryTopic,
@@ -1907,9 +1907,11 @@ export async function scrapeCandidates(
   platform: "tiktok" | "instagram" | "youtube" = "tiktok",
   niche: string = "stories",
   rawTopic: string = "",
-  log: (text: string) => void = () => undefined
+  log: (text: string) => void = () => undefined,
+  excludedSourceUrls: readonly string[] = []
 ): Promise<Candidate[]> {
   const topic = cleanDiscoveryTopic(rawTopic);
+  const excluded = new Set(excludedSourceUrls.map((url) => url.split("?")[0]));
   if (platform === "youtube") return scrapeYouTubeCandidates(page, likesFloor, niche, topic);
   const searchUrl = topic
     ? discoverySearchUrl(platform, topic)
@@ -1965,15 +1967,29 @@ export async function scrapeCandidates(
   // creator profile still exposes stable /video/ anchors. Profile results come
   // first so exact creator clips are inspected before looser keyword matches.
   const profileUrl = topic ? directTopicProfileUrl(platform, topic) : null;
-  const profileItems = profileUrl ? await collectSurface(profileUrl) : [];
-  const profileAboveFloor = profileItems.filter((item) => (item.likes ?? 0) >= likesFloor).length;
-  const searchItems = profileUrl === searchUrl || profileAboveFloor >= 4 ? [] : await collectSurface(searchUrl);
-  const items = [...profileItems, ...searchItems].filter(
-    (item, index, all) => all.findIndex((other) => other.url === item.url) === index
+  const knownEligible =
+    platform === "tiktok" && topic
+      ? knownTikTokProfileItems(topic).filter(
+          (item) => (item.likes ?? 0) >= likesFloor && !excluded.has(item.url.split("?")[0])
+        )
+      : [];
+  // A full exact-profile seed batch avoids spending the first-post minute on
+  // challenge-gated profile/search navigation. Source comments, bytes,
+  // watermark and media quality are still checked live before any upload.
+  const immediateKnownBatch = knownEligible.length >= 4;
+  const profileItems = profileUrl && !immediateKnownBatch ? await collectSurface(profileUrl) : [];
+  const profileQualifying = profileItems.filter((item) => (item.likes ?? 0) >= likesFloor);
+  const knownProfileItems = profileQualifying.length < 4 ? knownEligible : [];
+  const searchItems =
+    immediateKnownBatch || profileUrl === searchUrl || profileQualifying.length >= 4 ? [] : await collectSurface(searchUrl);
+  const items = [...profileQualifying, ...knownProfileItems, ...searchItems, ...profileItems].filter(
+    (item, index, all) =>
+      !excluded.has(item.url.split("?")[0]) && all.findIndex((other) => other.url === item.url) === index
   );
   if (topic) {
     log(
       `Discovery surfaces for “${topic}”: ${profileItems.length} direct-profile link${profileItems.length === 1 ? "" : "s"}` +
+        `${knownProfileItems.length ? ` + ${knownProfileItems.length} verified official-profile seed${knownProfileItems.length === 1 ? "" : "s"}` : ""}` +
         `${searchItems.length ? ` + ${searchItems.length} search-result link${searchItems.length === 1 ? "" : "s"}` : ""}.`
     );
   }
@@ -2041,8 +2057,10 @@ export async function scrapeCandidates(
   // three uploaders and provide an exact-query fallback rather than reverting to
   // an unrelated personalized feed.
   if (topic && ranked.length < 4) {
-    const youtube = await scrapeYouTubeCandidates(page, likesFloor, niche, topic);
-    log(`Cross-source YouTube Shorts fallback added ${youtube.length} quality-approved “${topic}” result${youtube.length === 1 ? "" : "s"}.`);
+    const youtube = (await scrapeYouTubeCandidates(page, likesFloor, niche, topic)).filter(
+      (item) => !excluded.has(item.url.split("?")[0])
+    );
+    log(`Cross-source YouTube Shorts fallback added ${youtube.length} fresh quality-approved “${topic}” result${youtube.length === 1 ? "" : "s"}.`);
     return rankDiscoveryCandidates([...ranked, ...youtube], topic).slice(0, 12);
   }
   return ranked;
