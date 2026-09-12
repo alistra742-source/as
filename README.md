@@ -9,8 +9,8 @@ the engine keep the account growing on your rules:
   the first hour** flips it into *double-down* mode and it posts **similar** content.
 - Enter **What to upload about** (for example `donut smp` or `drdonutt`) and Start Growth AI. The
   selected named account searches that exact topic; a handle-shaped topic also checks its direct creator
-  profile before broader platform results, with YouTube Shorts as a cross-source fallback. Visible post
-  counters, metadata, and current hydration data all enforce the 50K-like engagement floor. Likely picks
+  profile and same-origin profile item list before broader platform results, with YouTube Shorts as a
+  cross-source fallback. Visible post counters, metadata, and current hydration data all enforce the 50K-like engagement floor. Likely picks
   are downloaded, rejected when sub-720p-class or watermarked, and published with a fresh caption inspired
   by the selected source title. Empty/rejected open-slot searches retry promptly (1–5 minutes); only a
   confirmed destination post starts the full hourly wait.

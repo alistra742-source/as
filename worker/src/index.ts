@@ -37,6 +37,7 @@ void warmTor().catch(() => undefined);
 
 /** Built frontend lives in dist/ at the repo root (single-service deploy). */
 const DIST = path.resolve("dist");
+const BUILD_ID = (process.env.RAILWAY_GIT_COMMIT_SHA || process.env.GIT_COMMIT_SHA || "local").slice(0, 12);
 
 const MIME: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -308,7 +309,14 @@ async function routeHttp(req: http.IncomingMessage, res: http.ServerResponse): P
     const tor = torHealth();
     if (tor.enabled && tor.state === "failed") void warmTor().catch(() => undefined);
     const ready = !tor.enabled || tor.state === "ready";
-    sendJson(res, ready ? 200 : 503, { ok: ready, platforms: PLATFORMS, uptime: process.uptime(), tor });
+    sendJson(res, ready ? 200 : 503, {
+      ok: ready,
+      build: BUILD_ID,
+      protocol: PROTOCOL_VERSION,
+      platforms: PLATFORMS,
+      uptime: process.uptime(),
+      tor,
+    });
     return;
   }
 

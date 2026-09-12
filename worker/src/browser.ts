@@ -1885,6 +1885,14 @@ export interface Candidate {
   commentSample: string;
 }
 
+interface DiscoverySurfaceItem {
+  url: string;
+  label: string;
+  likes?: number;
+  views?: number;
+  comments?: number;
+}
+
 const YT_SEARCH_QUERIES: Record<string, string[]> = {
   stories: ["faceless storytime shorts", "faceless stories shorts"],
   scary: ["scary creepy stories shorts", "scary stories shorts"],
@@ -1918,15 +1926,18 @@ export async function scrapeCandidates(
     await page.mouse.wheel(0, Math.round(jitter(400, 900)));
     await readingPause(700, 2200);
 
-    return page.evaluate(() => {
-      const out: { url: string; label: string }[] = [];
+    const rendered = await page.evaluate(() => {
+      const out: DiscoverySurfaceItem[] = [];
       const hrefs = new Set<string>();
       const els = document.querySelectorAll("a[href*='/video/'], a[href*='/reel/']");
       for (const a of els) {
         const href = (a as HTMLAnchorElement).href.split("?")[0];
         if (hrefs.has(href)) continue;
         hrefs.add(href);
-        const card = a.closest("article, [data-e2e='user-post-item'], [role='listitem']") || a.parentElement?.parentElement || a;
+        const card =
+          a.closest("[data-e2e='search_video-item-list'] > div, article, [data-e2e='user-post-item'], [role='listitem']") ||
+          a.parentElement?.parentElement ||
+          a;
         const label = [a.getAttribute("aria-label"), a.getAttribute("title"), card.textContent]
           .filter(Boolean)
           .join(" ")
@@ -1937,6 +1948,101 @@ export async function scrapeCandidates(
       }
       return out;
     });
+
+    const parsed = new URL(url);
+    if (platform !== "tiktok" || !/^\/@[^/]+\/?$/i.test(parsed.pathname)) return rendered;
+    const handle = decodeURIComponent(parsed.pathname.slice(2)).replace(/\/$/, "");
+    const structured = await page
+      .evaluate(async ({ expectedHandle }) => {
+        const scripts = Array.from(document.scripts)
+          .map((script) => script.textContent || "")
+          .filter((text) => text.includes("secUid") && text.length <= 5_000_000)
+          .slice(0, 8);
+        let secUid = "";
+        let visited = 0;
+        const hydratedItems: Record<string, unknown>[] = [];
+        const scan = (value: unknown, depth = 0): void => {
+          if (value === null || typeof value !== "object" || depth > 16 || visited > 60_000) return;
+          visited += 1;
+          if (Array.isArray(value)) {
+            for (const child of value) scan(child, depth + 1);
+            return;
+          }
+          const record = value as Record<string, unknown>;
+          const uniqueId = String(record.uniqueId ?? record.unique_id ?? "").replace(/^@/, "").toLowerCase();
+          if (!secUid && uniqueId === expectedHandle.toLowerCase() && typeof record.secUid === "string") secUid = record.secUid;
+          if (/^\d{10,30}$/.test(String(record.id ?? "")) && record.stats && typeof record.stats === "object") {
+            const stats = record.stats as Record<string, unknown>;
+            if (["diggCount", "digg_count", "playCount", "play_count", "commentCount", "comment_count"].some((key) => key in stats)) {
+              hydratedItems.push(record);
+            }
+          }
+          for (const child of Object.values(record)) scan(child, depth + 1);
+        };
+        for (const text of scripts) {
+          try {
+            scan(JSON.parse(text));
+          } catch {
+            /* another hydration script may contain the usable profile data */
+          }
+        }
+
+        const mapItems = (rawItems: unknown[]): DiscoverySurfaceItem[] => {
+          const results: DiscoverySurfaceItem[] = [];
+          for (const raw of rawItems) {
+            if (!raw || typeof raw !== "object") continue;
+            const item = raw as Record<string, unknown>;
+            const id = String(item.id ?? "");
+            if (!/^\d{10,30}$/.test(id)) continue;
+            const author = item.author && typeof item.author === "object" ? (item.author as Record<string, unknown>) : {};
+            const stats = item.stats && typeof item.stats === "object" ? (item.stats as Record<string, unknown>) : {};
+            const authorId = String(author.uniqueId ?? author.unique_id ?? expectedHandle).replace(/^@/, "");
+            if (authorId.toLowerCase() !== expectedHandle.toLowerCase()) continue;
+            const number = (value: unknown) => {
+              const parsed = Number(value);
+              return Number.isFinite(parsed) && parsed >= 0 ? Math.round(parsed) : undefined;
+            };
+            results.push({
+              url: `https://www.tiktok.com/@${authorId}/video/${id}`,
+              label: `@${authorId} ${String(item.desc ?? "TikTok video")}`.slice(0, 600),
+              likes: number(stats.diggCount ?? stats.digg_count),
+              views: number(stats.playCount ?? stats.play_count),
+              comments: number(stats.commentCount ?? stats.comment_count),
+            });
+            if (results.length >= 35) break;
+          }
+          return results;
+        };
+        const hydrated = mapItems(hydratedItems);
+        if (!secUid) return hydrated;
+
+        try {
+          const params = new URLSearchParams({
+            aid: "1988",
+            count: "35",
+            cursor: "0",
+            device_platform: "web_pc",
+            secUid,
+          });
+          const response = await fetch(`/api/post/item_list/?${params.toString()}`, {
+            credentials: "include",
+            headers: { accept: "application/json, text/plain, */*" },
+          });
+          if (!response.ok) return hydrated;
+          const data = (await response.json()) as { itemList?: unknown[] };
+          const apiItems = mapItems(data.itemList ?? []);
+          return [...apiItems, ...hydrated].filter(
+            (item, index, all) => all.findIndex((other) => other.url === item.url) === index
+          );
+        } catch {
+          return hydrated;
+        }
+      }, { expectedHandle: handle })
+      .catch(() => [] as DiscoverySurfaceItem[]);
+    const prioritized = [...structured].sort((a, b) => (b.likes ?? 0) - (a.likes ?? 0));
+    return [...prioritized, ...rendered].filter(
+      (item, index, all) => all.findIndex((other) => other.url === item.url) === index
+    );
   };
 
   // A topic such as `drdonutt` is also a creator handle. Search pages are often
@@ -1945,7 +2051,8 @@ export async function scrapeCandidates(
   // first so exact creator clips are inspected before looser keyword matches.
   const profileUrl = topic ? directTopicProfileUrl(platform, topic) : null;
   const profileItems = profileUrl ? await collectSurface(profileUrl) : [];
-  const searchItems = profileUrl === searchUrl || profileItems.length >= 10 ? [] : await collectSurface(searchUrl);
+  const profileAboveFloor = profileItems.filter((item) => (item.likes ?? 0) >= likesFloor).length;
+  const searchItems = profileUrl === searchUrl || profileAboveFloor >= 4 ? [] : await collectSurface(searchUrl);
   const items = [...profileItems, ...searchItems].filter(
     (item, index, all) => all.findIndex((other) => other.url === item.url) === index
   );
@@ -1971,12 +2078,12 @@ export async function scrapeCandidates(
   for (const it of ordered.slice(0, topic ? 10 : 40)) {
     inspected += 1;
     let title = it.label.slice(0, 160) || "Untitled clip";
-    let likes = parseCount(it.label.match(/([\d.,]+[KMB]?)\s*likes?/i)?.[1]);
-    let views = parseCount(it.label.match(/([\d.,]+[KMB]?)\s*views?/i)?.[1]);
-    let comments = parseCount(it.label.match(/([\d.,]+[KMB]?)\s*comments?/i)?.[1]);
-    // Search cards often expose views but not likes. Open only the bounded,
-    // relevant set and apply the same account quality floor to real post stats.
-    if (topic) {
+    let likes = it.likes ?? parseCount(it.label.match(/([\d.,]+[KMB]?)\s*likes?/i)?.[1]);
+    let views = it.views ?? parseCount(it.label.match(/([\d.,]+[KMB]?)\s*views?/i)?.[1]);
+    let comments = it.comments ?? parseCount(it.label.match(/([\d.,]+[KMB]?)\s*comments?/i)?.[1]);
+    // Search cards often expose views but not likes. Open only entries without
+    // structured profile counters; item_list rows already identify the exact post.
+    if (topic && it.likes === undefined) {
       const stats = await readVideoStats(page, it.url);
       likes = stats.likes ?? likes;
       views = stats.views ?? views;

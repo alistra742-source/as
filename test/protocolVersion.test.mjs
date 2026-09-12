@@ -14,6 +14,8 @@ test("frontend and worker protocol contracts remain exact mirrors", () => {
   const withoutNow = workerProtocol.replace(/\nexport function now\(\): number \{[\s\S]*$/, "").trim();
   assert.equal(withoutNow, frontend.trim());
   assert.match(frontend, /PROTOCOL_VERSION = 13/);
+  assert.match(workerIndex, /build: BUILD_ID/);
+  assert.match(workerIndex, /protocol: PROTOCOL_VERSION/);
 });
 
 test("only protocol v12 gets narrow growth-only compatibility with worker v13", () => {
