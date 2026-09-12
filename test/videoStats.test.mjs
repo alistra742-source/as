@@ -4,14 +4,16 @@ import test from "node:test";
 import { publicVideoStats, structuredVideoStats } from "../worker/src/videoStats.ts";
 
 const browserSource = fs.readFileSync(new URL("../worker/src/browser.ts", import.meta.url), "utf8");
+const profileSource = fs.readFileSync(new URL("../worker/src/tiktokProfile.ts", import.meta.url), "utf8");
 
 test("topic discovery combines direct creator profiles with current TikTok counter evidence", () => {
   const discovery = browserSource.slice(browserSource.indexOf("export async function scrapeCandidates"), browserSource.indexOf("async function scrapeYouTubeCandidates"));
   assert.match(discovery, /directTopicProfileUrl\(platform, topic\)/);
-  assert.match(discovery, /hydratedItems/);
-  assert.match(discovery, /\/api\/post\/item_list\//);
-  assert.match(discovery, /secUid/);
-  assert.match(discovery, /stats\.diggCount/);
+  assert.match(discovery, /tiktokProfileItemsPage/);
+  assert.match(profileSource, /hydratedItems/);
+  assert.match(profileSource, /\/api\/post\/item_list\//);
+  assert.match(profileSource, /secUid/);
+  assert.match(profileSource, /stats\.diggCount/);
   assert.match(discovery, /const items = \[\.\.\.profileItems, \.\.\.searchItems\]/);
 
   const stats = browserSource.slice(browserSource.indexOf("export async function readVideoStats"));
