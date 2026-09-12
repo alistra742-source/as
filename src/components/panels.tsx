@@ -4,7 +4,9 @@ import {
   Check,
   ChevronRight,
   CircleAlert,
+  KeyRound,
   Paperclip,
+  ShieldCheck,
   Play,
   Pause,
   Send,
@@ -17,6 +19,7 @@ import { NICHES, NICHE_LABEL } from "../lib/types";
 import { clockTime, compactNumber, countdownLabel, timeAgo } from "../lib/format";
 import { useDeck } from "../state/deck";
 import { Button, Chip, NumberField, Panel, PanelHeader, StatusDot, cn } from "./ui";
+import { sendBusCmd, sendBusCookie } from "../lib/liveBus";
 
 /* ------------------------------- Engine panel ------------------------------ */
 
@@ -33,7 +36,8 @@ export function EnginePanel({ room }: { room: Room }) {
   const toggleNiche = useDeck((s) => s.toggleNiche);
   const [, force] = useState(0);
   const engine = room.engine;
-  const loggedIn = room.session?.state === "logged-in";
+  const oauthReady = room.platform === "youtube" && room.live.youtubeOAuthConnected;
+  const loggedIn = room.session?.state === "logged-in" || oauthReady;
   const hasSession = !!room.session;
 
   useEffect(() => {
@@ -63,9 +67,19 @@ export function EnginePanel({ room }: { room: Room }) {
               size="sm"
               onClick={() => startEngine(room.platform)}
               disabled={!loggedIn || !hasSession}
-              title={!hasSession ? "Open a browser session first" : !loggedIn ? "Log in in the browser first" : ""}
+              title={
+                !hasSession
+                  ? "Open the account browser first"
+                  : !loggedIn
+                    ? room.platform === "youtube"
+                      ? "Connect Google or sign in in this account browser first"
+                      : "Log in in the browser first"
+                    : engine.searchTopic.trim()
+                      ? `Start automatic discovery for “${engine.searchTopic.trim()}”; any manual source link below is ignored`
+                      : "Start Growth AI automatic discovery now"
+              }
             >
-              <Play className="size-3.5" /> Start
+              <Play className="size-3.5" /> Start Growth AI
             </Button>
           )
         }
@@ -81,6 +95,12 @@ export function EnginePanel({ room }: { room: Room }) {
           <p className="rounded-lg border border-danger-500/25 bg-danger-500/10 px-3 py-2 text-xs text-danger-400">
             <CircleAlert className="mr-1 inline size-3.5" />
             Not signed in — the engine won't act until you log in in the browser.
+          </p>
+        )}
+        {engine.searchTopic.trim() && (
+          <p className="rounded-lg border border-signal-500/25 bg-signal-500/5 px-3 py-2 text-[11px] leading-snug text-signal-200">
+            <Sparkles className="mr-1 inline size-3.5" />
+            Start Growth AI searches <span className="font-semibold">“{engine.searchTopic.trim()}”</span>. It never consumes the manual source link below.
           </p>
         )}
 
@@ -212,9 +232,11 @@ export function EnginePanel({ room }: { room: Room }) {
 
 export function ComposerPanel({ room }: { room: Room }) {
   const setComposer = useDeck((s) => s.setComposer);
+  const updateEngine = useDeck((s) => s.updateEngine);
   const postNow = useDeck((s) => s.postNow);
   const c = room.composer;
-  const loggedIn = room.session?.state === "logged-in";
+  const oauthReady = room.platform === "youtube" && room.live.youtubeOAuthConnected;
+  const loggedIn = room.session?.state === "logged-in" || oauthReady;
   const niche = NICHE_LABEL[room.engine.activeNiche];
 
   return (
@@ -225,7 +247,9 @@ export function ComposerPanel({ room }: { room: Room }) {
         sub={
           room.session?.mode === "demo"
             ? "Demo mode — posting is simulated"
-            : "Sent to your live browser — real publish"
+            : oauthReady
+              ? "Official YouTube API upload — browser remains available as fallback"
+              : "Sent to your live browser — real publish"
         }
         right={
           <Chip tone={room.session?.mode === "demo" ? "amber" : "green"}>
@@ -236,53 +260,108 @@ export function ComposerPanel({ room }: { room: Room }) {
       <div className="space-y-3 p-4">
         <label className="block">
           <span className="mb-1 block text-[11px] font-semibold text-muted uppercase tracking-wider">
-            {room.platform === "tiktok"
-              ? "TikTok video link"
-              : room.platform === "youtube"
-                ? "YouTube video / Shorts link"
-                : "Reel / IG video link"}
+            What to upload about
+          </span>
+          <input
+            value={room.engine.searchTopic}
+            onChange={(e) => updateEngine(room.platform, { searchTopic: e.target.value.slice(0, 80) })}
+            placeholder="e.g. donut smp or drdonutt"
+            maxLength={80}
+            autoComplete="off"
+            disabled={c.busy}
+            className="h-10 w-full rounded-xl border border-signal-500/30 bg-signal-500/5 px-3 text-sm text-slate-100 outline-none transition-colors placeholder:text-faint focus:border-signal-400/70 disabled:cursor-not-allowed disabled:opacity-60"
+          />
+          <span className="mt-1 block text-[11px] leading-snug text-muted">
+            Saved only for this named account. Start Growth AI always searches this exact topic—even when a manual link is filled below—then ranks
+            relevant high-engagement clips, inspects the best options, rejects low-quality or detected-watermark sources, and writes a fresh
+            source-inspired caption. With no link, Find &amp; post with AI runs the same search once.
+          </span>
+        </label>
+        <div className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-faint">
+          <span className="h-px flex-1 bg-line" /> manual one-off: use an exact source <span className="h-px flex-1 bg-line" />
+        </div>
+        <label className="block">
+          <span className="mb-1 block text-[11px] font-semibold text-muted uppercase tracking-wider">
+            Source video link — TikTok, Instagram or YouTube
           </span>
           <input
             value={c.url}
             onChange={(e) => setComposer(room.platform, { url: e.target.value })}
-            placeholder={
-              room.platform === "tiktok"
-                ? "https://www.tiktok.com/@user/video/…"
-                : room.platform === "youtube"
-                  ? "https://www.youtube.com/watch?v=… or /shorts/…"
-                  : "https://www.instagram.com/reel/…"
-            }
+            placeholder="https://www.tiktok.com/@user/video/… · /reel/… · watch?v=…"
             spellCheck={false}
-            className="h-10 w-full rounded-xl border border-line bg-ink-900 px-3 font-mono text-xs text-slate-200 outline-none transition-colors placeholder:text-faint focus:border-amber-400/60"
+            autoComplete="off"
+            autoCapitalize="off"
+            disabled={c.busy}
+            className="h-10 w-full rounded-xl border border-line bg-ink-900 px-3 font-mono text-xs text-slate-200 outline-none transition-colors placeholder:text-faint focus:border-amber-400/60 disabled:cursor-not-allowed disabled:opacity-60"
           />
+          <span className="mt-1 block text-[11px] leading-snug text-muted">
+            The link is where the video is *taken from* — any of the three sites works, and it is published to{" "}
+            <span className="text-slate-300">{room.platform === "tiktok" ? "TikTok" : room.platform === "youtube" ? "YouTube" : "Instagram"}</span>.
+            The worker pulls the file the source page itself plays (its own mp4, not a screenshot), so
+            cross-posting a Reel to TikTok is the normal case. If a site refuses this server, the log says
+            which stage refused it.
+          </span>
         </label>
         <label className="block">
-          <span className="mb-1 block text-[11px] font-semibold text-muted uppercase tracking-wider">Caption</span>
+          <span className="mb-1 block text-[11px] font-semibold text-muted uppercase tracking-wider">
+            Caption {c.url.trim() ? "" : "— optional override"}
+          </span>
           <textarea
             value={c.caption}
             onChange={(e) => setComposer(room.platform, { caption: e.target.value })}
             placeholder={
               room.session?.mode === "demo"
                 ? `e.g. Hello — or leave empty and let Groq write one (${niche} angle)`
-                : "e.g. Hello — posted exactly as written"
+                : c.url.trim()
+                  ? "e.g. Hello — posted exactly as written"
+                  : "Leave empty for a fresh caption inspired by the selected video's title"
             }
             rows={2}
-            className="w-full resize-none rounded-xl border border-line bg-ink-900 px-3 py-2.5 text-sm text-slate-200 outline-none transition-colors placeholder:text-faint focus:border-amber-400/60"
+            disabled={c.busy}
+            className="w-full resize-none rounded-xl border border-line bg-ink-900 px-3 py-2.5 text-sm text-slate-200 outline-none transition-colors placeholder:text-faint focus:border-amber-400/60 disabled:cursor-not-allowed disabled:opacity-60"
           />
         </label>
+        {c.busy && room.engine.message && (
+          <p className="flex items-start gap-1.5 text-xs text-amber-300">
+            <Timer className="mt-0.5 size-3.5 shrink-0 animate-pulse" /> {room.engine.message}
+          </p>
+        )}
         {c.error && (
           <p className="flex items-start gap-1.5 text-xs text-danger-400">
             <CircleAlert className="mt-0.5 size-3.5 shrink-0" /> {c.error}
           </p>
         )}
         <div className="flex flex-wrap items-center gap-2">
-          <Button size="md" loading={c.busy} disabled={!loggedIn} onClick={() => postNow(room.platform)}>
-            {c.url.trim() ? "Post video" : <Sparkles className="size-4" />}
+          <Button
+            size="md"
+            loading={c.busy}
+            disabled={!loggedIn || !room.session}
+            title={
+              !room.session
+                ? "Open the account browser so the worker command channel is connected"
+                : !loggedIn
+                  ? room.platform === "youtube"
+                    ? "Connect Google, sign in in the browser, or paste a session cookie first"
+                    : "Sign in in the browser (or paste a session cookie) first"
+                  : c.url.trim()
+                    ? "Manual action: publish this exact source video; it does not run topic discovery"
+                    : "Run one topic-based AI discovery and publish"
+            }
+            onClick={() => postNow(room.platform)}
+          >
+            {c.url.trim() ? (c.busy ? "Grabbing video + publishing…" : "Post exact video") : <Sparkles className="size-4" />}
             {c.url.trim() ? "" : "Find & post with AI"}
           </Button>
-          {!c.url.trim() && (
-            <p className="max-w-[220px] text-[11px] leading-snug text-muted">
-              No link? Groq scans faceless clips with 50K+ likes, reviews comments, and posts the best one — 1/hr.
+          {c.url.trim() ? (
+            <p className="max-w-[330px] text-[11px] leading-snug text-amber-200">
+              Manual source is filled, so this button publishes that exact video. Start Growth AI above ignores this link and searches
+              {room.engine.searchTopic.trim() ? ` “${room.engine.searchTopic.trim()}”.` : " the configured topic."}
+            </p>
+          ) : (
+            <p className="max-w-[260px] text-[11px] leading-snug text-muted">
+              {room.engine.searchTopic.trim()
+                ? `Search “${room.engine.searchTopic.trim()}” now; only a relevant, quality-approved, watermark-screened clip can be posted.`
+                : "Enter a topic above (for example donut smp) so the AI knows exactly what to search for."}
             </p>
           )}
           {!loggedIn && (
@@ -324,7 +403,7 @@ export function PostsPanel({ room }: { room: Room }) {
                 ) : (
                   <Chip tone="violet">AI PICK</Chip>
                 )}
-                <Chip tone="neutral">{NICHE_LABEL[p.niche]}</Chip>
+                <Chip tone="neutral">{p.topic || NICHE_LABEL[p.niche]}</Chip>
                 <span className="ml-auto text-[10px] text-faint">{timeAgo(p.postedAt)}</span>
                 {isHit && <Chip tone="green">🔥 hit</Chip>}
               </div>
@@ -418,7 +497,7 @@ export function WorkerCard({ room }: { room: Room }) {
       <PanelHeader
         icon={<span className="text-base leading-none">🛰</span>}
         title="Browser worker"
-        sub={live.connected ? "Connected — real browser sessions available" : "Optional — empty = auto-connect to this app's backend"}
+        sub={live.connected ? "Connected — remote browser sessions ready" : "Optional — empty = auto-connect to this app's backend"}
         right={
           live.connected ? (
             <Chip tone="green">● online</Chip>
@@ -455,8 +534,253 @@ export function WorkerCard({ room }: { room: Room }) {
         </div>
         <p className="text-[11px] leading-snug text-muted">
           Deployed as one service, the app serves its own browser backend — leave both fields empty and live
-          mode just works. Set a custom URL/token only when pointing at a separate worker.
+          mode just works. Set a custom URL/token only when pointing at a separate worker. The worker launches
+          <span className="text-slate-300"> stock Chromium through Playwright</span> by default (raw CDP, no
+          WebDriver layer, every click/keypress sent as trusted humanized input), and can switch to the
+          <span className="text-slate-300"> Clearcote</span> anti-fingerprint build with
+          <span className="font-mono"> BROWSER_ENGINE=clearcote</span> — same profile dir, so the switch keeps
+          your logins. The dock badge above shows which one is live.
         </p>
+      </div>
+    </Panel>
+  );
+}
+
+/* ------------------------- Sign in with a session cookie ------------------------- */
+
+const COOKIE_FIELD: Record<Platform, { name: string; site: string; via: string }> = {
+  tiktok: {
+    name: "sessionid",
+    site: "https://www.tiktok.com",
+    via: "DevTools → Application → Cookies → www.tiktok.com → copy the value of sessionid",
+  },
+  instagram: {
+    name: "sessionid",
+    site: "https://www.instagram.com",
+    via: "DevTools → Application → Cookies → www.instagram.com → copy the value of sessionid",
+  },
+  youtube: {
+    name: "SID",
+    site: "https://www.youtube.com",
+    via: "DevTools → Application → Cookies → www.youtube.com → copy the value of SID",
+  },
+};
+
+/**
+ * Login without touching the remote browser.
+ *
+ * The verification screen in a streamed tab is the one place this product can
+ * stall: a 60 px row that has to be hit through a JPEG, at the wrong scale, on a
+ * phone. The click path has three fallbacks now, and this is the fourth door —
+ * paste the cookie your own signed-in browser already holds and the profile
+ * becomes you, no coordinates involved.
+ *
+ * It deliberately stops at "signed in". The engine arms only on the deck's Start
+ * button, and this panel never touches it; if the engine is already running the
+ * write is refused, because swapping the session out from under a posting loop
+ * would make it publish on an account that was never armed.
+ */
+export function SessionCookiePanel({ room }: { room: Room }) {
+  const p = room.platform;
+  const accountId = room.accountId ?? "default";
+  const live = room.live;
+  const addLog = useDeck((s) => s.addLog);
+  const [value, setValue] = useState("");
+  const [busy, setBusy] = useState<"apply" | "clear" | "check" | null>(null);
+  const hint = COOKIE_FIELD[p];
+  const loggedIn = room.session?.state === "logged-in";
+  const installed = !!live.cookieAt;
+  const running = room.engine.running;
+  const publishing = room.composer.busy;
+  const latestLogText = room.log[room.log.length - 1]?.text ?? "";
+
+  // The worker answers with cookie-state once the jar is written (and on every
+  // connect), so that is the only honest signal that the paste finished.
+  useEffect(() => {
+    setBusy(null);
+  }, [live.cookieAt, live.cookieNames.join(",")]);
+  useEffect(() => {
+    if (busy !== "check") return;
+    if (/Upload access:|Upload access check skipped|Command failed:/i.test(latestLogText)) setBusy(null);
+  }, [busy, latestLogText]);
+  useEffect(() => {
+    if (!busy) return;
+    const t = window.setTimeout(() => setBusy(null), busy === "check" ? 130_000 : 45_000);
+    return () => window.clearTimeout(t);
+  }, [busy]);
+
+  const log = (level: "info" | "ok" | "warn", text: string) =>
+    addLog(p, [{ id: `c-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, at: Date.now(), level, text }]);
+
+  function apply() {
+    const raw = value.trim();
+    if (!raw || busy) return;
+    if (running) return;
+    if (!sendBusCookie(p, accountId, "apply", raw)) {
+      log("warn", "No worker socket open — the live browser above has to be connected before there is a profile to sign in.");
+      return;
+    }
+    // Drop the paste from component state immediately: it should not linger in a
+    // render, a React tree snapshot, or anything that gets persisted.
+    setValue("");
+    setBusy("apply");
+    log("info", `Installing a ${raw.length}-character session in the ${p} profile and reloading the site…`);
+  }
+
+  function clear() {
+    if (busy) return;
+    if (!sendBusCookie(p, accountId, "clear")) {
+      log("warn", "No worker socket open — nothing to clear.");
+      return;
+    }
+    setBusy("clear");
+    log("info", "Emptying this profile's cookie jar (signs the session out, device ids included).");
+  }
+
+  return (
+    <Panel>
+      <PanelHeader
+        icon={<KeyRound className="size-4" />}
+        title="Session cookie — sign in without clicking"
+        sub={`Paste ${hint.name} from a browser already signed in to ${hint.site}`}
+        right={
+          loggedIn ? (
+            <Chip tone="green">● signed in</Chip>
+          ) : installed ? (
+            <Chip tone="amber">cookie installed</Chip>
+          ) : (
+            <Chip tone="neutral">no cookie</Chip>
+          )
+        }
+      />
+      <div className="space-y-2.5 p-4">
+        <textarea
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          rows={3}
+          spellCheck={false}
+          autoCapitalize="off"
+          autoCorrect="off"
+          enterKeyHint="done"
+          placeholder={`${hint.name}=abc123…   ·   or the whole Cookie: header   ·   or just the bare value`}
+          className="w-full resize-y rounded-lg border border-line bg-ink-900 px-2.5 py-2 font-mono text-[11px] leading-relaxed text-slate-200 outline-none placeholder:text-faint focus:border-amber-400/60"
+        />
+        <div className="flex items-center gap-2">
+          <Button
+            size="sm"
+            onClick={apply}
+            loading={busy === "apply"}
+            disabled={!value.trim() || running || publishing || busy !== null}
+            title={
+              publishing
+                ? "Wait for the current publish receipt before changing the session"
+                : running
+                  ? "Pause the engine before changing the session"
+                  : "Write it into the browser profile and reload"
+            }
+          >
+            <Check className="size-3.5" /> Apply &amp; sign in
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={clear}
+            loading={busy === "clear"}
+            disabled={!installed || !live.connected || running || publishing || busy !== null}
+            title={
+              publishing
+                ? "Wait for the current publish receipt before clearing the session"
+                : running
+                  ? "Pause the engine before clearing the session"
+                  : live.connected
+                    ? "Empty this profile's cookie jar"
+                    : "Open the live browser first"
+            }
+          >
+            Clear
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            loading={busy === "check"}
+            onClick={() => {
+              if (busy) return;
+              if (!sendBusCmd(p, accountId, { t: "check-upload" })) {
+                log("warn", "No worker socket open — there is no browser to check.");
+                return;
+              }
+              setBusy("check");
+              log("info", "Asking the upload studio whether this session may post… (it opens in the browser tab)");
+            }}
+            disabled={!live.connected || !loggedIn || running || publishing || busy !== null}
+            title={
+              busy === "check"
+                ? "Upload access is already being checked"
+                : publishing
+                  ? "The publish owns the uploader until its exact receipt returns"
+                  : running
+                    ? "Pause the hourly engine before navigating the browser for a capability check"
+                    : !live.connected
+                      ? "Open the live browser first"
+                      : !loggedIn
+                        ? "Sign in first — the studio has to be reached as you"
+                        : "Open the upload page and report whether it lets this session pick a file"
+            }
+          >
+            <ShieldCheck className="size-3.5" /> Can it post?
+          </Button>
+          <span className="ml-auto whitespace-nowrap font-mono text-[10px] text-faint">
+            {installed
+              ? `${live.cookieNames.slice(0, 2).join(", ")}${
+                  live.cookieNames.length > 2 ? ` +${live.cookieNames.length - 2}` : ""
+                } · ${timeAgo(live.cookieAt as number)}`
+              : "not saved here"}
+          </span>
+        </div>
+
+        <p className="text-[11px] leading-snug text-muted">
+          <span className="text-slate-300">Start is still yours.</span> Applying a cookie only makes the profile
+          you — nothing is posted and the engine does not arm until you press Start. Where it came from:{" "}
+          <span className="text-slate-300">{hint.via}</span> (a whole <span className="font-mono">Cookie:</span>{" "}
+          header works too).
+        </p>
+
+        {running && (
+          <p className="rounded-lg border border-amber-500/25 bg-amber-400/5 px-3 py-2 text-[11px] leading-snug text-amber-200">
+            The engine is running on the current session — press Pause before swapping accounts, so it can never
+            post on a profile you did not arm.
+          </p>
+        )}
+        {!live.connected && (
+          <p className="rounded-lg border border-line bg-ink-900 px-3 py-2 text-[11px] leading-snug text-muted">
+            Not connected to a worker yet — open the live browser above so there is a profile to write into.
+          </p>
+        )}
+
+        <details className="rounded-lg border border-line bg-ink-900/60 px-3 py-2">
+          <summary className="cursor-pointer text-[11px] font-semibold text-slate-300">
+            Where the cookie goes (read once)
+          </summary>
+          <ul className="mt-2 space-y-1 text-[11px] leading-snug text-muted">
+            <li>
+              · It is sent once, over your own worker socket, straight into the browser profile&apos;s cookie jar —
+              the persistent one the manual tab and every engine run already share.
+            </li>
+            <li>
+              · It is never written to the deck&apos;s saved state, never printed in the activity log, and never
+              echoed back in a toast: only cookie <span className="text-slate-300">names</span> and dates are
+              reported.
+            </li>
+            <li>
+              · Clear empties the whole jar, including the device ids the site uses to trust this browser, so the
+              next manual sign-in may ask for a code.
+            </li>
+            <li>
+              · A TikTok session usually lives ~30 days; when it dies the site shows you signed out and you paste a
+              fresh one.
+            </li>
+          </ul>
+        </details>
       </div>
     </Panel>
   );

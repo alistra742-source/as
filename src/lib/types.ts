@@ -1,3 +1,5 @@
+import type { DriverInfo } from "./protocol";
+
 export type Platform = "tiktok" | "instagram" | "youtube";
 
 export type Niche = "stories" | "scary" | "facts";
@@ -16,6 +18,15 @@ export type EnginePhase =
   | "paused"
   | "error";
 
+export interface ManagedAccount {
+  /** Opaque, path-safe key. Names are presentation only and can be changed later. */
+  id: string;
+  name: string;
+  platform: Platform;
+  createdAt: number;
+  lastOpenedAt: number | null;
+}
+
 export interface BrowserSession {
   id: string;
   platform: Platform;
@@ -23,6 +34,8 @@ export interface BrowserSession {
   state: SessionState;
   url: string;
   startedAt: number;
+  /** Live sessions only: what drives the remote browser (which Chromium, and how input is sent). */
+  driver?: DriverInfo | null;
 }
 
 export interface MetricCheck {
@@ -37,6 +50,8 @@ export interface PostRecord {
   url: string;
   caption: string;
   niche: Niche;
+  /** Exact custom discovery subject, when this was an AI search rather than a preset. */
+  topic?: string;
   source: "manual" | "ai";
   audience: "Everyone";
   postedAt: number;
@@ -76,6 +91,8 @@ export interface EngineState {
   cadenceHours: number;
   activeNiche: Niche;
   niches: Niche[];
+  /** Per-named-account free-text discovery query; blank cycles the presets. */
+  searchTopic: string;
   nextRunAt: number | null;
   lastRunAt: number | null;
   message: string | null;
@@ -95,10 +112,27 @@ export interface LiveLink {
   token: string;
   connected: boolean;
   lastError: string | null;
+  /**
+   * Metadata about a session cookie pasted into the login panel. Names and dates
+   * only: the value never lands here, because this whole object is persisted to
+   * localStorage and a session cookie IS a login. It goes straight from the input
+   * to the worker and into the browser profile's own jar.
+   */
+  cookieAt: number | null;
+  cookieNames: string[];
+  cookieExpiresAt: number | null;
+  /** Public OAuth status only. Google tokens remain encrypted on the worker and
+   * are never sent to, logged by, or persisted in the frontend. */
+  youtubeOAuthConfigured: boolean;
+  youtubeOAuthConnected: boolean;
+  youtubeOAuthError: string | null;
 }
 
 export interface Room {
   platform: Platform;
+  /** Present for a named account room; omitted only by the empty account menu. */
+  accountId?: string;
+  accountName?: string;
   session: BrowserSession | null;
   composer: ComposerState;
   engine: EngineState;

@@ -17,9 +17,11 @@ import { DEMO_CANDIDATES, DEMO_HOOKS } from "../data/demo";
  * per hour) can be explored before the Railway worker is connected.
  * Timings below are compressed; the worker enforces real hours.
  */
-export const DEMO_FIRST_CHECK_MS = 16_000;
-export const DEMO_SECOND_CHECK_MS = 95_000;
 export const DEMO_CADENCE_MS = 45_000;
+// Demo time is compressed, but ordering matches production: no metric read
+// occurs before its full simulated hour has elapsed.
+export const DEMO_FIRST_CHECK_MS = DEMO_CADENCE_MS;
+export const DEMO_SECOND_CHECK_MS = DEMO_CADENCE_MS * 2;
 export const DEMO_PHASE_MS = 2_400;
 
 /** Demo compresses one real hour into ~45s, so the slot window follows that. */
@@ -40,11 +42,11 @@ function viewsAt(seed: number, ageMs: number): number {
   return Math.round(48 * base * blow * Math.pow(ageSec, 1.12));
 }
 
-function simMetrics(post: PostRecord, ageMs: number): MetricCheck {
+function simMetrics(post: PostRecord, ageMs: number, at: number): MetricCheck {
   const seed = seedOf(post.id);
   const views = viewsAt(seed, ageMs);
   return {
-    at: Date.now(),
+    at,
     views,
     likes: Math.round(views * seededStep(seed + 3, 0.09, 0.05)),
     comments: Math.round(views * seededStep(seed + 5, 0.008, 0.004)),
@@ -102,7 +104,7 @@ function measureDue(room: Room, now: number): { posts: PostRecord[]; logs: LogEn
     const checks = p.checks;
     if (checks.length === 0 && age >= DEMO_FIRST_CHECK_MS) {
       changed = true;
-      const m = simMetrics(p, age);
+      const m = simMetrics(p, age, now);
       const crossed = m.views >= room.engine.thresholdViews;
       const verdict = crossed
         ? `🔥 ${compactNumber(m.views)} views in the first hour — crossed the ${room.engine.thresholdViews.toLocaleString()} target. Engine doubles down on this format.`
@@ -121,9 +123,9 @@ function measureDue(room: Room, now: number): { posts: PostRecord[]; logs: LogEn
       );
       return { ...p, checks: [...checks, m], verdict };
     }
-    if (checks.length === 1 && age >= DEMO_SECOND_CHECK_MS) {
+    if (checks.length === 1 && age >= DEMO_SECOND_CHECK_MS && now - checks[0].at >= DEMO_CADENCE_MS) {
       changed = true;
-      const m = simMetrics(p, age);
+      const m = simMetrics(p, age, now);
       const first = checks[0];
       const delta = m.views - first.views;
       const verdict =
@@ -196,7 +198,8 @@ export function engineTick(
       } else {
         enginePatch.phase = "waiting";
         enginePatch.lastRunAt = now;
-        enginePatch.message = "No candidate cleared the quality bar this hour — trying again next cycle.";
+        enginePatch.nextRunAt = now + demoWindow(engine.cadenceHours);
+        enginePatch.message = "No candidate cleared the quality bar this hour — analyzing fresh results next cycle.";
         logs.push(logEntry("warn", "No 50K+ candidate cleared review this cycle — nothing posted (quality first)."));
       }
     }
@@ -229,9 +232,9 @@ export function engineTick(
         return { engine: enginePatch, posts: appended, logs };
       } else if (!slotFree) {
         enginePatch.phase = "waiting";
-        enginePatch.nextRunAt = now + demoWindow(engine.cadenceHours);
-        enginePatch.message = "Hourly slot used — next auto-post scheduled.";
-        logs.push(logEntry("info", "Hourly slot already used — next post in 1h (sim ~45s)."));
+        enginePatch.nextRunAt = lastPost!.postedAt + demoWindow(engine.cadenceHours);
+        enginePatch.message = "Hourly slot used — next auto-post remains anchored to the confirmed post.";
+        logs.push(logEntry("info", "Hourly slot already used — next post stays at the confirmed +1h boundary (sim ~45s)."));
       } else {
         enginePatch.phase = "waiting";
         enginePatch.nextRunAt = now + demoWindow(engine.cadenceHours);

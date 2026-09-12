@@ -1,9 +1,10 @@
 import { ChevronRight, PlayCircle, Radar, ShieldCheck, TimerReset, TrendingUp } from "lucide-react";
-import type { Platform } from "../lib/types";
+import type { Platform, Room } from "../lib/types";
 import { PLATFORMS } from "../lib/types";
 import { useDeck } from "../state/deck";
 import { Button, Chip, Panel, StatusDot, cn } from "./ui";
 import { compactNumber } from "../lib/format";
+import { roomAuthenticated, roomForAccount } from "../lib/accounts";
 
 interface HubCard {
   platform: Platform;
@@ -64,10 +65,18 @@ export function MainHub({ onOpen }: { onOpen: (p: Platform) => void }) {
 
 function Hero({ onOpen }: { onOpen: (p: Platform) => void }) {
   const rooms = useDeck((s) => s.rooms);
-  const running = PLATFORMS.filter((p) => rooms[p].engine.running).length;
-  const totalPosts = PLATFORMS.reduce((acc, p) => acc + rooms[p].posts.length, 0);
-  const totalViews = PLATFORMS.reduce(
-    (acc, p) => acc + rooms[p].posts.reduce((a, post) => a + (post.checks.at(-1)?.views ?? 0), 0),
+  const accounts = useDeck((s) => s.accounts);
+  const saved = useDeck((s) => s.accountRooms);
+  const activeIds = useDeck((s) => s.activeAccountIds);
+  const managedRooms = PLATFORMS.flatMap((platform) =>
+    accounts[platform]
+      .map((account) => roomForAccount(platform, account, activeIds[platform], rooms[platform], saved))
+      .filter((room): room is Room => room !== null)
+  );
+  const running = managedRooms.filter((room) => room.engine.running).length;
+  const totalPosts = managedRooms.reduce((acc, room) => acc + room.posts.length, 0);
+  const totalViews = managedRooms.reduce(
+    (acc, room) => acc + room.posts.reduce((a, post) => a + (post.checks.at(-1)?.views ?? 0), 0),
     0
   );
 
@@ -132,9 +141,18 @@ function PlatformCard({
   card: HubCard;
   onOpen: (p: Platform) => void;
 }) {
-  const room = useDeck((s) => s.rooms[card.platform]);
-  const views = room.posts.reduce((a, p) => a + (p.checks.at(-1)?.views ?? 0), 0);
-  const signedIn = room.session?.state === "logged-in";
+  const activeRoom = useDeck((s) => s.rooms[card.platform]);
+  const accounts = useDeck((s) => s.accounts[card.platform]);
+  const saved = useDeck((s) => s.accountRooms);
+  const activeId = useDeck((s) => s.activeAccountIds[card.platform]);
+  const rooms = accounts
+    .map((account) => roomForAccount(card.platform, account, activeId, activeRoom, saved))
+    .filter((room): room is Room => room !== null);
+  const views = rooms.reduce(
+    (total, room) => total + room.posts.reduce((sum, post) => sum + (post.checks.at(-1)?.views ?? 0), 0),
+    0
+  );
+  const signedIn = rooms.some((room) => roomAuthenticated(room));
 
   return (
     <button
@@ -170,7 +188,9 @@ function PlatformCard({
             <>
               <Chip tone={signedIn ? "green" : "neutral"}>
                 <StatusDot tone={signedIn ? "green" : "neutral"} className="!size-1.5" />
-                {signedIn ? "signed in" : "not signed in"}
+                {accounts.length
+                  ? `${accounts.length} account${accounts.length === 1 ? "" : "s"}${signedIn ? " · signed in" : ""}`
+                  : "no accounts"}
               </Chip>
               {views > 0 && <Chip tone="violet">👁 {compactNumber(views)}</Chip>}
             </>

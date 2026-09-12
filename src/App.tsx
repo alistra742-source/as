@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { Activity, LayoutGrid, Youtube } from "lucide-react";
-import type { Platform } from "./lib/types";
+import type { Platform, Room } from "./lib/types";
 import { PLATFORMS } from "./lib/types";
+import { roomAuthenticated, roomForAccount } from "./lib/accounts";
 import { useDeck } from "./state/deck";
 import { MainHub } from "./components/MainHub";
 import { PlatformRoom } from "./components/PlatformRoom";
@@ -45,7 +46,19 @@ export default function App() {
 
 function Header({ tab, onTab }: { tab: Tab; onTab: (t: Tab) => void }) {
   const rooms = useDeck((s) => s.rooms);
-  const liveRunning = PLATFORMS.filter((p) => rooms[p].engine.running).length;
+  const accounts = useDeck((s) => s.accounts);
+  const saved = useDeck((s) => s.accountRooms);
+  const activeIds = useDeck((s) => s.activeAccountIds);
+  const managedRooms = PLATFORMS.flatMap((platform) =>
+    accounts[platform]
+      .map((account) => roomForAccount(platform, account, activeIds[platform], rooms[platform], saved))
+      .filter((room): room is Room => room !== null)
+  );
+  const liveRunning = managedRooms.filter((room) => room.engine.running).length;
+  const platformSignedIn = (platform: Platform) =>
+    accounts[platform].some((account) =>
+      roomAuthenticated(roomForAccount(platform, account, activeIds[platform], rooms[platform], saved))
+    );
 
   return (
     <header className="sticky top-0 z-30 border-b border-line-soft bg-ink-950/85 backdrop-blur">
@@ -75,16 +88,14 @@ function Header({ tab, onTab }: { tab: Tab; onTab: (t: Tab) => void }) {
               {t.icon === "grid" && <LayoutGrid className="size-4" />}
               {t.icon === "yt" && <Youtube className="size-4 text-red-500" />}
               {t.label}
-              {t.id !== "main" && rooms[t.id as Platform].session && (
-                  <span
-                    className={cn(
-                      "size-1.5 rounded-full",
-                      rooms[t.id as Platform].session!.state === "logged-in"
-                        ? "bg-signal-400"
-                        : "bg-faint"
-                    )}
-                  />
-                )}
+              {t.id !== "main" && accounts[t.id as Platform].length > 0 && (
+                <span
+                  className={cn(
+                    "size-1.5 rounded-full",
+                    platformSignedIn(t.id as Platform) ? "bg-signal-400" : "bg-faint"
+                  )}
+                />
+              )}
               {tab === t.id && (
                 <span className="absolute inset-x-2 -bottom-[1px] h-0.5 rounded-full bg-amber-400" />
               )}
